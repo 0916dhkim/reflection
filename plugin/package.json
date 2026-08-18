@@ -1,0 +1,24 @@
+{
+  "name": "opencode-reflection-plugin",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "esbuild src/index.ts --bundle --platform=node --format=esm --target=node22 --outfile=dist/reflection.js",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "verify:bundle": "node scripts/verify-bundle.mjs"
+  },
+  "dependencies": {
+    "@opencode-ai/plugin": "1.18.15"
+  },
+  "devDependencies": {
+    "@types/node": "24.12.2",
+    "esbuild": "0.28.2",
+    "prettier": "3.6.2",
+    "typescript": "5.8.2",
+    "vitest": "3.2.4"
+  }
+}

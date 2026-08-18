@@ -1,0 +1,48 @@
+services:
+  db:
+    image: pgvector/pgvector:pg17
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-reflection}
+      POSTGRES_USER: ${POSTGRES_USER:-reflection}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+    volumes:
+      - /srv/reflection/postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  api:
+    build: .
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: ${DATABASE_URL:?DATABASE_URL is required}
+      REFLECTION_API_KEY: ${REFLECTION_API_KEY:?REFLECTION_API_KEY is required}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:?OPENROUTER_API_KEY is required}
+      VOYAGE_API_KEY: ${VOYAGE_API_KEY:?VOYAGE_API_KEY is required}
+      OPENROUTER_BASE_URL: ${OPENROUTER_BASE_URL:-https://openrouter.ai/api/v1}
+      VOYAGE_BASE_URL: ${VOYAGE_BASE_URL:-https://api.voyageai.com/v1}
+      EXTRACTION_MODEL: ${EXTRACTION_MODEL:-deepseek/deepseek-v4-flash-0731}
+      RESOLUTION_MODEL: ${RESOLUTION_MODEL:-deepseek/deepseek-v4-pro-0813}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-voyage-4-large}
+      WORKER_MAX_ATTEMPTS: ${WORKER_MAX_ATTEMPTS:-3}
+      WORKER_RETRY_BACKOFF_SECONDS: ${WORKER_RETRY_BACKOFF_SECONDS:-2}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "${PORT:-8000}:8000"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=2)",
+        ]
+      interval: 10s
+      timeout: 3s
+      retries: 10
