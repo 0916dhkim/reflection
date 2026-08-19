@@ -95,13 +95,16 @@ async def test_extraction_call_uses_strict_schema_provider_and_all_prior_summari
     assert captured["max_tokens"] == 16_384
     assert captured["reasoning"] == {"effort": "low"}
     assert captured["provider"] == {
+        "only": ["deepseek"],
+        "allow_fallbacks": False,
         "require_parameters": True,
         "data_collection": "deny",
         "zdr": True,
     }
+    assert captured["temperature"] == 0
     assert captured["response_format"]["json_schema"]["strict"] is True
     assert_all_object_properties_required(schema)
-    assert schema["properties"]["claims"]["maxItems"] == 50
+    assert schema["properties"]["claims"]["maxItems"] == 25
     assert user_payload["prior_session_segment_summaries"] == ["first", "second", "third"]
     system_prompt = captured["messages"][0]["content"]
     assert "most specific independently referable subject" in system_prompt
@@ -111,6 +114,8 @@ async def test_extraction_call_uses_strict_schema_provider_and_all_prior_summari
     assert "Preserve units and qualifiers" in system_prompt
     assert "0.85-0.99" in system_prompt
     assert "Prior summaries never increase confidence" in system_prompt
+    assert "user-facing display text" in system_prompt
+    assert "at most 25 nonredundant" in system_prompt
     assert result.summary == "A short summary"
 
 
@@ -169,10 +174,13 @@ async def test_resolution_receives_occurrence_context_summary_and_descriptions()
     assert captured["max_tokens"] == 32_768
     assert captured["reasoning"] == {"effort": "high"}
     assert captured["provider"] == {
+        "only": ["deepseek"],
+        "allow_fallbacks": False,
         "require_parameters": True,
         "data_collection": "deny",
         "zdr": True,
     }
+    assert captured["temperature"] == 0
     assert user_payload["segment_summary"] == "Segment summary"
     assert user_payload["mentions"][0]["supporting_claim"] == mention.supporting_claim
     assert candidate["description"] == "A relational database"

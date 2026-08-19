@@ -17,6 +17,12 @@ ShortText = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1
 NaturalPredicate = Annotated[
     str,
     StringConstraints(strip_whitespace=True, min_length=1, max_length=500, pattern=r"^[^_]+$"),
+    Field(
+        description=(
+            "Short user-facing natural-language verb phrase stored and displayed verbatim. "
+            "Use lowercase words with spaces, never snake_case, camelCase, or database identifiers."
+        )
+    ),
 ]
 Description = Annotated[
     str, StringConstraints(strip_whitespace=True, min_length=1, max_length=1000)
@@ -138,7 +144,7 @@ class ExtractedClaim(StrictModel):
 
 class ExtractionResult(StrictModel):
     summary: Annotated[str, StringConstraints(strip_whitespace=True, max_length=1000)]
-    claims: Annotated[list[ExtractedClaim], Field(max_length=50)]
+    claims: Annotated[list[ExtractedClaim], Field(max_length=25)]
 
 
 class Resolution(StrictModel):

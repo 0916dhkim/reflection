@@ -89,8 +89,9 @@ class ModelClient:
             "than folding it into the predicate: named plans, products, projects, policies, "
             "repositories, features, and similar concepts are entities when a fact is about them. "
             "Qualify generic names with their owner or context, such as 'Acme Pro plan'. "
-            "Predicates must be short natural-language verb phrases with spaces, never snake_case "
-            "or camelCase. Do not encode the subject or object name in the predicate. For example, "
+            "Predicates are user-facing display text, not knowledge-graph IDs or database keys. "
+            "They must be short natural-language verb phrases with spaces, never snake_case or "
+            "camelCase. Do not encode the subject or object name in the predicate. For example, "
             "prefer subject 'Acme Pro plan', predicate 'has monthly credit grant', and value "
             "'7200 credits' over a broad Acme subject with a plan-specific predicate. Set exactly "
             "one of object_entity or object_value. Use an entity object for something "
@@ -105,7 +106,11 @@ class ModelClient:
             "tentative, draft, "
             "or indirectly implied information; and below 0.60 for uncertain or conflicting "
             "information. Prior summaries never increase confidence. The summary must be at most "
-            "1000 characters."
+            "1000 characters. Return at most 25 nonredundant, durable claims. Prefer final "
+            "decisions and reusable facts; omit draft wording, transient discussion, and duplicate "
+            "variants. "
+            "Before returning, verify that every predicate reads naturally when placed between its "
+            "subject and object and contains no underscores or camelCase."
         )
         user = {
             "prior_session_segment_summaries": list(prior_summaries),
@@ -188,8 +193,11 @@ class ModelClient:
                     json={
                         "model": model,
                         "max_tokens": max_tokens,
+                        "temperature": 0,
                         "reasoning": {"effort": reasoning_effort},
                         "provider": {
+                            "only": ["deepseek"],
+                            "allow_fallbacks": False,
                             "require_parameters": True,
                             "data_collection": "deny",
                             "zdr": True,
@@ -246,7 +254,22 @@ class ModelClient:
                     trailing_chars,
                 )
             return result
-        except (KeyError, IndexError, TypeError, ValueError, ValidationError) as exc:
+        except ValidationError as exc:
+            issues = [
+                {
+                    "location": ".".join(str(part) for part in issue["loc"]),
+                    "type": issue["type"],
+                }
+                for issue in exc.errors(include_input=False)[:10]
+            ]
+            logger.warning(
+                "invalid structured model schema schema=%s model=%s issues=%s",
+                schema_name,
+                model,
+                issues,
+            )
+            raise UpstreamValidationError("invalid structured model response") from None
+        except (KeyError, IndexError, TypeError, ValueError) as exc:
             logger.warning(
                 "invalid structured model response schema=%s model=%s error_type=%s",
                 schema_name,

@@ -38,14 +38,15 @@ For each job the worker:
    written if a network call or model/schema validation fails.
 
 Structured requests set OpenRouter `provider.require_parameters=true`, `data_collection="deny"`, and
-`zdr=true`, and every property is required in the strict JSON schemas. Network, model, schema, and
+`zdr=true`. They are pinned to OpenRouter's official `deepseek` provider with fallbacks disabled, and every
+property is required in the strict JSON schemas. Network, model, schema, and
 entity-resolution validation failures all retry up to three attempts with a short configurable backoff
 because another model call may succeed. An invalid persisted job payload is terminal at claim time, and a
 generated embedding input over 30,000 UTF-8 bytes is terminal because retrying cannot reduce it. A delayed
 oldest job continues to block newer jobs, preserving FIFO. Operators can explicitly reset a terminal job
 with authenticated `POST /v1/jobs/{id}/retry`.
 
-Extraction output is capped at 50 claims and 16,384 completion tokens; entity resolution is capped at
+Extraction output is capped at 25 claims and 16,384 completion tokens; entity resolution is capped at
 32,768 completion tokens. The token budgets include hidden reasoning as well as visible JSON. Every model
 call also has a 180-second wall-clock deadline independent of
 HTTPX's per-operation timeout. Completion logs record timing, finish reason, token count, and content size
@@ -55,6 +56,7 @@ Some compatible providers append a second value or text after an otherwise valid
 Reflection validates and uses only the first JSON value and logs the ignored trailing character count,
 never the trailing content. Invalid model output is reported without including source or response text in
 exception traces.
+
 
 Voyage requests set `truncation=false`. Inputs are rejected above 30,000 UTF-8 bytes and requests are
 partitioned below both 128 inputs and 100,000 UTF-8 bytes. Byte limits are intentionally conservative
