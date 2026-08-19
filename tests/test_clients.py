@@ -89,8 +89,8 @@ async def test_extraction_call_uses_strict_schema_provider_and_all_prior_summari
             ["first", "second", "third"],
         )
 
-    user_payload = json.loads(captured["messages"][1]["content"])
-    schema = captured["response_format"]["json_schema"]["schema"]
+    user_payload = json.loads(captured["messages"][2]["content"])
+    schema = json.loads(captured["messages"][1]["content"].split("\n", 1)[1])
     assert captured["model"] == "deepseek/deepseek-v4-flash-0731"
     assert captured["max_tokens"] == 16_384
     assert captured["reasoning"] == {"effort": "low"}
@@ -98,11 +98,9 @@ async def test_extraction_call_uses_strict_schema_provider_and_all_prior_summari
         "only": ["deepseek"],
         "allow_fallbacks": False,
         "require_parameters": True,
-        "data_collection": "deny",
-        "zdr": True,
     }
     assert captured["temperature"] == 0
-    assert captured["response_format"]["json_schema"]["strict"] is True
+    assert captured["response_format"] == {"type": "json_object"}
     assert_all_object_properties_required(schema)
     assert schema["properties"]["claims"]["maxItems"] == 25
     assert user_payload["prior_session_segment_summaries"] == ["first", "second", "third"]
@@ -168,7 +166,7 @@ async def test_resolution_receives_occurrence_context_summary_and_descriptions()
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         result = await ModelClient(client, settings()).resolve("Segment summary", [mention])
 
-    user_payload = json.loads(captured["messages"][1]["content"])
+    user_payload = json.loads(captured["messages"][2]["content"])
     candidate = user_payload["mentions"][0]["candidates"][0]
     assert captured["model"] == "deepseek/deepseek-v4-pro-0813"
     assert captured["max_tokens"] == 32_768
@@ -177,8 +175,6 @@ async def test_resolution_receives_occurrence_context_summary_and_descriptions()
         "only": ["deepseek"],
         "allow_fallbacks": False,
         "require_parameters": True,
-        "data_collection": "deny",
-        "zdr": True,
     }
     assert captured["temperature"] == 0
     assert user_payload["segment_summary"] == "Segment summary"

@@ -180,6 +180,7 @@ class ModelClient:
         max_tokens: int,
     ) -> T:
         started_at = time.monotonic()
+        output_schema = strict_json_schema(response_model)
         try:
             async with asyncio.timeout(self._settings.model_call_timeout_seconds):
                 response = await self._client.post(
@@ -199,21 +200,20 @@ class ModelClient:
                             "only": ["deepseek"],
                             "allow_fallbacks": False,
                             "require_parameters": True,
-                            "data_collection": "deny",
-                            "zdr": True,
                         },
                         "messages": [
                             {"role": "system", "content": system},
+                            {
+                                "role": "system",
+                                "content": (
+                                    "Return exactly one JSON object matching this JSON Schema. "
+                                    "Do not include markdown or additional text.\n"
+                                    + json.dumps(output_schema, separators=(",", ":"))
+                                ),
+                            },
                             {"role": "user", "content": json.dumps(user, separators=(",", ":"))},
                         ],
-                        "response_format": {
-                            "type": "json_schema",
-                            "json_schema": {
-                                "name": schema_name,
-                                "strict": True,
-                                "schema": strict_json_schema(response_model),
-                            },
-                        },
+                        "response_format": {"type": "json_object"},
                     },
                 )
         except TimeoutError:

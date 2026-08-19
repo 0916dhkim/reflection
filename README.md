@@ -37,9 +37,10 @@ For each job the worker:
    and claims, marks the leased job successful, and clears its source payload. No extraction data is
    written if a network call or model/schema validation fails.
 
-Structured requests set OpenRouter `provider.require_parameters=true`, `data_collection="deny"`, and
-`zdr=true`. They are pinned to OpenRouter's official `deepseek` provider with fallbacks disabled, and every
-property is required in the strict JSON schemas. Network, model, schema, and
+Model requests are pinned to OpenRouter's official `deepseek` provider with fallbacks disabled. The
+official provider supports JSON-object mode but not OpenRouter's strict JSON-schema mode, so Reflection
+places the complete schema in a system message, requests one JSON object, and validates every property
+locally. Network, model, schema, and
 entity-resolution validation failures all retry up to three attempts with a short configurable backoff
 because another model call may succeed. An invalid persisted job payload is terminal at claim time, and a
 generated embedding input over 30,000 UTF-8 bytes is terminal because retrying cannot reduce it. A delayed
@@ -140,10 +141,10 @@ and `WORKER_RETRY_BACKOFF_SECONDS` defaults to `2`.
 
 ### Data retention prerequisite
 
-OpenRouter requests deny data collection and require zero-data-retention routing in every model call.
-Voyage retention is controlled at the organization/account level rather than by these embedding request
-fields. The deployment's Voyage organization or account must have the provider data opt-out enabled for
-zero-day retention, and that setting must be verified before any live transcript ingestion begins.
+Provider pinning is incompatible with OpenRouter's zero-data-retention filter because the official
+DeepSeek endpoint is categorized as allowing paid-model training. Voyage retention is also controlled at
+the organization/account level. Operators should review both providers' retention settings before sending
+sensitive transcripts.
 
 ## Run
 
