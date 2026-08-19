@@ -43,10 +43,9 @@ For each job the worker:
    and claims, marks the leased job successful, and clears its source payload. No extraction data is
    written if a network call or model/schema validation fails.
 
-Model requests are pinned to OpenRouter's official `deepseek` provider with fallbacks disabled. The
-official provider supports JSON-object mode but not OpenRouter's strict JSON-schema mode, so Reflection
-places the complete schema in a system message, requests one JSON object, and validates every property
-locally. Network, model, schema, and
+Model requests are pinned to OpenRouter's SiliconFlow `siliconflow/fp8` route with fallbacks disabled.
+Reflection places the complete schema in a system message, requests one JSON object, and validates every
+property locally. Network, model, schema, and
 entity-resolution validation failures all retry up to three attempts with a short configurable backoff
 because another model call may succeed. An invalid persisted job payload is terminal at claim time, and a
 generated embedding input over 30,000 UTF-8 bytes is terminal because retrying cannot reduce it. A delayed
@@ -188,7 +187,7 @@ integration test. The test truncates all Reflection tables in that database.
 `scripts/backfill.mjs` reads the local OpenCode SQLite database and submits complete-turn segments oldest
 first. It processes one segment to a terminal state before submitting the next, so pending transcript
 payloads do not accumulate in PostgreSQL. Existing successful jobs are skipped through the service's
-idempotent segment API. Failed jobs caused by an official DeepSeek `402` wait five minutes before retrying
+idempotent segment API. Failed jobs caused by a provider `402` wait five minutes before retrying
 through Reflection, ensuring the readiness check uses the deployed service's credentials and configured
 models. Other terminal failures receive one explicit retry and are recorded before the worker continues.
 Sessions updated within the last ten minutes are deferred and rechecked after older stable sessions.
