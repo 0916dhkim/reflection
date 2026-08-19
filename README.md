@@ -211,3 +211,10 @@ node scripts/backfill.mjs
 For unattended operation, run it under a supervisor that uses an absolute Node path and working directory,
 stores stdout and stderr durably, and restarts only after nonzero exits. Restarts scan from the newest
 session again, but successful segment submissions are skipped idempotently.
+
+When `REFLECTION_BACKFILL_LAUNCHD_LABEL` and `REFLECTION_BACKFILL_LAUNCHD_PLIST` are set, successful
+completion starts a detached cleanup helper that removes the plist and unloads the LaunchAgent. Failed runs
+leave the supervisor installed so it can restart. Terminal completion includes segments whose model output
+remained invalid after all retries; those failures remain recorded in the progress state. The helper
+confirms the service is unloaded before deleting its plist and requests another run if cleanup fails.
+Cleanup results are written beside the progress state.

@@ -8,6 +8,7 @@ import {
   unlinkSync,
   writeFileSync,
 } from "node:fs";
+import { spawn } from "node:child_process";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -30,6 +31,8 @@ const SQLITE_PATH =
   process.env.OPENCODE_DATABASE_PATH ??
   join(HOME, ".local/share/opencode/opencode.db");
 const REFLECTION_CONFIG_PATH = join(HOME, ".config/opencode/reflection.json");
+const LAUNCHD_LABEL = process.env.REFLECTION_BACKFILL_LAUNCHD_LABEL;
+const LAUNCHD_PLIST = process.env.REFLECTION_BACKFILL_LAUNCHD_PLIST;
 const PRIORITY_JOB_IDS = [7, 8];
 
 function now() {
@@ -117,6 +120,38 @@ function releaseLock() {
     if (readFileSync(LOCK_PATH, "utf8").trim() === String(process.pid))
       unlinkSync(LOCK_PATH);
   } catch {}
+}
+
+function scheduleLaunchAgentCleanup() {
+  if (!LAUNCHD_LABEL || !LAUNCHD_PLIST) return;
+  const child = spawn(
+    process.execPath,
+    [
+      join(import.meta.dirname, "cleanup-launch-agent.mjs"),
+      LAUNCHD_LABEL,
+      LAUNCHD_PLIST,
+      join(STATE_DIR, "cleanup.json"),
+    ],
+    { detached: true, stdio: "ignore" },
+  );
+  child.on("error", (error) => {
+    log("failed to start LaunchAgent cleanup", {
+      label: LAUNCHD_LABEL,
+      error: errorText(error),
+    });
+  });
+  child.unref();
+  state.cleanup = {
+    status: "scheduled",
+    label: LAUNCHD_LABEL,
+    plist: LAUNCHD_PLIST,
+    scheduledAt: now(),
+  };
+  saveState();
+  log("scheduled LaunchAgent cleanup", {
+    label: LAUNCHD_LABEL,
+    plist: LAUNCHD_PLIST,
+  });
 }
 
 function segmentMessages(rows) {
@@ -521,6 +556,7 @@ async function backfill() {
       segmentsAlreadySucceeded: state.segmentsAlreadySucceeded,
       segmentsFailed: state.segmentsFailed,
     });
+    scheduleLaunchAgentCleanup();
   } finally {
     releaseLock();
   }
