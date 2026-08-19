@@ -50,6 +50,11 @@ Extraction output is capped at 50 claims and 4,096 completion tokens; entity res
 HTTPX's per-operation timeout. Completion logs record timing, finish reason, token count, and content size
 without recording model input or output text.
 
+Some compatible providers append a second value or text after an otherwise valid structured JSON value.
+Reflection validates and uses only the first JSON value and logs the ignored trailing character count,
+never the trailing content. Invalid model output is reported without including source or response text in
+exception traces.
+
 Voyage requests set `truncation=false`. Inputs are rejected above 30,000 UTF-8 bytes and requests are
 partitioned below both 128 inputs and 100,000 UTF-8 bytes. Byte limits are intentionally conservative
 upper bounds for the provider's token limits and avoid a tokenizer dependency.

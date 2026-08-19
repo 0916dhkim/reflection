@@ -223,10 +223,9 @@ class ModelClient:
             content = choice["message"]["content"]
             if not isinstance(content, str):
                 raise TypeError("message content is not a string")
-            result = response_model.model_validate_json(content)
             usage = payload.get("usage") or {}
             logger.info(
-                "model call completed schema=%s model=%s elapsed_seconds=%.2f "
+                "model response received schema=%s model=%s elapsed_seconds=%.2f "
                 "finish_reason=%s completion_tokens=%s content_chars=%d",
                 schema_name,
                 model,
@@ -235,9 +234,26 @@ class ModelClient:
                 usage.get("completion_tokens"),
                 len(content),
             )
+            start_index = len(content) - len(content.lstrip())
+            value, end_index = json.JSONDecoder().raw_decode(content, start_index)
+            result = response_model.model_validate(value)
+            trailing_chars = len(content[end_index:].strip())
+            if trailing_chars:
+                logger.warning(
+                    "ignored trailing model output schema=%s model=%s trailing_chars=%d",
+                    schema_name,
+                    model,
+                    trailing_chars,
+                )
             return result
         except (KeyError, IndexError, TypeError, ValueError, ValidationError) as exc:
-            raise UpstreamValidationError("invalid structured model response") from exc
+            logger.warning(
+                "invalid structured model response schema=%s model=%s error_type=%s",
+                schema_name,
+                model,
+                type(exc).__name__,
+            )
+            raise UpstreamValidationError("invalid structured model response") from None
 
 
 class EmbeddingClient:

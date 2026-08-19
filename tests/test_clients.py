@@ -201,6 +201,34 @@ async def test_model_call_has_wall_clock_timeout() -> None:
 
 
 @pytest.mark.asyncio
+async def test_model_call_accepts_first_valid_json_value_and_ignores_trailing_output() -> None:
+    content = json.dumps({"summary": "Summary", "claims": []}) + '\n{"summary":"duplicate"}'
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "choices": [{"finish_reason": "stop", "message": {"content": content}}],
+                "usage": {"completion_tokens": 20},
+            },
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        result = await ModelClient(client, settings()).extract(
+            SegmentCreate(
+                session_id="session",
+                start_user_message_id="start",
+                end_user_message_id="end",
+                messages=[{"role": "user", "text": "source"}],
+            ),
+            [],
+        )
+
+    assert result.summary == "Summary"
+    assert result.claims == []
+
+
+@pytest.mark.asyncio
 async def test_voyage_call_uses_direct_api_shape_and_restores_index_order() -> None:
     captured: dict[str, Any] = {}
     vector_a = [0.1] * 1024
