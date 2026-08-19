@@ -110,7 +110,10 @@ class ModelClient:
             "information. Prior summaries never increase confidence. The summary must be at most "
             "1000 characters. Return at most 25 nonredundant, durable claims. Prefer final "
             "decisions and reusable facts; omit draft wording, transient discussion, and duplicate "
-            "variants. "
+            "variants. Explicit communication requirements are durable decisions: preserve "
+            "instructions about what a message must include, emphasize, or avoid as claims about a "
+            "fully qualified communication entity. Omit disposable prose drafts, not the rules "
+            "governing them. "
             "Before returning, verify that every predicate reads naturally when placed between its "
             "subject and object and contains no underscores or camelCase."
         )

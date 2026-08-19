@@ -120,6 +120,7 @@ async def test_extraction_call_uses_strict_schema_provider_and_all_prior_summari
     assert "user-facing display text" in system_prompt
     assert "at most 25 nonredundant" in system_prompt
     assert "Write 'Ideogram Pro plan', not 'Pro plan'" in system_prompt
+    assert "Explicit communication requirements are durable decisions" in system_prompt
     assert result.summary == "A short summary"
 
 
