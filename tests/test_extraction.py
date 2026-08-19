@@ -49,7 +49,7 @@ class FakeModels:
                     "predicate": "has age",
                     "confidence": 0.7,
                     "object_entity": None,
-                    "object_value": "30",
+                    "object_value": "30 years",
                 },
             ],
         )
@@ -120,7 +120,7 @@ async def test_prepare_resolves_occurrences_but_not_literals_with_claim_context(
     assert prepared.claims[0].confidence == 0.9
     assert prepared.claims[0].object_value is None
     assert prepared.claims[1].object_entity_id is None
-    assert prepared.claims[1].object_value == "30"
+    assert prepared.claims[1].object_value == "30 years"
     assert prepared.claims[0].subject_entity_id != prepared.claims[1].subject_entity_id
     assert {entity.description for entity in prepared.entities} == {
         "Description for Alex One",

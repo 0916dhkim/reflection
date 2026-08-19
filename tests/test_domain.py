@@ -102,6 +102,35 @@ def test_claim_requires_exactly_one_object_kind() -> None:
         )
 
 
+def test_claim_predicate_must_use_natural_language() -> None:
+    with pytest.raises(ValueError, match="pattern"):
+        ExtractedClaim(
+            subject="Acme Pro plan",
+            predicate="has_monthly_credit_grant",
+            confidence=0.9,
+            object_entity=None,
+            object_value="7200 credits",
+        )
+
+    with pytest.raises(ValueError, match="natural-language"):
+        ExtractedClaim(
+            subject="Acme Pro plan",
+            predicate="hasMonthlyCreditGrant",
+            confidence=0.9,
+            object_entity=None,
+            object_value="7200 credits",
+        )
+
+    claim = ExtractedClaim(
+        subject="Acme Pro plan",
+        predicate="has monthly credit grant",
+        confidence=0.9,
+        object_entity=None,
+        object_value="7200 credits",
+    )
+    assert claim.predicate == "has monthly credit grant"
+
+
 def test_literal_and_entity_equivalence_keys_are_distinct() -> None:
     subject_id = uuid4()
     object_id = uuid4()

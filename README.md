@@ -20,7 +20,9 @@ For each job the worker:
 2. Calls the configured OpenRouter-compatible extraction model with low reasoning. The strict result is
    a summary of at most 1000 characters and claims with a confidence from 0 to 1, an entity subject, and
    exactly one entity object or literal value. Source grounding is a model instruction and best-effort
-   property, not a separately validated guarantee.
+   property, not a separately validated guarantee. Extraction favors the most specific independently
+   referable subject, keeps named plans/products/projects/policies as entities, emits short natural-language
+   predicates rather than snake case, and preserves units and qualifiers in literal values.
 3. Creates a separate endpoint occurrence for every entity subject and entity object. It embeds each
    occurrence together with its supporting claim and segment summary using Voyage `voyage-4-large` at
    1024 dimensions, then retrieves the union of at most five indexable pg_trgm name/alias candidates and

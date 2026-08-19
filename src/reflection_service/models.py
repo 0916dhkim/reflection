@@ -1,11 +1,23 @@
+import re
 from datetime import datetime
 from enum import StrEnum
 from typing import Annotated, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StringConstraints,
+    field_validator,
+    model_validator,
+)
 
 ShortText = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=500)]
+NaturalPredicate = Annotated[
+    str,
+    StringConstraints(strip_whitespace=True, min_length=1, max_length=500, pattern=r"^[^_]+$"),
+]
 Description = Annotated[
     str, StringConstraints(strip_whitespace=True, min_length=1, max_length=1000)
 ]
@@ -105,10 +117,17 @@ class SearchResponse(StrictModel):
 
 class ExtractedClaim(StrictModel):
     subject: ShortText
-    predicate: ShortText
+    predicate: NaturalPredicate
     confidence: Annotated[float, Field(ge=0, le=1)]
     object_entity: ShortText | None
     object_value: LiteralText | None
+
+    @field_validator("predicate")
+    @classmethod
+    def require_natural_predicate(cls, value: str) -> str:
+        if re.search(r"[a-z][A-Z]", value):
+            raise ValueError("predicate must use natural-language words separated by spaces")
+        return value
 
     @model_validator(mode="after")
     def validate_object(self) -> "ExtractedClaim":
