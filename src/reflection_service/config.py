@@ -27,6 +27,7 @@ class Settings(BaseSettings):
     worker_lock_id: int = 7_320_260_818_001
     migration_lock_id: int = 7_320_260_818_002
     request_timeout_seconds: float = 120.0
+    model_call_timeout_seconds: float = 180.0
     migrations_dir: Path = Path("migrations")
     log_level: str = "INFO"
 

@@ -70,8 +70,11 @@ class ExtractionEngine:
                 context_specs, candidate_sets, strict=True
             )
         )
-        resolution_result = await self._models.resolve(extracted.summary, contexts)
-        validated = validate_resolutions(contexts, resolution_result)
+        if contexts:
+            resolution_result = await self._models.resolve(extracted.summary, contexts)
+            validated = validate_resolutions(contexts, resolution_result)
+        else:
+            validated = {}
 
         entities_by_id: dict[UUID, PreparedEntity] = {}
         occurrence_entities: dict[str, PreparedEntity] = {}

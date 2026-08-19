@@ -1,4 +1,7 @@
+import asyncio
 import json
+import logging
+import time
 from collections.abc import Sequence
 from typing import Any
 
@@ -8,6 +11,8 @@ from pydantic import BaseModel, ValidationError
 from reflection_service.config import Settings
 from reflection_service.domain import MentionContext, TerminalExtractionValidationError
 from reflection_service.models import ExtractionResult, ResolutionResult, SegmentCreate
+
+logger = logging.getLogger(__name__)
 
 
 class UpstreamResponseError(RuntimeError):
@@ -113,6 +118,7 @@ class ModelClient:
             user=user,
             response_model=ExtractionResult,
             schema_name="reflection_extraction",
+            max_tokens=4096,
         )
 
     async def resolve(self, summary: str, mentions: Sequence[MentionContext]) -> ResolutionResult:
@@ -154,6 +160,7 @@ class ModelClient:
             user=user,
             response_model=ResolutionResult,
             schema_name="entity_resolution",
+            max_tokens=16_384,
         )
 
     async def _structured_call[T: BaseModel](
@@ -165,41 +172,70 @@ class ModelClient:
         user: dict[str, Any],
         response_model: type[T],
         schema_name: str,
+        max_tokens: int,
     ) -> T:
-        response = await self._client.post(
-            f"{self._settings.openrouter_base_url}/chat/completions",
-            headers={
-                "Authorization": f"Bearer {self._settings.openrouter_api_key.get_secret_value()}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": model,
-                "reasoning": {"effort": reasoning_effort},
-                "provider": {
-                    "require_parameters": True,
-                    "data_collection": "deny",
-                    "zdr": True,
-                },
-                "messages": [
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": json.dumps(user, separators=(",", ":"))},
-                ],
-                "response_format": {
-                    "type": "json_schema",
-                    "json_schema": {
-                        "name": schema_name,
-                        "strict": True,
-                        "schema": strict_json_schema(response_model),
+        started_at = time.monotonic()
+        try:
+            async with asyncio.timeout(self._settings.model_call_timeout_seconds):
+                response = await self._client.post(
+                    f"{self._settings.openrouter_base_url}/chat/completions",
+                    headers={
+                        "Authorization": (
+                            f"Bearer {self._settings.openrouter_api_key.get_secret_value()}"
+                        ),
+                        "Content-Type": "application/json",
                     },
-                },
-            },
-        )
+                    json={
+                        "model": model,
+                        "max_tokens": max_tokens,
+                        "reasoning": {"effort": reasoning_effort},
+                        "provider": {
+                            "require_parameters": True,
+                            "data_collection": "deny",
+                            "zdr": True,
+                        },
+                        "messages": [
+                            {"role": "system", "content": system},
+                            {"role": "user", "content": json.dumps(user, separators=(",", ":"))},
+                        ],
+                        "response_format": {
+                            "type": "json_schema",
+                            "json_schema": {
+                                "name": schema_name,
+                                "strict": True,
+                                "schema": strict_json_schema(response_model),
+                            },
+                        },
+                    },
+                )
+        except TimeoutError:
+            logger.warning(
+                "model call timed out schema=%s model=%s timeout_seconds=%s",
+                schema_name,
+                model,
+                self._settings.model_call_timeout_seconds,
+            )
+            raise
         response.raise_for_status()
         try:
-            content = response.json()["choices"][0]["message"]["content"]
+            payload = response.json()
+            choice = payload["choices"][0]
+            content = choice["message"]["content"]
             if not isinstance(content, str):
                 raise TypeError("message content is not a string")
-            return response_model.model_validate_json(content)
+            result = response_model.model_validate_json(content)
+            usage = payload.get("usage") or {}
+            logger.info(
+                "model call completed schema=%s model=%s elapsed_seconds=%.2f "
+                "finish_reason=%s completion_tokens=%s content_chars=%d",
+                schema_name,
+                model,
+                time.monotonic() - started_at,
+                choice.get("finish_reason"),
+                usage.get("completion_tokens"),
+                len(content),
+            )
+            return result
         except (KeyError, IndexError, TypeError, ValueError, ValidationError) as exc:
             raise UpstreamValidationError("invalid structured model response") from exc
 

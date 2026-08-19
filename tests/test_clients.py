@@ -1,3 +1,4 @@
+import asyncio
 import json
 from typing import Any
 from uuid import uuid4
@@ -23,12 +24,13 @@ from reflection_service.domain import (
 from reflection_service.models import SegmentCreate
 
 
-def settings() -> Settings:
+def settings(**overrides: Any) -> Settings:
     return Settings(
         database_url="postgresql://unused",
         reflection_api_key="reflection-key",
         openrouter_api_key="openrouter-key",
         voyage_api_key="voyage-key",
+        **overrides,
     )
 
 
@@ -90,6 +92,7 @@ async def test_extraction_call_uses_strict_schema_provider_and_all_prior_summari
     user_payload = json.loads(captured["messages"][1]["content"])
     schema = captured["response_format"]["json_schema"]["schema"]
     assert captured["model"] == "deepseek/deepseek-v4-flash-0731"
+    assert captured["max_tokens"] == 4096
     assert captured["reasoning"] == {"effort": "low"}
     assert captured["provider"] == {
         "require_parameters": True,
@@ -98,6 +101,7 @@ async def test_extraction_call_uses_strict_schema_provider_and_all_prior_summari
     }
     assert captured["response_format"]["json_schema"]["strict"] is True
     assert_all_object_properties_required(schema)
+    assert schema["properties"]["claims"]["maxItems"] == 50
     assert user_payload["prior_session_segment_summaries"] == ["first", "second", "third"]
     system_prompt = captured["messages"][0]["content"]
     assert "most specific independently referable subject" in system_prompt
@@ -162,6 +166,7 @@ async def test_resolution_receives_occurrence_context_summary_and_descriptions()
     user_payload = json.loads(captured["messages"][1]["content"])
     candidate = user_payload["mentions"][0]["candidates"][0]
     assert captured["model"] == "deepseek/deepseek-v4-pro-0813"
+    assert captured["max_tokens"] == 16_384
     assert captured["reasoning"] == {"effort": "high"}
     assert captured["provider"] == {
         "require_parameters": True,
@@ -174,6 +179,25 @@ async def test_resolution_receives_occurrence_context_summary_and_descriptions()
     assert "Apple (company)" in captured["messages"][0]["content"]
     assert "Apple (fruit)" in captured["messages"][0]["content"]
     assert result.resolutions[0].candidate_entity_id == entity_id
+
+
+@pytest.mark.asyncio
+async def test_model_call_has_wall_clock_timeout() -> None:
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        await asyncio.sleep(0.05)
+        return httpx.Response(200, json={"choices": []})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(TimeoutError):
+            await ModelClient(client, settings(model_call_timeout_seconds=0.01)).extract(
+                SegmentCreate(
+                    session_id="session",
+                    start_user_message_id="start",
+                    end_user_message_id="end",
+                    messages=[{"role": "user", "text": "source"}],
+                ),
+                [],
+            )
 
 
 @pytest.mark.asyncio

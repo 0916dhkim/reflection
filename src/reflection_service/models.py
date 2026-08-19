@@ -138,7 +138,7 @@ class ExtractedClaim(StrictModel):
 
 class ExtractionResult(StrictModel):
     summary: Annotated[str, StringConstraints(strip_whitespace=True, max_length=1000)]
-    claims: Annotated[list[ExtractedClaim], Field(max_length=500)]
+    claims: Annotated[list[ExtractedClaim], Field(max_length=50)]
 
 
 class Resolution(StrictModel):
