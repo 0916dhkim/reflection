@@ -26,6 +26,19 @@ def segment_id_for(session_id: str, start_user_message_id: str) -> UUID:
     return uuid5(SEGMENT_NAMESPACE, f"{session_id}\0{start_user_message_id}")
 
 
+def projection_fingerprint(
+    segment_id: UUID,
+    end_user_message_id: str,
+    summary: str,
+    projection_version: int,
+) -> str:
+    value = (
+        f"{segment_id}:{len(end_user_message_id)}:{end_user_message_id}:"
+        f"{len(summary)}:{summary}:{projection_version}"
+    )
+    return hashlib.sha256(value.encode()).hexdigest()
+
+
 def new_entity_id_for(segment_id: UUID, canonical_name: str) -> UUID:
     return uuid5(ENTITY_NAMESPACE, f"{segment_id}\0{normalize_name(canonical_name)}")
 
@@ -105,6 +118,7 @@ class PreparedSegment:
     summary: str
     entities: tuple[PreparedEntity, ...]
     claims: tuple[PreparedClaim, ...]
+    projection_version: int = 0
 
 
 @dataclass(frozen=True, slots=True)

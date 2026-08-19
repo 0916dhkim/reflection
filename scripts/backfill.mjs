@@ -15,6 +15,7 @@ import { DatabaseSync } from "node:sqlite";
 
 const HOME = homedir();
 const MAX_SEGMENT_CHARS = 20_000;
+const PROJECTION_VERSION = 1;
 const INACTIVE_MS = 10 * 60 * 1000;
 const PROVIDER_POLL_MS = Number(
   process.env.REFLECTION_PROVIDER_POLL_MS ?? 5 * 60_000,
@@ -163,27 +164,38 @@ function segmentMessages(rows) {
       userMessageId: row.id,
       charCount: row.text.length,
       messages: [{ index, role: "user", text: row.text }],
+      complete: false,
     };
     turns.push(turn);
     turnsById.set(row.id, turn);
   }
 
-  const completed = new Set();
   for (const [index, row] of rows.entries()) {
     if (row.role !== "assistant" || !row.parentId) continue;
     const turn = turnsById.get(row.parentId);
     if (!turn) continue;
     turn.messages.push({ index, role: "assistant", text: row.text });
     turn.charCount += row.text.length;
-    completed.add(row.parentId);
+    if (
+      !row.error &&
+      typeof row.timeCompleted === "number" &&
+      typeof row.finish === "string" &&
+      !["tool-calls", "unknown"].includes(row.finish)
+    ) {
+      turn.complete = true;
+    }
   }
 
   const segments = [];
   let current = [];
   let currentChars = 0;
-  for (const turn of turns.filter((candidate) =>
-    completed.has(candidate.userMessageId),
-  )) {
+  for (const turn of turns) {
+    if (!turn.complete) {
+      if (current.length) segments.push(current);
+      current = [];
+      currentChars = 0;
+      continue;
+    }
     if (turn.charCount > MAX_SEGMENT_CHARS) {
       if (current.length) segments.push(current);
       segments.push([turn]);
@@ -246,6 +258,7 @@ function validatedJob(value) {
     value === null ||
     !Number.isInteger(value.id) ||
     typeof value.segment_id !== "string" ||
+    !Number.isInteger(value.projection_version) ||
     !["pending", "running", "succeeded", "failed"].includes(value.status) ||
     !Number.isInteger(value.attempts) ||
     (value.error !== null && typeof value.error !== "string")
@@ -402,13 +415,32 @@ const messageQuery = sqlite.prepare(`
     m.id,
     json_extract(m.data, '$.role') AS role,
     json_extract(m.data, '$.parentID') AS parentId,
+    json_extract(m.data, '$.error') AS error,
+    json_extract(m.data, '$.finish') AS finish,
+    json_extract(m.data, '$.time.completed') AS timeCompleted,
     COALESCE((
       SELECT group_concat(text, '')
       FROM (
-        SELECT json_extract(p.data, '$.text') AS text
+        SELECT CASE
+          WHEN json_extract(p.data, '$.type') = 'text'
+            THEN COALESCE(json_extract(p.data, '$.text'), '')
+          WHEN json_extract(p.data, '$.type') = 'file'
+            THEN '[Attachment' ||
+                 CASE
+                   WHEN json_extract(p.data, '$.filename') IS NOT NULL
+                     THEN ' ' || substr(json_extract(p.data, '$.filename'), 1, 500)
+                   ELSE ''
+                 END ||
+                 CASE
+                   WHEN json_extract(p.data, '$.mime') IS NOT NULL
+                     THEN ' (' || substr(json_extract(p.data, '$.mime'), 1, 200) || ')'
+                   ELSE ''
+                 END || ']'
+          ELSE ''
+        END AS text
         FROM part p
         WHERE p.message_id = m.id
-          AND json_extract(p.data, '$.type') = 'text'
+          AND COALESCE(json_extract(p.data, '$.ignored'), 0) != 1
         ORDER BY p.id
       )
     ), '') AS text
@@ -477,20 +509,32 @@ async function processSession(session, segments) {
       endUserMessageId: segment.endUserMessageId,
     };
     saveState();
-    const job = validatedJob(
-      await serviceRequest("/v1/segments", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          session_id: session.id,
-          start_user_message_id: segment.startUserMessageId,
-          end_user_message_id: segment.endUserMessageId,
-          messages: segment.messages,
-        }),
+    const submission = {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        session_id: session.id,
+        start_user_message_id: segment.startUserMessageId,
+        end_user_message_id: segment.endUserMessageId,
+        projection_version: PROJECTION_VERSION,
+        messages: segment.messages,
       }),
+    };
+    let job = validatedJob(
+      await serviceRequest("/v1/segments", submission),
     );
-    const wasAlreadySucceeded = job.status === "succeeded";
-    const completed = await completeJob(job);
+    let wasAlreadySucceeded = job.status === "succeeded";
+    let completed = await completeJob(job);
+    while (
+      completed.status === "succeeded" &&
+      completed.projection_version < PROJECTION_VERSION
+    ) {
+      job = validatedJob(
+        await serviceRequest("/v1/segments", submission),
+      );
+      wasAlreadySucceeded = wasAlreadySucceeded && job.status === "succeeded";
+      completed = await completeJob(job);
+    }
     if (completed.status === "succeeded") {
       if (wasAlreadySucceeded) state.segmentsAlreadySucceeded += 1;
       else state.segmentsSucceeded += 1;

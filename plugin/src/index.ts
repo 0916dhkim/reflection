@@ -6,6 +6,12 @@ import { tool, type Plugin } from "@opencode-ai/plugin";
 
 import { requestSignal, safeErrorDetail } from "./http.js";
 import {
+  activeModel,
+  projectMessages,
+  type StoredSegmentSummary,
+} from "./projection.js";
+import { ProjectionStateStore } from "./projection-state.js";
+import {
   readSegmentMessages,
   segmentMessages,
   type OpenCodeMessage,
@@ -13,11 +19,21 @@ import {
 } from "./segments.js";
 
 const CONFIG_PATH = join(homedir(), ".config", "opencode", "reflection.json");
+const PROJECTION_STATE_PATH = join(
+  homedir(),
+  ".local",
+  "state",
+  "reflection",
+  "projection",
+);
 const INACTIVE_MS = 10 * 60 * 1000;
+const PROJECTION_REQUEST_TIMEOUT_MS = 5_000;
+const PROJECTION_VERSION = 1;
 
 interface ReflectionConfig {
   url: string;
   apiKey: string;
+  contextProjection: boolean;
 }
 
 interface ApiResult {
@@ -33,6 +49,22 @@ interface StoredSegment {
   end_user_message_id: string;
 }
 
+interface ProviderListData {
+  all: Array<{
+    id: string;
+    models: Record<
+      string,
+      { limit: { context: number; input?: number; output?: number } }
+    >;
+  }>;
+}
+
+interface ModelLimits {
+  contextLimit: number;
+  inputLimit?: number;
+  outputLimit?: number;
+}
+
 function loadConfig(): ReflectionConfig | null {
   try {
     const value: unknown = JSON.parse(readFileSync(CONFIG_PATH, "utf8"));
@@ -46,13 +78,27 @@ function loadConfig(): ReflectionConfig | null {
       typeof value.apiKey === "string" &&
       value.apiKey.length > 0
     ) {
-      return { url: value.url.replace(/\/$/, ""), apiKey: value.apiKey };
+      const projection =
+        "contextProjection" in value &&
+        typeof value.contextProjection === "object" &&
+        value.contextProjection !== null &&
+        "enabled" in value.contextProjection &&
+        value.contextProjection.enabled === true;
+      return {
+        url: value.url.replace(/\/$/, ""),
+        apiKey: value.apiKey,
+        contextProjection: projection,
+      };
     }
   } catch {}
   return null;
 }
 
-async function apiCall(path: string, init: RequestInit): Promise<ApiResult> {
+async function apiCall(
+  path: string,
+  init: RequestInit,
+  timeoutMs?: number,
+): Promise<ApiResult> {
   const config = loadConfig();
   if (!config) {
     return {
@@ -63,7 +109,7 @@ async function apiCall(path: string, init: RequestInit): Promise<ApiResult> {
     };
   }
 
-  const request = requestSignal(init.signal);
+  const request = requestSignal(init.signal, timeoutMs);
   try {
     const headers = new Headers(init.headers);
     headers.set("X-Api-Key", config.apiKey);
@@ -121,8 +167,47 @@ function submissionBody(sessionId: string, segment: ReflectionSegment) {
     session_id: sessionId,
     start_user_message_id: segment.startUserMessageId,
     end_user_message_id: segment.endUserMessageId,
+    projection_version: PROJECTION_VERSION,
     messages: segment.messages,
   };
+}
+
+function parseSegmentSummaries(
+  data: unknown,
+  sessionId: string,
+): StoredSegmentSummary[] | null {
+  if (
+    typeof data !== "object" ||
+    data === null ||
+    !("segments" in data) ||
+    !("session_id" in data) ||
+    data.session_id !== sessionId
+  ) {
+    return null;
+  }
+  if (!Array.isArray(data.segments)) return null;
+  const result: StoredSegmentSummary[] = [];
+  for (const item of data.segments) {
+    if (typeof item !== "object" || item === null) return null;
+    const value = item as Record<string, unknown>;
+    if (
+      typeof value.id !== "string" ||
+      typeof value.start_user_message_id !== "string" ||
+      typeof value.end_user_message_id !== "string" ||
+      !Number.isInteger(value.projection_version) ||
+      typeof value.summary !== "string"
+    ) {
+      return null;
+    }
+    result.push({
+      id: value.id,
+      start_user_message_id: value.start_user_message_id,
+      end_user_message_id: value.end_user_message_id,
+      projection_version: value.projection_version as number,
+      summary: value.summary,
+    });
+  }
+  return result;
 }
 
 function formatData(data: unknown): string {
@@ -135,6 +220,12 @@ function formatApiFailure(operation: string, response: ApiResult): string {
 }
 
 export const Reflection: Plugin = async ({ client, directory }) => {
+  const initialConfig = loadConfig();
+  const projectionEnabled = initialConfig?.contextProjection === true;
+  const projectionState = new ProjectionStateStore(PROJECTION_STATE_PATH);
+  const modelLimits = new Map<string, ModelLimits>();
+  const compactingSessions = new Map<string, number>();
+  const sessionGenerations = new Map<string, number>();
   const log = async (message: string) => {
     try {
       await client.app.log({
@@ -172,8 +263,67 @@ export const Reflection: Plugin = async ({ client, directory }) => {
     }
   };
 
+  const getModelLimits = async (
+    providerId: string,
+    modelId: string,
+  ): Promise<ModelLimits> => {
+    const key = `${providerId}/${modelId}`;
+    const cached = modelLimits.get(key);
+    if (cached) return cached;
+    const response = await client.provider.list({ query: { directory } });
+    const data = response.data as ProviderListData | undefined;
+    const limit = data?.all.find((provider) => provider.id === providerId)
+      ?.models[modelId]?.limit;
+    if (!limit?.context || !Number.isFinite(limit.context)) {
+      throw new Error(`Reflection could not resolve context limit for ${key}`);
+    }
+    const result = {
+      contextLimit: limit.context,
+      inputLimit: limit.input,
+      outputLimit: limit.output,
+    };
+    modelLimits.set(key, result);
+    return result;
+  };
+
+  const getSegmentSummaries = async (
+    sessionId: string,
+  ): Promise<StoredSegmentSummary[]> => {
+    const response = await apiCall(
+      `/v1/sessions/${encodeURIComponent(sessionId)}/segments`,
+      { method: "GET" },
+      PROJECTION_REQUEST_TIMEOUT_MS,
+    );
+    if (!response.ok) {
+      throw new Error(formatApiFailure("context projection", response));
+    }
+    const summaries = parseSegmentSummaries(response.data, sessionId);
+    if (!summaries) {
+      throw new Error("context projection failed: invalid segment summaries");
+    }
+    return summaries;
+  };
+
   return {
+    config: async (config) => {
+      if (!projectionEnabled) return;
+      const mutable = config as typeof config & {
+        compaction?: { auto?: boolean; [key: string]: unknown };
+      };
+      mutable.compaction = { ...mutable.compaction, auto: false };
+    },
+
     event: async ({ event }) => {
+      if (event.type === "session.deleted") {
+        const sessionId = event.properties.info.id;
+        sessionGenerations.set(
+          sessionId,
+          (sessionGenerations.get(sessionId) ?? 0) + 1,
+        );
+        compactingSessions.delete(sessionId);
+        projectionState.delete(sessionId);
+        return;
+      }
       const sessionId =
         event.type === "session.idle"
           ? event.properties.sessionID
@@ -195,6 +345,66 @@ export const Reflection: Plugin = async ({ client, directory }) => {
         }
       } catch (error) {
         await log(`idle ingestion failed: ${String(error)}`);
+      }
+    },
+
+    "experimental.session.compacting": async ({ sessionID }) => {
+      if (projectionEnabled) {
+        compactingSessions.set(sessionID, Date.now() + 60_000);
+      }
+    },
+
+    "experimental.chat.messages.transform": async (_input, output) => {
+      if (!projectionEnabled || output.messages.length === 0) return;
+      const messages = output.messages as OpenCodeMessage[];
+      const model = activeModel(messages);
+      if (!model) {
+        throw new Error(
+          "Reflection context projection could not identify the active session model",
+        );
+      }
+      const compactionDeadline = compactingSessions.get(model.sessionId);
+      if (compactionDeadline !== undefined) {
+        compactingSessions.delete(model.sessionId);
+        if (compactionDeadline >= Date.now()) return;
+      }
+      const generation = sessionGenerations.get(model.sessionId) ?? 0;
+      try {
+        const previous = projectionState.get(model.sessionId);
+        const limits = await getModelLimits(model.providerId, model.modelId);
+        const result = await projectMessages({
+          messages,
+          ...limits,
+          previous,
+          loadSummaries: () => getSegmentSummaries(model.sessionId),
+        });
+        if ((sessionGenerations.get(model.sessionId) ?? 0) !== generation) {
+          throw new Error(
+            `Reflection session ${model.sessionId} was deleted during context projection`,
+          );
+        }
+        if (JSON.stringify(previous) !== JSON.stringify(result.state)) {
+          projectionState.set(model.sessionId, result.state);
+        }
+        output.messages.splice(
+          0,
+          output.messages.length,
+          ...(result.messages as typeof output.messages),
+        );
+        if (result.reset) {
+          try {
+            await client.app.log({
+              body: {
+                service: "reflection",
+                level: "info",
+                message: `context projection reset ${model.sessionId} at ${result.state.checkpoint?.tailStartUserMessageId}; estimated ${result.estimatedTokens}/${limits.contextLimit} tokens`,
+              },
+            });
+          } catch {}
+        }
+      } catch (error) {
+        await log(`context projection failed: ${String(error)}`);
+        throw error;
       }
     },
 

@@ -22,10 +22,17 @@ from reflection_service.domain import (
     PreparedSegment,
     RecallCandidate,
     normalize_name,
+    projection_fingerprint,
     segment_id_for,
     union_candidates,
 )
-from reflection_service.models import JobResponse, SegmentCreate, SegmentResponse
+from reflection_service.models import (
+    PROJECTION_SAFE_VERSION,
+    JobResponse,
+    SegmentCreate,
+    SegmentResponse,
+    SegmentSummary,
+)
 
 
 class JobNotRetryableError(RuntimeError):
@@ -91,25 +98,127 @@ class Database:
             cursor = await connection.execute(
                 """
                 INSERT INTO extraction_jobs (
-                    segment_id, session_id, start_user_message_id, end_user_message_id, payload
+                    segment_id, session_id, start_user_message_id, end_user_message_id,
+                    projection_version, payload
                 )
-                VALUES (%s, %s, %s, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, %s)
                 ON CONFLICT (session_id, start_user_message_id, end_user_message_id)
                 DO UPDATE SET session_id = EXCLUDED.session_id
-                RETURNING id, segment_id, status, attempts, error, created_at, started_at,
-                          finished_at, next_attempt_at
+                RETURNING id, segment_id, projection_version, status, attempts, error,
+                          created_at, started_at, finished_at, next_attempt_at
                 """,
                 (
                     segment_id,
                     request.session_id,
                     request.start_user_message_id,
                     request.end_user_message_id,
+                    request.projection_version,
                     Jsonb(request.model_dump(mode="json")),
                 ),
             )
             row = await cursor.fetchone()
             if row is None:
                 raise RuntimeError("job insert did not return a row")
+            jobs_cursor = await connection.execute(
+                """
+                SELECT id, status, projection_version
+                FROM extraction_jobs
+                WHERE segment_id = %s
+                FOR UPDATE
+                """,
+                (segment_id,),
+            )
+            jobs = await jobs_cursor.fetchall()
+            state = next((item for item in jobs if item["id"] == row["id"]), None)
+            if state is None:
+                raise RuntimeError("job state disappeared during enqueue")
+            segment_cursor = await connection.execute(
+                """
+                SELECT s.end_user_message_id, s.projection_version,
+                       s.projection_commit_fingerprint = reflection_projection_fingerprint(
+                           s.id,
+                           s.end_user_message_id,
+                           s.summary,
+                           s.projection_version
+                       ) AS projection_safe
+                FROM segments s
+                WHERE s.id = %s
+                """,
+                (segment_id,),
+            )
+            current_segment = await segment_cursor.fetchone()
+            await connection.execute(
+                """
+                INSERT INTO segment_targets (
+                    segment_id, job_id, end_user_message_id, projection_version, payload
+                )
+                VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT (segment_id) DO UPDATE
+                SET job_id = EXCLUDED.job_id,
+                    end_user_message_id = EXCLUDED.end_user_message_id,
+                    projection_version = EXCLUDED.projection_version,
+                    payload = EXCLUDED.payload,
+                    updated_at = now()
+                """,
+                (
+                    segment_id,
+                    row["id"],
+                    request.end_user_message_id,
+                    request.projection_version,
+                    Jsonb(request.model_dump(mode="json")),
+                ),
+            )
+            superseded_ids = [
+                item["id"]
+                for item in jobs
+                if item["id"] > row["id"] and item["status"] in {"pending", "failed"}
+            ]
+            if superseded_ids:
+                await connection.execute(
+                    "DELETE FROM extraction_jobs WHERE id = ANY(%s)",
+                    (superseded_ids,),
+                )
+            other_running = any(
+                item["id"] != row["id"] and item["status"] == "running" for item in jobs
+            )
+            current_matches = (
+                current_segment is not None
+                and current_segment["end_user_message_id"] == request.end_user_message_id
+                and current_segment["projection_version"] == request.projection_version
+                and (
+                    request.projection_version < PROJECTION_SAFE_VERSION
+                    or current_segment["projection_safe"]
+                )
+            )
+            lower_version = request.projection_version < state["projection_version"] or (
+                current_segment is not None
+                and request.projection_version < current_segment["projection_version"]
+            )
+            can_queue = state["status"] != "running" and not other_running
+            settled = current_matches and state["status"] != "running" and not other_running
+            if lower_version or settled:
+                await connection.execute(
+                    "DELETE FROM segment_targets WHERE segment_id = %s",
+                    (segment_id,),
+                )
+            elif can_queue:
+                await connection.execute(
+                    """
+                    UPDATE extraction_jobs
+                    SET projection_version = %s, payload = %s, status = 'pending',
+                        attempts = 0, lease_id = NULL, error = NULL, started_at = NULL,
+                        finished_at = NULL, next_attempt_at = now()
+                    WHERE id = %s
+                    """,
+                    (
+                        request.projection_version,
+                        Jsonb(request.model_dump(mode="json")),
+                        row["id"],
+                    ),
+                )
+                row = await self._job_row(connection, row["id"])
+                if row is None:
+                    raise RuntimeError("requeued job disappeared during enqueue")
         return self._job_response(row)
 
     async def get_job(self, job_id: int) -> JobResponse | None:
@@ -152,8 +261,8 @@ class Database:
                 SET status = 'pending', attempts = 0, error = NULL, lease_id = NULL,
                     started_at = NULL, finished_at = NULL, next_attempt_at = now()
                 WHERE id = %s AND status = 'failed' AND lease_id IS NULL
-                RETURNING id, segment_id, status, attempts, error, created_at, started_at,
-                          finished_at, next_attempt_at
+                RETURNING id, segment_id, projection_version, status, attempts, error,
+                          created_at, started_at, finished_at, next_attempt_at
                 """,
                 (job_id,),
             )
@@ -252,7 +361,7 @@ class Database:
             status = "pending"
             next_attempt_at = datetime.now(UTC) + timedelta(seconds=retry_after_seconds)
             finished_at = None
-        async with self.pool.connection() as connection:
+        async with self.pool.connection() as connection, connection.transaction():
             cursor = await connection.execute(
                 """
                 UPDATE extraction_jobs
@@ -269,6 +378,24 @@ class Database:
                     job.lease_id,
                 ),
             )
+            if cursor.rowcount == 1 and retry_after_seconds is None:
+                await connection.execute(
+                    """
+                    DELETE FROM segment_targets t
+                    USING segments s
+                    WHERE t.segment_id = %s
+                      AND s.id = t.segment_id
+                      AND s.end_user_message_id = t.end_user_message_id
+                      AND s.projection_version = t.projection_version
+                      AND s.projection_commit_fingerprint = reflection_projection_fingerprint(
+                          s.id,
+                          s.end_user_message_id,
+                          s.summary,
+                          s.projection_version
+                      )
+                    """,
+                    (job.segment_id,),
+                )
         return cursor.rowcount == 1
 
     async def prior_summaries(self, session_id: str, current_segment_id: UUID) -> list[str]:
@@ -354,6 +481,17 @@ class Database:
 
     async def commit_extraction(self, job: ClaimedJob, prepared: PreparedSegment) -> bool:
         async with self.pool.connection() as connection, connection.transaction():
+            version_cursor = await connection.execute(
+                "SELECT projection_version FROM segments WHERE id = %s FOR UPDATE",
+                (prepared.id,),
+            )
+            existing = await version_cursor.fetchone()
+            if (
+                existing is not None
+                and existing["projection_version"] > prepared.projection_version
+            ):
+                await self._finish_or_requeue_target(connection, job, prepared)
+                return True
             old_entity_cursor = await connection.execute(
                 """
                 SELECT subject_entity_id AS id
@@ -413,12 +551,15 @@ class Database:
             await connection.execute(
                 """
                 INSERT INTO segments (
-                    id, session_id, start_user_message_id, end_user_message_id, summary
+                    id, session_id, start_user_message_id, end_user_message_id, summary,
+                    projection_version, projection_commit_fingerprint
                 )
-                VALUES (%s, %s, %s, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (id) DO UPDATE
                 SET end_user_message_id = EXCLUDED.end_user_message_id,
                     summary = EXCLUDED.summary,
+                    projection_version = EXCLUDED.projection_version,
+                    projection_commit_fingerprint = EXCLUDED.projection_commit_fingerprint,
                     updated_at = now()
                 """,
                 (
@@ -427,6 +568,13 @@ class Database:
                     prepared.start_user_message_id,
                     prepared.end_user_message_id,
                     prepared.summary,
+                    prepared.projection_version,
+                    projection_fingerprint(
+                        prepared.id,
+                        prepared.end_user_message_id,
+                        prepared.summary,
+                        prepared.projection_version,
+                    ),
                 ),
             )
             await connection.execute("DELETE FROM claims WHERE segment_id = %s", (prepared.id,))
@@ -471,6 +619,30 @@ class Database:
                     """,
                     (old_entity_ids,),
                 )
+            await self._finish_or_requeue_target(connection, job, prepared)
+        return True
+
+    async def _finish_or_requeue_target(
+        self,
+        connection: AsyncConnection[Any],
+        job: ClaimedJob,
+        prepared: PreparedSegment,
+    ) -> None:
+        target_cursor = await connection.execute(
+            """
+            SELECT job_id, end_user_message_id, projection_version, payload
+            FROM segment_targets
+            WHERE segment_id = %s
+            FOR UPDATE
+            """,
+            (prepared.id,),
+        )
+        target = await target_cursor.fetchone()
+        target_matches = target is not None and (
+            target["end_user_message_id"] == prepared.end_user_message_id
+            and target["projection_version"] == prepared.projection_version
+        )
+        if target is None or target_matches:
             cursor = await connection.execute(
                 """
                 UPDATE extraction_jobs
@@ -482,7 +654,51 @@ class Database:
             )
             if cursor.rowcount != 1:
                 raise RuntimeError("job lease changed before extraction committed")
-        return True
+            if target_matches:
+                await connection.execute(
+                    "DELETE FROM segment_targets WHERE segment_id = %s",
+                    (prepared.id,),
+                )
+            return
+
+        if target["job_id"] != job.id:
+            cursor = await connection.execute(
+                """
+                UPDATE extraction_jobs
+                SET status = 'succeeded', lease_id = NULL, payload = NULL,
+                    error = NULL, finished_at = now()
+                WHERE id = %s AND status = 'running' AND lease_id = %s
+                """,
+                (job.id, job.lease_id),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError("job lease changed before extraction committed")
+
+        cursor = await connection.execute(
+            """
+            UPDATE extraction_jobs
+            SET projection_version = %s, payload = %s, status = 'pending',
+                attempts = 0, lease_id = NULL, error = NULL, started_at = NULL,
+                finished_at = NULL, next_attempt_at = now()
+            WHERE id = %s AND status <> 'running'
+            """
+            if target["job_id"] != job.id
+            else """
+            UPDATE extraction_jobs
+            SET projection_version = %s, payload = %s, status = 'pending',
+                attempts = 0, lease_id = NULL, error = NULL, started_at = NULL,
+                finished_at = NULL, next_attempt_at = now()
+            WHERE id = %s AND status = 'running' AND lease_id = %s
+            """,
+            (
+                target["projection_version"],
+                Jsonb(target["payload"]),
+                target["job_id"],
+                *(() if target["job_id"] != job.id else (job.lease_id,)),
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise RuntimeError("target job could not be requeued")
 
     async def get_segment(self, segment_id: UUID) -> SegmentResponse | None:
         async with self.pool.connection() as connection:
@@ -510,6 +726,27 @@ class Database:
             )
             claims = await claim_cursor.fetchall()
         return SegmentResponse.model_validate({**segment, "claims": claims})
+
+    async def segment_summaries(self, session_id: str) -> list[SegmentSummary]:
+        async with self.pool.connection() as connection:
+            cursor = await connection.execute(
+                """
+                SELECT s.id, s.start_user_message_id, s.end_user_message_id,
+                       s.projection_version, s.summary
+                FROM segments s
+                WHERE s.session_id = %s
+                  AND s.projection_commit_fingerprint = reflection_projection_fingerprint(
+                      s.id,
+                      s.end_user_message_id,
+                      s.summary,
+                      s.projection_version
+                  )
+                ORDER BY s.created_at, s.id
+                """,
+                (session_id,),
+            )
+            rows = await cursor.fetchall()
+        return [SegmentSummary.model_validate(row) for row in rows]
 
     async def direct_claims(
         self, embedding: Sequence[float], limit: int = 10
@@ -590,7 +827,7 @@ class Database:
         cursor = await connection.execute(
             """
             SELECT id, segment_id, status, attempts, error, created_at, started_at, finished_at,
-                   next_attempt_at
+                   next_attempt_at, projection_version
             FROM extraction_jobs
             WHERE id = %s
             """,

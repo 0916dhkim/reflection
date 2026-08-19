@@ -20,7 +20,13 @@ function assistant(
   ...texts: string[]
 ): OpenCodeMessage {
   return {
-    info: { id, role: "assistant", parentID },
+    info: {
+      id,
+      role: "assistant",
+      parentID,
+      finish: "stop",
+      time: { created: 0, completed: 1 },
+    },
     parts: texts.map((text) => ({ type: "text", text })),
   };
 }
@@ -32,12 +38,16 @@ describe("textOf", () => {
       parts: [
         { type: "text", text: "first" },
         { type: "reasoning", text: "secret" },
+        { type: "text", text: "user-only", ignored: true },
         { type: "tool" },
         { type: "text", text: " second" },
+        { type: "file", filename: "image.png", mime: "image/png" },
       ],
     };
 
-    expect(textOf(message)).toBe("first second");
+    expect(textOf(message)).toBe(
+      "first second[Attachment image.png (image/png)]",
+    );
   });
 });
 
@@ -66,7 +76,7 @@ describe("segmentMessages", () => {
         startUserMessageId: "u2",
         endUserMessageId: "u2",
         charCount: 6,
-        closed: false,
+        closed: true,
         messages: [
           { role: "user", text: "1234" },
           { role: "assistant", text: "56" },
@@ -172,6 +182,43 @@ describe("segmentMessages", () => {
       { role: "assistant", text: "" },
       { role: "assistant", text: "answer" },
     ]);
+  });
+
+  it("never spans an unanswered user message", () => {
+    const messages = [
+      user("u1", "first"),
+      assistant("a1", "u1", "answer"),
+      user("u2", "unanswered"),
+      user("u3", "third"),
+      assistant("a3", "u3", "answer"),
+    ];
+
+    expect(
+      segmentMessages(messages).map((segment) => ({
+        start: segment.startUserMessageId,
+        end: segment.endUserMessageId,
+        closed: segment.closed,
+      })),
+    ).toEqual([
+      { start: "u1", end: "u1", closed: true },
+      { start: "u3", end: "u3", closed: false },
+    ]);
+  });
+
+  it("does not complete failed or intermediate assistant turns", () => {
+    const failed = assistant("a1", "u1", "partial");
+    failed.info.error = { name: "UnknownError" };
+    const intermediate = assistant("a2", "u2", "working");
+    intermediate.info.finish = "tool-calls";
+
+    expect(
+      segmentMessages([
+        user("u1", "failed"),
+        failed,
+        user("u2", "unfinished"),
+        intermediate,
+      ]),
+    ).toEqual([]);
   });
 });
 

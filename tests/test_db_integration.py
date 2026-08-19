@@ -14,7 +14,7 @@ from reflection_service.domain import (
     PreparedSegment,
     equivalence_key,
 )
-from reflection_service.models import SegmentCreate
+from reflection_service.models import JobStatus, SegmentCreate
 
 EMBEDDING = (0.01,) * 1024
 OPPOSITE_EMBEDDING = (-0.01,) * 1024
@@ -91,6 +91,7 @@ def prepared_segment(
                 embedding=OPPOSITE_EMBEDDING,
             ),
         ),
+        projection_version=claimed.request.projection_version,
     )
 
 
@@ -112,13 +113,15 @@ async def test_queue_fencing_replacement_retry_and_recall() -> None:
     try:
         async with database.pool.connection() as connection:
             await connection.execute(
-                "TRUNCATE claims, entity_aliases, entities, segments, extraction_jobs "
+                "TRUNCATE segment_targets, claims, entity_aliases, entities, segments, "
+                "extraction_jobs "
                 "RESTART IDENTITY CASCADE"
             )
         request = SegmentCreate(
             session_id="session",
             start_user_message_id="start",
             end_user_message_id="end-1",
+            projection_version=1,
             messages=[{"role": "user", "text": "hello"}],
         )
 
@@ -180,6 +183,7 @@ async def test_queue_fencing_replacement_retry_and_recall() -> None:
         direct = await database.direct_claims(EMBEDDING)
         neighbors = await database.neighboring_claims(subject_id, EMBEDDING, seed_similarity=0.75)
         summaries = await database.prior_summaries("session", first.segment_id)
+        segment_summaries = await database.segment_summaries("session")
 
         assert segment is not None
         assert segment.end_user_message_id == "end-2"
@@ -193,6 +197,195 @@ async def test_queue_fencing_replacement_retry_and_recall() -> None:
         assert neighbors[0].similarity > neighbors[1].similarity
         assert neighbors[0].seed_similarity == 0.75
         assert summaries == []
+        assert [item.id for item in segment_summaries] == [first.segment_id]
+        assert segment_summaries[0].end_user_message_id == "end-2"
+        assert segment_summaries[0].summary == "Latest tail snapshot"
+
+        legacy_request = SegmentCreate(
+            session_id="session",
+            start_user_message_id="legacy-start",
+            end_user_message_id="legacy-end",
+            messages=[{"role": "user", "text": "legacy"}],
+        )
+        legacy_job = await database.enqueue(legacy_request)
+        async with database.pool.connection() as connection:
+            legacy_claim = await database.claim_oldest_job(connection)
+        assert legacy_claim is not None
+        await database.commit_extraction(
+            legacy_claim,
+            PreparedSegment(
+                id=legacy_claim.segment_id,
+                session_id="session",
+                start_user_message_id="legacy-start",
+                end_user_message_id="legacy-end",
+                summary="Unsafe legacy summary",
+                entities=(),
+                claims=(),
+            ),
+        )
+        mixed_summaries = await database.segment_summaries("session")
+        assert {item.id for item in mixed_summaries} == {
+            first.segment_id,
+            legacy_job.segment_id,
+        }
+        assert {item.projection_version for item in mixed_summaries} == {0, 1}
+
+        safe_job = await database.enqueue(
+            legacy_request.model_copy(update={"projection_version": 1})
+        )
+        assert safe_job.id == legacy_job.id
+        assert safe_job.status == JobStatus.PENDING
+        assert {item.summary for item in await database.segment_summaries("session")} >= {
+            "Unsafe legacy summary"
+        }
+        async with database.pool.connection() as connection:
+            safe_claim = await database.claim_oldest_job(connection)
+        assert safe_claim is not None
+        assert await database.finish_failed_attempt(
+            safe_claim,
+            "terminal v1 failure",
+            retry_after_seconds=None,
+        )
+        assert {item.summary for item in await database.segment_summaries("session")} >= {
+            "Unsafe legacy summary"
+        }
+        safe_job = await database.enqueue(
+            legacy_request.model_copy(update={"projection_version": 1})
+        )
+        assert safe_job.status == JobStatus.PENDING
+        async with database.pool.connection() as connection:
+            safe_claim = await database.claim_oldest_job(connection)
+        assert safe_claim is not None
+        await database.commit_extraction(
+            safe_claim,
+            PreparedSegment(
+                id=safe_claim.segment_id,
+                session_id="session",
+                start_user_message_id="legacy-start",
+                end_user_message_id="legacy-end",
+                summary="Projection-safe summary",
+                entities=(),
+                claims=(),
+                projection_version=1,
+            ),
+        )
+        assert {item.summary for item in await database.segment_summaries("session")} == {
+            "Latest tail snapshot",
+            "Projection-safe summary",
+        }
+        downgrade_job = await database.enqueue(
+            legacy_request.model_copy(update={"end_user_message_id": "legacy-end-2"})
+        )
+        async with database.pool.connection() as connection:
+            downgrade_claim = await database.claim_oldest_job(connection)
+        assert downgrade_claim is not None
+        await database.commit_extraction(
+            downgrade_claim,
+            PreparedSegment(
+                id=downgrade_claim.segment_id,
+                session_id="session",
+                start_user_message_id="legacy-start",
+                end_user_message_id="legacy-end-2",
+                summary="Unsafe downgrade",
+                entities=(),
+                claims=(),
+            ),
+        )
+        preserved = await database.get_segment(safe_job.segment_id)
+        assert preserved is not None
+        assert preserved.summary == "Projection-safe summary"
+        assert preserved.end_user_message_id == "legacy-end"
+
+        forward_job = await database.enqueue(
+            legacy_request.model_copy(
+                update={"end_user_message_id": "legacy-end-2", "projection_version": 1}
+            )
+        )
+        assert forward_job.id == downgrade_job.id
+        assert forward_job.status == JobStatus.PENDING
+        async with database.pool.connection() as connection:
+            forward_claim = await database.claim_oldest_job(connection)
+        assert forward_claim is not None
+        await database.commit_extraction(
+            forward_claim,
+            PreparedSegment(
+                id=forward_claim.segment_id,
+                session_id="session",
+                start_user_message_id="legacy-start",
+                end_user_message_id="legacy-end-2",
+                summary="Projection-safe forward snapshot",
+                entities=(),
+                claims=(),
+                projection_version=1,
+            ),
+        )
+
+        rewind_job = await database.enqueue(
+            legacy_request.model_copy(update={"projection_version": 1})
+        )
+        assert rewind_job.id == safe_job.id
+        assert rewind_job.status == JobStatus.PENDING
+        async with database.pool.connection() as connection:
+            rewind_claim = await database.claim_oldest_job(connection)
+        assert rewind_claim is not None
+        await database.commit_extraction(
+            rewind_claim,
+            PreparedSegment(
+                id=rewind_claim.segment_id,
+                session_id="session",
+                start_user_message_id="legacy-start",
+                end_user_message_id="legacy-end",
+                summary="Projection-safe rewind snapshot",
+                entities=(),
+                claims=(),
+                projection_version=1,
+            ),
+        )
+        rewound = await database.get_segment(safe_job.segment_id)
+        assert rewound is not None
+        assert rewound.summary == "Projection-safe rewind snapshot"
+        assert rewound.end_user_message_id == "legacy-end"
+
+        pending_future = await database.enqueue(
+            legacy_request.model_copy(
+                update={"end_user_message_id": "legacy-end-3", "projection_version": 1}
+            )
+        )
+        replay_current = await database.enqueue(
+            legacy_request.model_copy(update={"projection_version": 1})
+        )
+        assert replay_current.status == JobStatus.SUCCEEDED
+        assert await database.get_job(pending_future.id) is None
+
+        pending_upgrade_request = SegmentCreate(
+            session_id="session",
+            start_user_message_id="pending-upgrade",
+            end_user_message_id="pending-upgrade-end",
+            messages=[{"role": "user", "text": "upgrade"}],
+        )
+        pending_legacy = await database.enqueue(pending_upgrade_request)
+        pending_safe = await database.enqueue(
+            pending_upgrade_request.model_copy(update={"projection_version": 1})
+        )
+        assert pending_safe.id == pending_legacy.id
+        assert pending_safe.projection_version == 1
+        async with database.pool.connection() as connection:
+            pending_safe_claim = await database.claim_oldest_job(connection)
+        assert pending_safe_claim is not None
+        assert pending_safe_claim.request.projection_version == 1
+        await database.commit_extraction(
+            pending_safe_claim,
+            PreparedSegment(
+                id=pending_safe_claim.segment_id,
+                session_id="session",
+                start_user_message_id="pending-upgrade",
+                end_user_message_id="pending-upgrade-end",
+                summary="Safely upgraded while pending",
+                entities=(),
+                claims=(),
+                projection_version=1,
+            ),
+        )
 
         support_request = SegmentCreate(
             session_id="other-session",
@@ -240,6 +433,7 @@ async def test_queue_fencing_replacement_retry_and_recall() -> None:
                 summary="No claims in this snapshot",
                 entities=(),
                 claims=(),
+                projection_version=empty_shared_claim.request.projection_version,
             ),
         )
         async with database.pool.connection() as connection:
@@ -382,6 +576,200 @@ async def test_queue_fencing_replacement_retry_and_recall() -> None:
 
 @pytest.mark.integration
 @pytest.mark.asyncio
+async def test_running_targets_survive_recovery_and_upgrade() -> None:
+    database_url = os.getenv("REFLECTION_TEST_DATABASE_URL")
+    if not database_url:
+        pytest.skip("REFLECTION_TEST_DATABASE_URL is not set")
+    configured = Settings(
+        database_url=database_url,
+        reflection_api_key="test",
+        openrouter_api_key="test",
+        voyage_api_key="test",
+        migrations_dir=Path(__file__).parents[1] / "migrations",
+    )
+    database = Database(configured)
+    await database.open()
+    try:
+        async with database.pool.connection() as connection:
+            await connection.execute(
+                "TRUNCATE segment_targets, claims, entity_aliases, entities, segments, "
+                "extraction_jobs RESTART IDENTITY CASCADE"
+            )
+
+        first_request = SegmentCreate(
+            session_id="running-session",
+            start_user_message_id="start",
+            end_user_message_id="A",
+            projection_version=1,
+            messages=[{"role": "user", "text": "A"}],
+        )
+        first_job = await database.enqueue(first_request)
+        async with database.pool.connection() as connection:
+            first_claim = await database.claim_oldest_job(connection)
+        assert first_claim is not None
+        await database.commit_extraction(
+            first_claim,
+            PreparedSegment(
+                id=first_claim.segment_id,
+                session_id="running-session",
+                start_user_message_id="start",
+                end_user_message_id="A",
+                summary="A",
+                entities=(),
+                claims=(),
+                projection_version=1,
+            ),
+        )
+
+        second_job = await database.enqueue(
+            first_request.model_copy(update={"end_user_message_id": "B"})
+        )
+        async with database.pool.connection() as connection:
+            second_claim = await database.claim_oldest_job(connection)
+        assert second_claim is not None and second_claim.id == second_job.id
+        replay = await database.enqueue(first_request)
+        assert replay.id == first_job.id
+        assert replay.status == JobStatus.SUCCEEDED
+
+        async with database.pool.connection() as connection:
+            assert await database.recover_running_jobs(connection) == 1
+            recovered_second = await database.claim_oldest_job(connection)
+        assert recovered_second is not None and recovered_second.id == second_job.id
+        await database.commit_extraction(
+            recovered_second,
+            PreparedSegment(
+                id=recovered_second.segment_id,
+                session_id="running-session",
+                start_user_message_id="start",
+                end_user_message_id="B",
+                summary="B",
+                entities=(),
+                claims=(),
+                projection_version=1,
+            ),
+        )
+        async with database.pool.connection() as connection:
+            replay_claim = await database.claim_oldest_job(connection)
+        assert replay_claim is not None and replay_claim.id == first_job.id
+        await database.commit_extraction(
+            replay_claim,
+            PreparedSegment(
+                id=replay_claim.segment_id,
+                session_id="running-session",
+                start_user_message_id="start",
+                end_user_message_id="A",
+                summary="A after recovery",
+                entities=(),
+                claims=(),
+                projection_version=1,
+            ),
+        )
+        rewound = await database.get_segment(first_job.segment_id)
+        assert rewound is not None
+        assert rewound.end_user_message_id == "A"
+        assert rewound.summary == "A after recovery"
+
+        failing_job = await database.enqueue(
+            first_request.model_copy(update={"end_user_message_id": "failing-B"})
+        )
+        async with database.pool.connection() as connection:
+            failing_claim = await database.claim_oldest_job(connection)
+        assert failing_claim is not None and failing_claim.id == failing_job.id
+        await database.enqueue(first_request)
+        assert await database.finish_failed_attempt(
+            failing_claim,
+            "terminal failure",
+            retry_after_seconds=None,
+        )
+        async with database.pool.connection() as connection:
+            target_cursor = await connection.execute(
+                "SELECT count(*) AS count FROM segment_targets WHERE segment_id = %s",
+                (first_job.segment_id,),
+            )
+            target_count = await target_cursor.fetchone()
+        assert target_count is not None and target_count["count"] == 0
+
+        upgrade_request = SegmentCreate(
+            session_id="running-session",
+            start_user_message_id="upgrade",
+            end_user_message_id="upgrade-end",
+            messages=[{"role": "user", "text": "upgrade"}],
+        )
+        upgrade_job = await database.enqueue(upgrade_request)
+        async with database.pool.connection() as connection:
+            legacy_claim = await database.claim_oldest_job(connection)
+        assert legacy_claim is not None and legacy_claim.id == upgrade_job.id
+        deferred_upgrade = await database.enqueue(
+            upgrade_request.model_copy(update={"projection_version": 1})
+        )
+        assert deferred_upgrade.status == JobStatus.RUNNING
+        assert deferred_upgrade.projection_version == 0
+        await database.commit_extraction(
+            legacy_claim,
+            PreparedSegment(
+                id=legacy_claim.segment_id,
+                session_id="running-session",
+                start_user_message_id="upgrade",
+                end_user_message_id="upgrade-end",
+                summary="Legacy",
+                entities=(),
+                claims=(),
+            ),
+        )
+        upgraded_job = await database.get_job(upgrade_job.id)
+        assert upgraded_job is not None
+        assert upgraded_job.status == JobStatus.PENDING
+        assert upgraded_job.projection_version == 1
+        async with database.pool.connection() as connection:
+            upgraded_claim = await database.claim_oldest_job(connection)
+        assert upgraded_claim is not None
+        assert upgraded_claim.request.projection_version == 1
+        rollback_connection = await AsyncConnection.connect(
+            database_url,
+            row_factory=dict_row,
+        )
+        async with rollback_connection, rollback_connection.transaction():
+            await rollback_connection.execute("SELECT now()")
+            await database.commit_extraction(
+                upgraded_claim,
+                PreparedSegment(
+                    id=upgraded_claim.segment_id,
+                    session_id="running-session",
+                    start_user_message_id="upgrade",
+                    end_user_message_id="upgrade-end",
+                    summary="Safe",
+                    entities=(),
+                    claims=(),
+                    projection_version=1,
+                ),
+            )
+            assert {
+                item.summary for item in await database.segment_summaries("running-session")
+            } == {
+                "A after recovery",
+                "Safe",
+            }
+            await rollback_connection.execute(
+                """
+                UPDATE segments
+                SET summary = 'unsafe rollback write', updated_at = now()
+                WHERE id = %s
+                """,
+                (upgrade_job.segment_id,),
+            )
+        assert {item.summary for item in await database.segment_summaries("running-session")} == {
+            "A after recovery"
+        }
+        repaired = await database.enqueue(
+            upgrade_request.model_copy(update={"projection_version": 1})
+        )
+        assert repaired.status == JobStatus.PENDING
+    finally:
+        await database.close()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
 async def test_legacy_schema_migrates_in_place() -> None:
     database_url = os.getenv("REFLECTION_TEST_DATABASE_URL")
     if not database_url:
@@ -390,8 +778,8 @@ async def test_legacy_schema_migrates_in_place() -> None:
     async with connection:
         await connection.execute(
             """
-            DROP TABLE IF EXISTS claims, entity_aliases, entities, segments,
-                extraction_jobs CASCADE;
+            DROP TABLE IF EXISTS segment_targets, claims, entity_aliases, entities,
+                segments, extraction_jobs CASCADE;
             CREATE EXTENSION IF NOT EXISTS vector;
             CREATE EXTENSION IF NOT EXISTS pg_trgm;
             CREATE TABLE extraction_jobs (

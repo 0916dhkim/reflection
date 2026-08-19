@@ -3,12 +3,25 @@ export const DEFAULT_MAX_SEGMENT_CHARS = 20_000;
 export interface OpenCodeMessage {
   info: {
     id: string;
+    sessionID?: string;
     role: "user" | "assistant";
     parentID?: string;
+    model?: {
+      providerID: string;
+      modelID: string;
+    };
+    [key: string]: unknown;
   };
   parts: ReadonlyArray<{
     type: string;
     text?: string;
+    tool?: string;
+    state?: unknown;
+    synthetic?: boolean;
+    filename?: string;
+    mime?: string;
+    url?: string;
+    [key: string]: unknown;
   }>;
 }
 
@@ -34,16 +47,43 @@ interface CompleteTurn {
   userMessageId: string;
   charCount: number;
   messages: IndexedMessage[];
+  complete: boolean;
 }
 
 export function textOf(message: OpenCodeMessage): string {
   return message.parts
-    .filter((part) => part.type === "text")
-    .map((part) => part.text ?? "")
+    .flatMap((part) => {
+      if (part.ignored === true) return [];
+      if (part.type === "text") {
+        return [part.text ?? ""];
+      }
+      if (part.type === "file") {
+        const name = part.filename ? ` ${part.filename.slice(0, 500)}` : "";
+        const mime = part.mime ? ` (${part.mime.slice(0, 200)})` : "";
+        return [`[Attachment${name}${mime}]`];
+      }
+      return [];
+    })
     .join("");
 }
 
-function completeTurns(messages: readonly OpenCodeMessage[]): CompleteTurn[] {
+export function isSuccessfulAssistant(message: OpenCodeMessage): boolean {
+  if (message.info.role !== "assistant" || message.info.error) return false;
+  const time = message.info.time;
+  const completed =
+    typeof time === "object" &&
+    time !== null &&
+    "completed" in time &&
+    typeof time.completed === "number";
+  const finish = message.info.finish;
+  return (
+    completed &&
+    typeof finish === "string" &&
+    !["tool-calls", "unknown"].includes(finish)
+  );
+}
+
+function turns(messages: readonly OpenCodeMessage[]): CompleteTurn[] {
   const users = new Map<string, CompleteTurn>();
   const turns: CompleteTurn[] = [];
 
@@ -53,22 +93,26 @@ function completeTurns(messages: readonly OpenCodeMessage[]): CompleteTurn[] {
       userMessageId: message.info.id,
       charCount: textOf(message).length,
       messages: [{ index, message }],
+      complete: false,
     };
     users.set(message.info.id, turn);
     turns.push(turn);
   });
 
-  const completed = new Set<string>();
   messages.forEach((message, index) => {
     if (message.info.role !== "assistant" || !message.info.parentID) return;
     const turn = users.get(message.info.parentID);
     if (!turn) return;
     turn.messages.push({ index, message });
     turn.charCount += textOf(message).length;
-    completed.add(turn.userMessageId);
+    if (isSuccessfulAssistant(message)) turn.complete = true;
   });
 
-  return turns.filter((turn) => completed.has(turn.userMessageId));
+  return turns;
+}
+
+function completeTurns(messages: readonly OpenCodeMessage[]): CompleteTurn[] {
+  return turns(messages).filter((turn) => turn.complete);
 }
 
 function reflectionMessages(
@@ -108,7 +152,13 @@ export function segmentMessages(
   let current: CompleteTurn[] = [];
   let currentChars = 0;
 
-  for (const turn of completeTurns(messages)) {
+  for (const turn of turns(messages)) {
+    if (!turn.complete) {
+      if (current.length > 0) segments.push(makeSegment(current, true));
+      current = [];
+      currentChars = 0;
+      continue;
+    }
     if (turn.charCount > maxChars) {
       if (current.length > 0) segments.push(makeSegment(current, true));
       segments.push(makeSegment([turn], true));

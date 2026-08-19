@@ -6,10 +6,12 @@ FastAPI, PostgreSQL 17, and pgvector.
 
 ## Processing model
 
-`POST /v1/segments` stores the complete request in a durable FIFO job and returns `202` immediately. A
-single worker is elected with a PostgreSQL advisory lock, so multiple API replicas cannot process jobs
-concurrently. The elected worker resets interrupted `running` jobs to `pending` when it acquires the
-lock and always claims the oldest pending identity value. Each claim attempt receives a new lease UUID;
+`POST /v1/segments` stores the complete request in a durable FIFO job, records the latest desired snapshot
+for that deterministic segment, and returns `202` immediately. A single worker is elected with a PostgreSQL
+advisory lock, so multiple API replicas cannot process jobs concurrently. The elected worker resets
+interrupted `running` jobs to `pending` when it acquires the lock and always claims the oldest pending
+identity value. If the desired snapshot changes while an older job is running, the same transaction that
+finishes the older extraction durably requeues the desired range/version. Each claim attempt receives a new lease UUID;
 success, failure, and automatic requeue writes must match that lease, so work from a fenced-out worker
 cannot commit after recovery.
 
@@ -69,8 +71,10 @@ partitioned below both 128 inputs and 100,000 UTF-8 bytes. Byte limits are inten
 upper bounds for the provider's token limits and avoid a tokenizer dependency.
 
 The model schemas contain no evidence or quote field. Source messages remain in the local PostgreSQL job
-payload while pending, running, or failed, but the successful commit clears that payload so completed
-transcripts are not duplicated. Messages are never returned by segment or search endpoints. Recall returns
+payload while pending, running, or failed. A transient desired-snapshot row also retains the latest submitted
+payload only while a running or queued extraction must converge to it. The successful desired commit clears
+the job payload and desired row so completed transcripts are not duplicated; a terminal failure also clears
+a desired row when the already-committed projection-safe segment proves it is satisfied. Messages are never returned by segment or search endpoints. Recall returns
 segment IDs only; any source-message hydration is explicitly local-only work for the caller and is not
 performed by this service.
 
@@ -90,6 +94,7 @@ Content-Type: application/json
   "session_id": "session-1",
   "start_user_message_id": "message-10",
   "end_user_message_id": "message-20",
+  "projection_version": 1,
   "messages": [
     {"role": "user", "text": "I use PostgreSQL for Reflection."},
     {"role": "assistant", "text": "Understood."}
@@ -97,10 +102,14 @@ Content-Type: application/json
 }
 ```
 
-The segment UUID is UUIDv5-derived from `session_id` and `start_user_message_id`. Reposting an exact
-`session_id`/start/end range returns the original job, even if its status is terminal. A different end ID
-creates a new FIFO job for the same deterministic segment. This supports mutable tail snapshots: the older
-range applies first and the newer snapshot atomically replaces it.
+The segment UUID is UUIDv5-derived from `session_id` and `start_user_message_id`. Queue identity uses the
+`session_id`/start/end range. Reposting an exact current snapshot returns the original job; a higher projection
+version or a history rewind to a previously replaced end boundary requeues that identity with the submitted
+payload. A different end ID creates a new FIFO job for the same deterministic segment. This preserves binary
+rollback compatibility while supporting mutable tails and safe re-extraction. Lower-version jobs cannot
+overwrite a newer projection-safe segment. `projection_version` defaults to `0`. During migration, context
+projection uses committed summaries from both versions while version `1` ingestion replaces version `0`
+incrementally.
 
 Message text may be empty. A single message may contain up to 1,000,000 characters, while the aggregate
 text across a segment is limited to 2,000,000 characters. This permits one unusually large turn without
@@ -111,6 +120,7 @@ allowing an unbounded many-message payload.
 - `GET /v1/jobs/{id}` returns queue state, attempts, timestamps, and a bounded error string.
 - `POST /v1/jobs/{id}/retry` resets a terminal failed job's attempt budget and returns `202`.
 - `GET /v1/segments/{uuid}` returns metadata, summary, and resolved claims, but no source messages.
+- `GET /v1/sessions/{session_id}/segments` returns committed version `0` and version `1` segment IDs, boundaries, versions, and summaries in creation order for authenticated context projection clients.
 - `POST /v1/search` accepts `{"query":"..."}`.
 
 An old failed mutable-tail snapshot cannot be explicitly retried after any newer job exists for the same
@@ -193,6 +203,11 @@ five minutes before retrying through Reflection, ensuring the readiness check us
 credentials and configured models. Other terminal failures receive one explicit retry and are recorded
 before the worker continues.
 Sessions updated within the last ten minutes are deferred and rechecked after other stable sessions.
+
+Backfill submissions use projection version `1` and the same hidden-text, attachment-metadata, successful-turn,
+and unanswered-turn barrier rules as the live plugin. After deploying the migration, stop the version `0`
+worker and run the upgraded backfill. Projection may be activated after a mixed-version smoke test and uses
+version `0` summaries until each segment is replaced by version `1`.
 
 The worker reads service credentials from `~/.config/opencode/reflection.json`. Progress is atomically
 stored in `~/.local/state/reflection-backfill/state.json`, and a PID lock prevents concurrent workers. Run

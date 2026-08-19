@@ -1,4 +1,7 @@
 {
   "url": "https://reflection.example.com",
-  "apiKey": "replace-with-your-api-key"
+  "apiKey": "replace-with-your-api-key",
+  "contextProjection": {
+    "enabled": false
+  }
 }

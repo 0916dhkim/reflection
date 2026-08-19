@@ -19,6 +19,7 @@ from reflection_service.models import (
     SearchResponse,
     SegmentCreate,
     SegmentResponse,
+    SessionSegmentsResponse,
 )
 from reflection_service.search import SearchService
 from reflection_service.worker import ExtractionWorker
@@ -111,6 +112,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if segment is None:
             raise HTTPException(status_code=404, detail="segment not found")
         return segment
+
+    @router.get("/sessions/{session_id}/segments", response_model=SessionSegmentsResponse)
+    async def get_session_segments(session_id: str) -> SessionSegmentsResponse:
+        return SessionSegmentsResponse(
+            session_id=session_id,
+            segments=await database.segment_summaries(session_id),
+        )
 
     @router.post("/search", response_model=SearchResponse)
     async def search(request: SearchRequest) -> SearchResponse:

@@ -190,6 +190,7 @@ class ExtractionEngine:
             summary=extracted.summary,
             entities=tuple(entities),
             claims=tuple(claims),
+            projection_version=job.request.projection_version,
         )
 
     @staticmethod

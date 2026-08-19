@@ -7,7 +7,7 @@ import pytest
 
 from reflection_service.app import create_app
 from reflection_service.config import Settings
-from reflection_service.models import JobResponse, JobStatus
+from reflection_service.models import JobResponse, JobStatus, SegmentSummary
 
 
 def settings() -> Settings:
@@ -24,6 +24,7 @@ def job_response(status: JobStatus = JobStatus.PENDING) -> JobResponse:
     return JobResponse(
         id=1,
         segment_id=uuid4(),
+        projection_version=0,
         status=status,
         attempts=0,
         error=None,
@@ -113,3 +114,41 @@ async def test_retry_endpoint_is_authenticated_and_wakes_worker() -> None:
     assert unauthorized.status_code == 401
     assert response.status_code == 202
     app.state.worker.wake.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_session_segments_returns_ordered_summary_metadata() -> None:
+    app = create_app(settings())
+    segment = SegmentSummary(
+        id=uuid4(),
+        start_user_message_id="start",
+        end_user_message_id="end",
+        projection_version=0,
+        summary="What happened",
+    )
+    app.state.database.segment_summaries = AsyncMock(return_value=[segment])
+    transport = httpx.ASGITransport(app=app)
+    try:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            unauthorized = await client.get("/v1/sessions/session/segments")
+            response = await client.get(
+                "/v1/sessions/session/segments",
+                headers={"X-Api-Key": "test-key"},
+            )
+    finally:
+        await app.state.http_client.aclose()
+
+    assert unauthorized.status_code == 401
+    assert response.status_code == 200
+    assert response.json() == {
+        "session_id": "session",
+        "segments": [
+            {
+                "id": str(segment.id),
+                "start_user_message_id": "start",
+                "end_user_message_id": "end",
+                "projection_version": 0,
+                "summary": "What happened",
+            }
+        ],
+    }

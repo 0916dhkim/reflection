@@ -41,6 +41,7 @@ LiteralText = Annotated[str, StringConstraints(min_length=1, max_length=10_000)]
 Identifier = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=500)]
 MAX_MESSAGE_TEXT_CHARS = 1_000_000
 MAX_SEGMENT_TEXT_CHARS = 2_000_000
+PROJECTION_SAFE_VERSION = 1
 
 
 class StrictModel(BaseModel):
@@ -56,6 +57,7 @@ class SegmentCreate(StrictModel):
     session_id: Identifier
     start_user_message_id: Identifier
     end_user_message_id: Identifier
+    projection_version: Literal[0, 1] = 0
     messages: Annotated[list[SourceMessage], Field(min_length=1, max_length=10_000)]
 
     @model_validator(mode="after")
@@ -77,6 +79,7 @@ class JobStatus(StrEnum):
 class JobResponse(StrictModel):
     id: int
     segment_id: UUID
+    projection_version: int
     status: JobStatus
     attempts: int
     error: str | None
@@ -114,6 +117,19 @@ class SegmentResponse(StrictModel):
     claims: list[ClaimData]
     created_at: datetime
     updated_at: datetime
+
+
+class SegmentSummary(StrictModel):
+    id: UUID
+    start_user_message_id: str
+    end_user_message_id: str
+    projection_version: int
+    summary: str
+
+
+class SessionSegmentsResponse(StrictModel):
+    session_id: str
+    segments: list[SegmentSummary]
 
 
 class SearchRequest(StrictModel):
