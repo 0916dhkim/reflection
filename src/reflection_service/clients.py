@@ -10,7 +10,12 @@ from pydantic import BaseModel, ValidationError
 
 from reflection_service.config import Settings
 from reflection_service.domain import MentionContext, TerminalExtractionValidationError
-from reflection_service.models import ExtractionResult, ResolutionResult, SegmentCreate
+from reflection_service.models import (
+    ExtractedClaim,
+    ExtractionResult,
+    ResolutionResult,
+    SegmentCreate,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -91,6 +96,10 @@ class ModelClient:
             "Qualify generic names with their owner or context, such as 'Acme Pro plan'. "
             "The subject and object_entity strings themselves must be fully qualified; do not rely "
             "on a later resolution step to add context. Write 'Ideogram Pro plan', not 'Pro plan'. "
+            "Facts that are true only within a specific PR, incident, project, or rollout must use "
+            "that stable context as the subject. For example, emit subject 'PR #14330 deployment "
+            "order', predicate 'is', and value 'log-consumer before sampling-coordinator', never a "
+            "universal claim that log-consumer blocks sampling-coordinator. "
             "Predicates are user-facing display text, not knowledge-graph IDs or database keys. "
             "They must be short natural-language verb phrases with spaces, never snake_case or "
             "camelCase. Do not encode the subject or object name in the predicate. For example, "
@@ -131,14 +140,31 @@ class ModelClient:
             max_tokens=16_384,
         )
 
-    async def resolve(self, summary: str, mentions: Sequence[MentionContext]) -> ResolutionResult:
+    async def resolve(
+        self,
+        summary: str,
+        claims: Sequence[ExtractedClaim],
+        mentions: Sequence[MentionContext],
+    ) -> ResolutionResult:
         system = (
-            "Resolve every entity endpoint occurrence using its supporting claim and segment "
-            "summary. Resolve to one supplied candidate or a new canonical entity, and return "
-            "every mention_id exactly once. Identical mention text may refer to different entities "
-            "in different claims. Select a candidate only when its description identifies the same "
-            "real entity. For a new entity, provide a concise source-grounded description. For an "
-            "existing candidate, preserve its canonical name and description. Keep useful aliases. "
+            "Jointly triage the proposed claims and resolve entities for every kept claim. Return "
+            "one claim decision for every claim_id exactly once. Keep a claim only when it is "
+            "durable and already stated with enough explicit context to remain true outside this "
+            "conversation. Stable named contexts include a specific PR, incident, project, policy, "
+            "or rollout. Drop transient, draft, superseded, speculative, current-session-only, and "
+            "unsafe-to-generalize claims. Do not rewrite any claim fields: kept claims are stored "
+            "exactly as proposed, including their confidence. "
+            "Never turn a relationship that is true only for one rollout into a universal edge "
+            "between services. For example, drop 'log-consumer blocks deployment of "
+            "sampling-coordinator' when it is true only for one PR rollout, but keep an already "
+            "contextual claim about 'PR #14330 deployment order'. Resolve every subject and entity "
+            "object of kept claims exactly once using its cN.subject or cN.object mention_id. "
+            "Return no resolutions for dropped claims or literal objects. "
+            "Resolve to one supplied candidate or a new canonical entity. Identical mention text "
+            "may refer to different entities in different claims. Select a candidate only when its "
+            "description identifies the same real entity. "
+            "For a new entity, provide a concise source-grounded description. For an existing "
+            "candidate, preserve its canonical name and description. Keep useful aliases. "
             "candidate_entity_id must copy an exact ID from that mention's candidates. If its "
             "candidate list is empty, candidate_entity_id must be null; never invent an ID."
             " Different real entities must have distinguishable canonical names, such as "
@@ -146,6 +172,10 @@ class ModelClient:
         )
         user = {
             "segment_summary": summary,
+            "proposed_claims": [
+                {"claim_id": f"c{index}", **claim.model_dump()}
+                for index, claim in enumerate(claims)
+            ],
             "mentions": [
                 {
                     "mention_id": mention.mention_id,

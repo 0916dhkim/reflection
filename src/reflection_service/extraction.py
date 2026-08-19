@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from dataclasses import replace
 from uuid import UUID
 
@@ -14,9 +15,12 @@ from reflection_service.domain import (
     equivalence_key,
     new_entity_id_for,
     normalize_name,
+    validate_claim_decisions,
     validate_resolutions,
 )
 from reflection_service.models import ExtractedClaim, Resolution
+
+logger = logging.getLogger(__name__)
 
 
 class ExtractionEngine:
@@ -71,14 +75,34 @@ class ExtractionEngine:
             )
         )
         if contexts:
-            resolution_result = await self._models.resolve(extracted.summary, contexts)
-            validated = validate_resolutions(contexts, resolution_result)
+            resolution_result = await self._models.resolve(
+                extracted.summary, extracted.claims, contexts
+            )
+            triaged_claims = validate_claim_decisions(extracted.claims, resolution_result)
+            kept_context_ids = {f"c{index}.subject" for index, _ in triaged_claims}
+            kept_context_ids.update(
+                f"c{index}.object"
+                for index, claim in triaged_claims
+                if claim.object_entity is not None
+            )
+            kept_contexts = tuple(
+                context for context in contexts if context.mention_id in kept_context_ids
+            )
+            validated = validate_resolutions(kept_contexts, resolution_result)
+            logger.info(
+                "claim triage completed proposed=%d kept=%d dropped=%d",
+                len(extracted.claims),
+                len(triaged_claims),
+                len(extracted.claims) - len(triaged_claims),
+            )
         else:
+            triaged_claims = []
+            kept_contexts = ()
             validated = {}
 
         entities_by_id: dict[UUID, PreparedEntity] = {}
         occurrence_entities: dict[str, PreparedEntity] = {}
-        for context in contexts:
+        for context in kept_contexts:
             _, resolution = validated[context.mention_id]
             candidate = self._selected_candidate(context, resolution)
             if candidate is None:
@@ -118,13 +142,13 @@ class ExtractionEngine:
 
         entities = list(entities_by_id.values())
         new_entities = [entity for entity in entities if entity.is_new]
-        claim_texts = [self._claim_text(claim) for claim in extracted.claims]
+        claim_texts = [self._claim_text(claim) for _, claim in triaged_claims]
         entity_texts = [f"{entity.canonical_name}: {entity.description}" for entity in new_entities]
         document_embeddings = await self._embeddings.embed(
             [*claim_texts, *entity_texts], input_type="document"
         )
-        claim_embeddings = document_embeddings[: len(extracted.claims)]
-        entity_embeddings = document_embeddings[len(extracted.claims) :]
+        claim_embeddings = document_embeddings[: len(triaged_claims)]
+        entity_embeddings = document_embeddings[len(triaged_claims) :]
         embedding_by_entity = {
             entity.id: embedding
             for entity, embedding in zip(new_entities, entity_embeddings, strict=True)
@@ -134,9 +158,7 @@ class ExtractionEngine:
         ]
 
         claims: list[PreparedClaim] = []
-        for index, (claim, embedding) in enumerate(
-            zip(extracted.claims, claim_embeddings, strict=True)
-        ):
+        for (index, claim), embedding in zip(triaged_claims, claim_embeddings, strict=True):
             subject_entity = occurrence_entities[f"c{index}.subject"]
             object_entity = (
                 occurrence_entities[f"c{index}.object"] if claim.object_entity is not None else None

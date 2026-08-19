@@ -21,7 +21,7 @@ from reflection_service.domain import (
     MentionContext,
     TerminalExtractionValidationError,
 )
-from reflection_service.models import SegmentCreate
+from reflection_service.models import ExtractedClaim, SegmentCreate
 
 
 def settings(**overrides: Any) -> Settings:
@@ -120,6 +120,8 @@ async def test_extraction_call_uses_strict_schema_provider_and_all_prior_summari
     assert "user-facing display text" in system_prompt
     assert "at most 25 nonredundant" in system_prompt
     assert "Write 'Ideogram Pro plan', not 'Pro plan'" in system_prompt
+    assert "PR #14330 deployment order" in system_prompt
+    assert "never a universal claim" in system_prompt
     assert "Explicit communication requirements are durable decisions" in system_prompt
     assert result.summary == "A short summary"
 
@@ -139,6 +141,12 @@ async def test_resolution_receives_occurrence_context_summary_and_descriptions()
                         "message": {
                             "content": json.dumps(
                                 {
+                                    "claims": [
+                                        {
+                                            "claim_id": "c0",
+                                            "action": "keep",
+                                        }
+                                    ],
                                     "resolutions": [
                                         {
                                             "mention_id": "c0.object",
@@ -147,7 +155,7 @@ async def test_resolution_receives_occurrence_context_summary_and_descriptions()
                                             "description": "A relational database",
                                             "aliases": ["Postgres"],
                                         }
-                                    ]
+                                    ],
                                 }
                             )
                         }
@@ -170,8 +178,17 @@ async def test_resolution_receives_occurrence_context_summary_and_descriptions()
             ),
         ),
     )
+    proposed_claim = ExtractedClaim(
+        subject="Reflection",
+        predicate="uses",
+        confidence=0.9,
+        object_entity="PostgreSQL",
+        object_value=None,
+    )
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        result = await ModelClient(client, settings()).resolve("Segment summary", [mention])
+        result = await ModelClient(client, settings()).resolve(
+            "Segment summary", [proposed_claim], [mention]
+        )
 
     user_payload = json.loads(captured["messages"][2]["content"])
     candidate = user_payload["mentions"][0]["candidates"][0]
@@ -185,12 +202,16 @@ async def test_resolution_receives_occurrence_context_summary_and_descriptions()
     }
     assert captured["temperature"] == 0
     assert user_payload["segment_summary"] == "Segment summary"
+    assert user_payload["proposed_claims"] == [{"claim_id": "c0", **proposed_claim.model_dump()}]
     assert user_payload["mentions"][0]["supporting_claim"] == mention.supporting_claim
     assert candidate["description"] == "A relational database"
     assert "never invent an ID" in captured["messages"][0]["content"]
+    assert "one claim decision for every claim_id" in captured["messages"][0]["content"]
+    assert "universal edge between services" in captured["messages"][0]["content"]
     assert "Apple (company)" in captured["messages"][0]["content"]
     assert "Apple (fruit)" in captured["messages"][0]["content"]
     assert result.resolutions[0].candidate_entity_id == entity_id
+    assert result.claims[0].action == "keep"
 
 
 @pytest.mark.asyncio

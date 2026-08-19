@@ -3,7 +3,7 @@ from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from uuid import UUID, uuid5
 
-from reflection_service.models import Resolution, ResolutionResult, SearchClaim
+from reflection_service.models import ExtractedClaim, Resolution, ResolutionResult, SearchClaim
 
 SEGMENT_NAMESPACE = UUID("b14d5f2c-4cce-4f37-9e32-ea30c1fd1b42")
 ENTITY_NAMESPACE = UUID("966769b5-ab08-4b02-8948-7db052586124")
@@ -160,6 +160,26 @@ def validate_resolutions(
             )
         validated[mention_id] = (expected[mention_id], resolution)
     return validated
+
+
+def validate_claim_decisions(
+    proposed: Sequence[ExtractedClaim], result: ResolutionResult
+) -> list[tuple[int, ExtractedClaim]]:
+    expected = {f"c{index}" for index in range(len(proposed))}
+    actual = {decision.claim_id: decision for decision in result.claims}
+    if len(actual) != len(result.claims):
+        raise ExtractionValidationError("claim triage returned duplicate claim IDs")
+    if actual.keys() != expected:
+        raise ExtractionValidationError(
+            "claim triage must return every proposed claim exactly once"
+        )
+
+    kept: list[tuple[int, ExtractedClaim]] = []
+    for index, claim in enumerate(proposed):
+        decision = actual[f"c{index}"]
+        if decision.action == "keep":
+            kept.append((index, claim))
+    return kept
 
 
 def rank_and_group_claims(

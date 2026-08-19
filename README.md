@@ -27,12 +27,18 @@ For each job the worker:
    occurrence together with its supporting claim and segment summary using Voyage `voyage-4-large` at
    1024 dimensions, then retrieves the union of at most five indexable pg_trgm name/alias candidates and
    five vector candidates. Literal values do not enter entity resolution.
-4. Calls the configured OpenRouter-compatible resolution model once with all occurrences, candidate
-   names and descriptions, claim context, and the segment summary using high reasoning. Identical text
-   occurrences can resolve differently and different real entities receive distinguishable canonical
-   names. Newly proposed identical canonical names coalesce to the same deterministic entity UUID within
-   the segment.
-5. Embeds claims and new canonical entities directly with Voyage.
+4. Calls the configured OpenRouter-compatible resolution model once with all proposed claims,
+   occurrences, candidate names and descriptions, and the segment summary using high reasoning. The model
+   keeps or drops every proposed claim before resolving entities. Kept claims are stored unchanged;
+   session-only claims and context-dependent claims that were not already stated against a stable named
+   context are dropped. This prevents PR- or rollout-specific dependencies from becoming universal graph
+   edges.
+   Identical text occurrences can resolve differently and different real entities receive distinguishable
+   canonical names. Newly proposed identical canonical names coalesce to the same deterministic entity UUID
+   within the segment.
+5. Embeds only kept claims and their new canonical entities as documents with Voyage. Candidate retrieval
+   happens before joint triage and resolution, so entity mentions from all proposed claims receive temporary
+   query embeddings; dropped claims create no persisted entities, graph edges, or document embeddings.
 6. In one PostgreSQL transaction, upserts new entities, descriptions, and aliases, replaces the segment
    and claims, marks the leased job successful, and clears its source payload. No extraction data is
    written if a network call or model/schema validation fails.

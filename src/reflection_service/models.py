@@ -157,6 +157,11 @@ class ExtractionResult(StrictModel):
     claims: Annotated[list[ExtractedClaim], Field(max_length=25)]
 
 
+class ClaimDecision(StrictModel):
+    claim_id: Annotated[str, StringConstraints(pattern=r"^c[0-9]+$")]
+    action: Literal["keep", "drop"]
+
+
 class Resolution(StrictModel):
     mention_id: str
     candidate_entity_id: Annotated[
@@ -174,4 +179,5 @@ class Resolution(StrictModel):
 
 
 class ResolutionResult(StrictModel):
+    claims: Annotated[list[ClaimDecision], Field(max_length=25)]
     resolutions: Annotated[list[Resolution], Field(max_length=1000)]

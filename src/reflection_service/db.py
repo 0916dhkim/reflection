@@ -354,6 +354,19 @@ class Database:
 
     async def commit_extraction(self, job: ClaimedJob, prepared: PreparedSegment) -> bool:
         async with self.pool.connection() as connection, connection.transaction():
+            old_entity_cursor = await connection.execute(
+                """
+                SELECT subject_entity_id AS id
+                FROM claims
+                WHERE segment_id = %s
+                UNION
+                SELECT object_entity_id AS id
+                FROM claims
+                WHERE segment_id = %s AND object_entity_id IS NOT NULL
+                """,
+                (prepared.id, prepared.id),
+            )
+            old_entity_ids = [row["id"] for row in await old_entity_cursor.fetchall()]
             new_entities = [entity for entity in prepared.entities if entity.is_new]
             if new_entities:
                 await connection.cursor().executemany(
@@ -444,6 +457,19 @@ class Database:
                         )
                         for claim in prepared.claims
                     ],
+                )
+            if old_entity_ids:
+                await connection.execute(
+                    """
+                    DELETE FROM entities e
+                    WHERE e.id = ANY(%s)
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM claims c
+                          WHERE c.subject_entity_id = e.id OR c.object_entity_id = e.id
+                      )
+                    """,
+                    (old_entity_ids,),
                 )
             cursor = await connection.execute(
                 """

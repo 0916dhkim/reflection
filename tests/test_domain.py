@@ -14,9 +14,10 @@ from reflection_service.domain import (
     rank_and_group_claims,
     segment_id_for,
     union_candidates,
+    validate_claim_decisions,
     validate_resolutions,
 )
-from reflection_service.models import ExtractedClaim, Resolution, ResolutionResult
+from reflection_service.models import ClaimDecision, ExtractedClaim, Resolution, ResolutionResult
 
 
 def test_segment_and_new_entity_ids_are_deterministic() -> None:
@@ -59,7 +60,7 @@ def resolution(mention_id: str, candidate_id: UUID | None = None) -> Resolution:
 
 def test_resolution_must_select_supplied_candidate() -> None:
     allowed = entity_candidate("Allowed")
-    result = ResolutionResult(resolutions=[resolution("c0.subject", uuid4())])
+    result = ResolutionResult(claims=[], resolutions=[resolution("c0.subject", uuid4())])
 
     with pytest.raises(ExtractionValidationError, match="unknown candidate"):
         validate_resolutions([mention("c0.subject", (allowed,))], result)
@@ -67,10 +68,51 @@ def test_resolution_must_select_supplied_candidate() -> None:
 
 def test_resolution_must_cover_every_occurrence_once() -> None:
     contexts = [mention("c0.subject"), mention("c1.subject")]
-    result = ResolutionResult(resolutions=[resolution("c0.subject")])
+    result = ResolutionResult(claims=[], resolutions=[resolution("c0.subject")])
 
     with pytest.raises(ExtractionValidationError, match="every mention"):
         validate_resolutions(contexts, result)
+
+
+def test_claim_triage_must_cover_every_proposed_claim_once() -> None:
+    proposed = [
+        ExtractedClaim(
+            subject="Reflection",
+            predicate="uses",
+            confidence=1,
+            object_entity="PostgreSQL",
+            object_value=None,
+        )
+    ]
+
+    with pytest.raises(ExtractionValidationError, match="every proposed claim"):
+        validate_claim_decisions(proposed, ResolutionResult(claims=[], resolutions=[]))
+
+
+def test_claim_triage_keeps_original_claim_unchanged() -> None:
+    proposed = [
+        ExtractedClaim(
+            subject="Reflection",
+            predicate="has database",
+            confidence=0.7,
+            object_entity=None,
+            object_value="PostgreSQL",
+        )
+    ]
+    result = ResolutionResult(
+        claims=[
+            ClaimDecision(
+                claim_id="c0",
+                action="keep",
+            )
+        ],
+        resolutions=[],
+    )
+
+    kept = validate_claim_decisions(proposed, result)
+
+    assert kept == [(0, proposed[0])]
+    assert kept[0][1].confidence == 0.7
 
 
 def test_claim_requires_exactly_one_object_kind() -> None:

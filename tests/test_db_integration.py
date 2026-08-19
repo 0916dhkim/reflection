@@ -226,6 +226,79 @@ async def test_queue_fencing_replacement_retry_and_recall() -> None:
         assert support.session_count == 2
         assert set(support.segment_ids) == {first.segment_id, support_job.segment_id}
 
+        await database.enqueue(request.model_copy(update={"end_user_message_id": "end-3"}))
+        async with database.pool.connection() as connection:
+            empty_shared_claim = await database.claim_oldest_job(connection)
+        assert empty_shared_claim is not None
+        await database.commit_extraction(
+            empty_shared_claim,
+            PreparedSegment(
+                id=empty_shared_claim.segment_id,
+                session_id=empty_shared_claim.request.session_id,
+                start_user_message_id=empty_shared_claim.request.start_user_message_id,
+                end_user_message_id=empty_shared_claim.request.end_user_message_id,
+                summary="No claims in this snapshot",
+                entities=(),
+                claims=(),
+            ),
+        )
+        async with database.pool.connection() as connection:
+            shared_cursor = await connection.execute(
+                "SELECT id FROM entities WHERE id = ANY(%s)",
+                ([subject_id, object_id],),
+            )
+            shared_entities = await shared_cursor.fetchall()
+        assert {row["id"] for row in shared_entities} == {subject_id, object_id}
+
+        orphan_request = SegmentCreate(
+            session_id="orphan-session",
+            start_user_message_id="orphan-start",
+            end_user_message_id="orphan-end-1",
+            messages=[{"role": "user", "text": "temporary claim"}],
+        )
+        await database.enqueue(orphan_request)
+        async with database.pool.connection() as connection:
+            orphan_claim = await database.claim_oldest_job(connection)
+        assert orphan_claim is not None
+        orphan_subject_id = uuid4()
+        orphan_object_id = uuid4()
+        await database.commit_extraction(
+            orphan_claim,
+            prepared_segment(
+                orphan_claim,
+                end_id="orphan-end-1",
+                summary="Temporary claims",
+                subject_id=orphan_subject_id,
+                object_id=orphan_object_id,
+                entities_are_new=True,
+            ),
+        )
+        await database.enqueue(
+            orphan_request.model_copy(update={"end_user_message_id": "orphan-end-2"})
+        )
+        async with database.pool.connection() as connection:
+            empty_claim = await database.claim_oldest_job(connection)
+        assert empty_claim is not None
+        await database.commit_extraction(
+            empty_claim,
+            PreparedSegment(
+                id=empty_claim.segment_id,
+                session_id=empty_claim.request.session_id,
+                start_user_message_id=empty_claim.request.start_user_message_id,
+                end_user_message_id=empty_claim.request.end_user_message_id,
+                summary="No durable claims",
+                entities=(),
+                claims=(),
+            ),
+        )
+        async with database.pool.connection() as connection:
+            orphan_cursor = await connection.execute(
+                "SELECT id FROM entities WHERE id = ANY(%s)",
+                ([orphan_subject_id, orphan_object_id],),
+            )
+            orphan_entities = await orphan_cursor.fetchall()
+        assert orphan_entities == []
+
         async with database.pool.connection() as connection:
             payload_cursor = await connection.execute(
                 "SELECT id, payload FROM extraction_jobs WHERE id = ANY(%s)",
