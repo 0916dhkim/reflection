@@ -92,7 +92,7 @@ async def test_extraction_call_uses_strict_schema_provider_and_all_prior_summari
     user_payload = json.loads(captured["messages"][1]["content"])
     schema = captured["response_format"]["json_schema"]["schema"]
     assert captured["model"] == "deepseek/deepseek-v4-flash-0731"
-    assert captured["max_tokens"] == 4096
+    assert captured["max_tokens"] == 16_384
     assert captured["reasoning"] == {"effort": "low"}
     assert captured["provider"] == {
         "require_parameters": True,
@@ -166,7 +166,7 @@ async def test_resolution_receives_occurrence_context_summary_and_descriptions()
     user_payload = json.loads(captured["messages"][1]["content"])
     candidate = user_payload["mentions"][0]["candidates"][0]
     assert captured["model"] == "deepseek/deepseek-v4-pro-0813"
-    assert captured["max_tokens"] == 16_384
+    assert captured["max_tokens"] == 32_768
     assert captured["reasoning"] == {"effort": "high"}
     assert captured["provider"] == {
         "require_parameters": True,

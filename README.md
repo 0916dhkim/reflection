@@ -45,8 +45,9 @@ generated embedding input over 30,000 UTF-8 bytes is terminal because retrying c
 oldest job continues to block newer jobs, preserving FIFO. Operators can explicitly reset a terminal job
 with authenticated `POST /v1/jobs/{id}/retry`.
 
-Extraction output is capped at 50 claims and 4,096 completion tokens; entity resolution is capped at
-16,384 completion tokens. Every model call also has a 180-second wall-clock deadline independent of
+Extraction output is capped at 50 claims and 16,384 completion tokens; entity resolution is capped at
+32,768 completion tokens. The token budgets include hidden reasoning as well as visible JSON. Every model
+call also has a 180-second wall-clock deadline independent of
 HTTPX's per-operation timeout. Completion logs record timing, finish reason, token count, and content size
 without recording model input or output text.
 

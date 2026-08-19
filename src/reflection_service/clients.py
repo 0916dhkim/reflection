@@ -118,7 +118,7 @@ class ModelClient:
             user=user,
             response_model=ExtractionResult,
             schema_name="reflection_extraction",
-            max_tokens=4096,
+            max_tokens=16_384,
         )
 
     async def resolve(self, summary: str, mentions: Sequence[MentionContext]) -> ResolutionResult:
@@ -160,7 +160,7 @@ class ModelClient:
             user=user,
             response_model=ResolutionResult,
             schema_name="entity_resolution",
-            max_tokens=16_384,
+            max_tokens=32_768,
         )
 
     async def _structured_call[T: BaseModel](
