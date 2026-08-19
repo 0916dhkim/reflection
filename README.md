@@ -43,9 +43,9 @@ For each job the worker:
    and claims, marks the leased job successful, and clears its source payload. No extraction data is
    written if a network call or model/schema validation fails.
 
-Model requests are pinned to OpenRouter's SiliconFlow `siliconflow/fp8` route with fallbacks disabled.
-Reflection places the complete schema in a system message, requests one JSON object, and validates every
-property locally. Network, model, schema, and
+Model requests are pinned to OpenRouter's official `deepseek` provider with fallbacks disabled. Reflection
+places the complete schema in a system message, requests one JSON object, and validates every property
+locally. Network, model, schema, and
 entity-resolution validation failures all retry up to three attempts with a short configurable backoff
 because another model call may succeed. An invalid persisted job payload is terminal at claim time, and a
 generated embedding input over 30,000 UTF-8 bytes is terminal because retrying cannot reduce it. A delayed

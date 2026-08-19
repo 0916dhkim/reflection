@@ -234,7 +234,7 @@ class ModelClient:
                         "temperature": 0,
                         "reasoning": {"effort": reasoning_effort},
                         "provider": {
-                            "only": ["siliconflow/fp8"],
+                            "only": ["deepseek"],
                             "allow_fallbacks": False,
                             "require_parameters": True,
                         },

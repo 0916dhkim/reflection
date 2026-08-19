@@ -95,7 +95,7 @@ async def test_extraction_call_uses_strict_schema_provider_and_all_prior_summari
     assert captured["max_tokens"] == 16_384
     assert captured["reasoning"] == {"effort": "low"}
     assert captured["provider"] == {
-        "only": ["siliconflow/fp8"],
+        "only": ["deepseek"],
         "allow_fallbacks": False,
         "require_parameters": True,
     }
@@ -196,7 +196,7 @@ async def test_resolution_receives_occurrence_context_summary_and_descriptions()
     assert captured["max_tokens"] == 32_768
     assert captured["reasoning"] == {"effort": "high"}
     assert captured["provider"] == {
-        "only": ["siliconflow/fp8"],
+        "only": ["deepseek"],
         "allow_fallbacks": False,
         "require_parameters": True,
     }
