@@ -356,7 +356,7 @@ async function processPriorityJobs() {
 const sqlite = new DatabaseSync(SQLITE_PATH, { readOnly: true });
 const sessions = sqlite
   .prepare(
-    "SELECT id, title, time_updated AS timeUpdated FROM session ORDER BY time_created ASC, id ASC",
+    "SELECT id, title, time_updated AS timeUpdated FROM session ORDER BY time_created DESC, id DESC",
   )
   .all();
 const sessionStatusQuery = sqlite.prepare(

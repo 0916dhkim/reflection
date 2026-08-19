@@ -184,14 +184,15 @@ integration test. The test truncates all Reflection tables in that database.
 
 ## Backfill
 
-`scripts/backfill.mjs` reads the local OpenCode SQLite database and submits complete-turn segments oldest
-first. It processes one segment to a terminal state before submitting the next, so pending transcript
-payloads do not accumulate in PostgreSQL. Existing successful jobs are skipped through the service's
+`scripts/backfill.mjs` reads the local OpenCode SQLite database and submits stable sessions newest first.
+Segments within each session remain chronological. It processes one segment to a terminal state before
+submitting the next, so pending transcript payloads do not accumulate in PostgreSQL. Existing successful
+jobs are skipped through the service's
 idempotent segment API. A stale provider `402` receives one immediate retry; repeated `402` failures wait
 five minutes before retrying through Reflection, ensuring the readiness check uses the deployed service's
 credentials and configured models. Other terminal failures receive one explicit retry and are recorded
 before the worker continues.
-Sessions updated within the last ten minutes are deferred and rechecked after older stable sessions.
+Sessions updated within the last ten minutes are deferred and rechecked after other stable sessions.
 
 The worker reads service credentials from `~/.config/opencode/reflection.json`. Progress is atomically
 stored in `~/.local/state/reflection-backfill/state.json`, and a PID lock prevents concurrent workers. Run
@@ -208,5 +209,5 @@ node scripts/backfill.mjs
 ```
 
 For unattended operation, run it under a supervisor that uses an absolute Node path and working directory,
-stores stdout and stderr durably, and restarts only after nonzero exits. Restarts scan from the oldest
+stores stdout and stderr durably, and restarts only after nonzero exits. Restarts scan from the newest
 session again, but successful segment submissions are skipped idempotently.
