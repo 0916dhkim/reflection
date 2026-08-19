@@ -103,6 +103,11 @@ async def test_extraction_call_uses_strict_schema_provider_and_all_prior_summari
     assert captured["response_format"] == {"type": "json_object"}
     assert_all_object_properties_required(schema)
     assert schema["properties"]["claims"]["maxItems"] == 25
+    extracted_claim_schema = schema["$defs"]["ExtractedClaim"]
+    assert (
+        "Self-contained entity name"
+        in extracted_claim_schema["properties"]["subject"]["description"]
+    )
     assert user_payload["prior_session_segment_summaries"] == ["first", "second", "third"]
     system_prompt = captured["messages"][0]["content"]
     assert "most specific independently referable subject" in system_prompt
@@ -114,6 +119,7 @@ async def test_extraction_call_uses_strict_schema_provider_and_all_prior_summari
     assert "Prior summaries never increase confidence" in system_prompt
     assert "user-facing display text" in system_prompt
     assert "at most 25 nonredundant" in system_prompt
+    assert "Write 'Ideogram Pro plan', not 'Pro plan'" in system_prompt
     assert result.summary == "A short summary"
 
 
@@ -180,6 +186,7 @@ async def test_resolution_receives_occurrence_context_summary_and_descriptions()
     assert user_payload["segment_summary"] == "Segment summary"
     assert user_payload["mentions"][0]["supporting_claim"] == mention.supporting_claim
     assert candidate["description"] == "A relational database"
+    assert "never invent an ID" in captured["messages"][0]["content"]
     assert "Apple (company)" in captured["messages"][0]["content"]
     assert "Apple (fruit)" in captured["messages"][0]["content"]
     assert result.resolutions[0].candidate_entity_id == entity_id

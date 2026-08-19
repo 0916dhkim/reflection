@@ -14,6 +14,16 @@ from pydantic import (
 )
 
 ShortText = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=500)]
+EntityMention = Annotated[
+    str,
+    StringConstraints(strip_whitespace=True, min_length=1, max_length=500),
+    Field(
+        description=(
+            "Self-contained entity name with enough owner or product context to identify it "
+            "outside this source, such as 'Ideogram Pro plan' rather than 'Pro plan'."
+        )
+    ),
+]
 NaturalPredicate = Annotated[
     str,
     StringConstraints(strip_whitespace=True, min_length=1, max_length=500, pattern=r"^[^_]+$"),
@@ -122,10 +132,10 @@ class SearchResponse(StrictModel):
 
 
 class ExtractedClaim(StrictModel):
-    subject: ShortText
+    subject: EntityMention
     predicate: NaturalPredicate
     confidence: Annotated[float, Field(ge=0, le=1)]
-    object_entity: ShortText | None
+    object_entity: EntityMention | None
     object_value: LiteralText | None
 
     @field_validator("predicate")
@@ -149,7 +159,15 @@ class ExtractionResult(StrictModel):
 
 class Resolution(StrictModel):
     mention_id: str
-    candidate_entity_id: UUID | None
+    candidate_entity_id: Annotated[
+        UUID | None,
+        Field(
+            description=(
+                "Exact ID copied from this mention's supplied candidates, or null when creating a "
+                "new entity. Always null when the candidate list is empty; never invent an ID."
+            )
+        ),
+    ]
     canonical_name: ShortText
     description: Description
     aliases: Annotated[list[ShortText], Field(max_length=20)]
