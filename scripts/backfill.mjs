@@ -296,24 +296,28 @@ function isProviderBalanceFailure(job) {
 async function completeJob(job) {
   let current = validatedJob(job);
   let nonProviderRounds = 0;
+  let providerFailures = 0;
   while (true) {
     if (current.status === "succeeded") return current;
     if (current.status === "failed") {
       if (isProviderBalanceFailure(current)) {
-        state.status = "waiting_for_deepseek";
-        state.providerStatus = {
-          jobId: current.id,
-          error: current.error,
-          nextRetryAt: new Date(Date.now() + PROVIDER_POLL_MS).toISOString(),
-        };
-        saveState();
-        log("official DeepSeek provider remains unavailable", {
-          jobId: current.id,
-          nextRetryAt: state.providerStatus.nextRetryAt,
-        });
-        await sleep(PROVIDER_POLL_MS);
-        state.status = "running";
-        saveState();
+        if (providerFailures > 0) {
+          state.status = "waiting_for_provider";
+          state.providerStatus = {
+            jobId: current.id,
+            error: current.error,
+            nextRetryAt: new Date(Date.now() + PROVIDER_POLL_MS).toISOString(),
+          };
+          saveState();
+          log("model provider remains unavailable", {
+            jobId: current.id,
+            nextRetryAt: state.providerStatus.nextRetryAt,
+          });
+          await sleep(PROVIDER_POLL_MS);
+          state.status = "running";
+          saveState();
+        }
+        providerFailures += 1;
       } else {
         nonProviderRounds += 1;
         if (nonProviderRounds >= MAX_NON_PROVIDER_JOB_ROUNDS) return current;

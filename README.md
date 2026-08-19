@@ -187,9 +187,10 @@ integration test. The test truncates all Reflection tables in that database.
 `scripts/backfill.mjs` reads the local OpenCode SQLite database and submits complete-turn segments oldest
 first. It processes one segment to a terminal state before submitting the next, so pending transcript
 payloads do not accumulate in PostgreSQL. Existing successful jobs are skipped through the service's
-idempotent segment API. Failed jobs caused by a provider `402` wait five minutes before retrying
-through Reflection, ensuring the readiness check uses the deployed service's credentials and configured
-models. Other terminal failures receive one explicit retry and are recorded before the worker continues.
+idempotent segment API. A stale provider `402` receives one immediate retry; repeated `402` failures wait
+five minutes before retrying through Reflection, ensuring the readiness check uses the deployed service's
+credentials and configured models. Other terminal failures receive one explicit retry and are recorded
+before the worker continues.
 Sessions updated within the last ten minutes are deferred and rechecked after older stable sessions.
 
 The worker reads service credentials from `~/.config/opencode/reflection.json`. Progress is atomically
