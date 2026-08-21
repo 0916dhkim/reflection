@@ -21,6 +21,12 @@ try {
   if (typeof plugin.default !== "function") {
     throw new Error("bundle has no default plugin export");
   }
+  const exports = Object.keys(plugin).sort();
+  if (JSON.stringify(exports) !== JSON.stringify(["Reflection", "default"])) {
+    throw new Error(
+      `bundle has unexpected plugin exports: ${exports.join(", ")}`,
+    );
+  }
 } finally {
   await rm(directory, { recursive: true, force: true });
 }

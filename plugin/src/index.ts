@@ -1,4 +1,3 @@
-import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -19,6 +18,7 @@ import {
   isNormalUserMessage,
   readSegmentMessages,
   segmentMessages,
+  submissionSourceFingerprint,
   type OpenCodeMessage,
   type ReflectionSegment,
 } from "./segments.js";
@@ -245,24 +245,6 @@ function submissionBody(sessionId: string, segment: ReflectionSegment) {
     projection_version: PROJECTION_VERSION,
     messages: segment.messages,
   };
-}
-
-export function submissionSourceFingerprint(
-  sessionId: string,
-  segment: ReflectionSegment,
-): string {
-  const frame = (value: string) =>
-    `${Buffer.byteLength(value, "utf8")}:${value}`;
-  const source =
-    "reflection-source-v1:" +
-    frame(sessionId) +
-    frame(segment.startUserMessageId) +
-    frame(segment.endUserMessageId) +
-    `${segment.messages.length}:` +
-    segment.messages
-      .map((message) => frame(message.role) + frame(message.text))
-      .join("");
-  return createHash("sha256").update(source, "utf8").digest("hex");
 }
 
 function parseSegmentListing(

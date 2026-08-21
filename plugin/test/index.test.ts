@@ -14,6 +14,7 @@ import {
 import {
   PROJECTION_LOSS_WARNING,
   segmentMessages,
+  submissionSourceFingerprint,
   type OpenCodeMessage,
 } from "../src/segments.js";
 
@@ -26,7 +27,7 @@ vi.mock("node:os", async (importOriginal) => ({
   homedir: () => paths.home,
 }));
 
-import { Reflection, submissionSourceFingerprint } from "../src/index.js";
+import { Reflection } from "../src/index.js";
 
 function segmentFingerprint(
   sessionId: string,

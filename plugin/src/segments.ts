@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 export const DEFAULT_MAX_SEGMENT_CHARS = 20_000;
 const MEDIA_TOKEN_RESERVE = 8_000;
 const MEDIA_BYTES_PER_TOKEN = 2;
@@ -54,6 +56,24 @@ export interface CommittedSegmentBoundary {
   projectionVersion?: number;
   sourceEligible?: boolean;
   sourceFingerprint?: string;
+}
+
+export function submissionSourceFingerprint(
+  sessionId: string,
+  segment: ReflectionSegment,
+): string {
+  const frame = (value: string) =>
+    `${Buffer.byteLength(value, "utf8")}:${value}`;
+  const source =
+    "reflection-source-v1:" +
+    frame(sessionId) +
+    frame(segment.startUserMessageId) +
+    frame(segment.endUserMessageId) +
+    `${segment.messages.length}:` +
+    segment.messages
+      .map((message) => frame(message.role) + frame(message.text))
+      .join("");
+  return createHash("sha256").update(source, "utf8").digest("hex");
 }
 
 type OpenCodePart = OpenCodeMessage["parts"][number];
