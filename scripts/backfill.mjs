@@ -432,9 +432,15 @@ async function segmentPlan(sessionId, messages) {
 if (DRY_RUN) {
   let segmentCount = 0;
   let messageCount = 0;
+  let deferredSessions = 0;
   const statuses = { eligible: 0, stale: 0, new: 0 };
   for (const session of sessions) {
-    const segments = await segmentPlan(session.id, sessionMessages(session.id));
+    const snapshot = stableSessionSnapshot(session);
+    if (!snapshot.ready) {
+      deferredSessions += 1;
+      continue;
+    }
+    const segments = await segmentPlan(session.id, snapshot.messages);
     segmentCount += segments.length;
     for (const segment of segments) statuses[segment.status] += 1;
     messageCount += segments.reduce(
@@ -445,6 +451,8 @@ if (DRY_RUN) {
   console.log(
     JSON.stringify({
       sessions: sessions.length,
+      stableSessions: sessions.length - deferredSessions,
+      deferredSessions,
       segments: segmentCount,
       messages: messageCount,
       statuses,
