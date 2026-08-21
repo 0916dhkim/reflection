@@ -127,9 +127,29 @@ class SegmentSummary(StrictModel):
     summary: str
 
 
+class SegmentBoundary(StrictModel):
+    id: UUID
+    start_user_message_id: str
+    end_user_message_id: str
+    projection_version: int
+    source_eligible: bool
+    source_fingerprint: str | None
+
+
+class SegmentTargetBoundary(StrictModel):
+    id: UUID
+    start_user_message_id: str
+    end_user_message_id: str
+    projection_version: int
+    status: JobStatus
+    source_fingerprint: str
+
+
 class SessionSegmentsResponse(StrictModel):
     session_id: str
     segments: list[SegmentSummary]
+    boundaries: list[SegmentBoundary]
+    targets: list[SegmentTargetBoundary]
 
 
 class SearchRequest(StrictModel):
@@ -171,6 +191,21 @@ class ExtractedClaim(StrictModel):
 class ExtractionResult(StrictModel):
     summary: Annotated[str, StringConstraints(strip_whitespace=True, max_length=1000)]
     claims: Annotated[list[ExtractedClaim], Field(max_length=25)]
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_claim_predicates(cls, value: object) -> object:
+        if not isinstance(value, dict) or not isinstance(value.get("claims"), list):
+            return value
+        normalized_claims: list[object] = []
+        for claim in value["claims"]:
+            if not isinstance(claim, dict) or not isinstance(claim.get("predicate"), str):
+                normalized_claims.append(claim)
+                continue
+            predicate = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", claim["predicate"])
+            predicate = " ".join(predicate.replace("_", " ").lower().split())
+            normalized_claims.append({**claim, "predicate": predicate})
+        return {**value, "claims": normalized_claims}
 
 
 class ClaimDecision(StrictModel):

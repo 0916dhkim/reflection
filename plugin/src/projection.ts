@@ -2,9 +2,13 @@ import {
   isModelVisibleMessage,
   isModelVisiblePart,
   isNormalUserMessage,
+  modelVisibleMediaTokens,
+  modelVisibleToolState,
+  modelVisibleToolAttachmentTokens,
   PROJECTION_LOSS_WARNING,
   segmentMessages,
   textOf,
+  type CommittedSegmentBoundary,
   type OpenCodeMessage,
   type ReflectionSegment,
 } from "./segments.js";
@@ -16,8 +20,6 @@ export const PROJECTION_HARD_LIMIT_RATIO = 0.9;
 const ESTIMATED_CHARS_PER_TOKEN = 4;
 const DEFAULT_OUTPUT_LIMIT = 32_000;
 const MAX_TOOL_OUTPUT_CHARS = 2_000;
-const MEDIA_TOKEN_RESERVE = 8_000;
-const MEDIA_BYTES_PER_TOKEN = 2;
 const MAX_TOOL_ATTACHMENTS = 10;
 
 export interface StoredSegmentSummary {
@@ -74,83 +76,6 @@ export function estimateTokens(value: unknown): number {
   );
 }
 
-function sanitizeModelValue(value: unknown, depth = 0): unknown {
-  if (depth > 8) return "[nested value omitted]";
-  if (typeof value === "string") {
-    return value.startsWith("data:") ? "[data URL omitted]" : value;
-  }
-  if (Array.isArray(value)) {
-    return value.map((item) => sanitizeModelValue(item, depth + 1));
-  }
-  if (typeof value !== "object" || value === null) return value;
-  return Object.fromEntries(
-    Object.entries(value).map(([key, item]) => [
-      key,
-      sanitizeModelValue(item, depth + 1),
-    ]),
-  );
-}
-
-function modelVisibleToolState(value: unknown): unknown {
-  if (typeof value !== "object" || value === null) {
-    return sanitizeModelValue(value);
-  }
-  const state = value as Record<string, unknown>;
-  const time =
-    typeof state.time === "object" && state.time !== null
-      ? (state.time as Record<string, unknown>)
-      : {};
-  return sanitizeModelValue(
-    typeof time.compacted === "number"
-      ? { ...state, output: "[Old tool result content cleared]" }
-      : state,
-  );
-}
-
-function dataUrlBytes(url: string): number | null {
-  if (!url.startsWith("data:")) return null;
-  const separator = url.indexOf(",");
-  if (separator < 0) return null;
-  const metadata = url.slice(0, separator);
-  const payload = url.slice(separator + 1);
-  return metadata.endsWith(";base64")
-    ? Math.ceil((payload.length * 3) / 4)
-    : Buffer.byteLength(payload, "utf8");
-}
-
-function mediaTokenEstimate(value: unknown): number {
-  if (typeof value !== "object" || value === null)
-    return Number.POSITIVE_INFINITY;
-  const media = value as Record<string, unknown>;
-  const mime = typeof media.mime === "string" ? media.mime : "";
-  if (mime.startsWith("image/")) return MEDIA_TOKEN_RESERVE;
-  if (typeof media.url !== "string") return Number.POSITIVE_INFINITY;
-  const bytes = dataUrlBytes(media.url);
-  return bytes === null
-    ? Number.POSITIVE_INFINITY
-    : Math.max(MEDIA_TOKEN_RESERVE, Math.ceil(bytes / MEDIA_BYTES_PER_TOKEN));
-}
-
-function modelVisibleToolAttachmentTokens(value: unknown): number {
-  if (typeof value !== "object" || value === null) return 0;
-  const state = value as Record<string, unknown>;
-  const time =
-    typeof state.time === "object" && state.time !== null
-      ? (state.time as Record<string, unknown>)
-      : {};
-  if (
-    state.status !== "completed" ||
-    typeof time.compacted === "number" ||
-    !Array.isArray(state.attachments)
-  ) {
-    return 0;
-  }
-  return state.attachments.reduce(
-    (total, attachment) => total + mediaTokenEstimate(attachment),
-    0,
-  );
-}
-
 function estimateMessageTokens(messages: readonly OpenCodeMessage[]): number {
   let mediaTokens = 0;
   const visible = messages.flatMap((message) =>
@@ -165,7 +90,7 @@ function estimateMessageTokens(messages: readonly OpenCodeMessage[]): number {
                   return { type: part.type, text: part.text ?? "" };
                 }
                 if (part.type === "file") {
-                  mediaTokens += mediaTokenEstimate(part);
+                  mediaTokens += modelVisibleMediaTokens(part);
                   return {
                     type: "file",
                     filename: part.filename?.slice(0, 500),
@@ -697,6 +622,7 @@ function safeTailCandidates(input: {
   messages: readonly OpenCodeMessage[];
   contextLimit: number;
   previous?: ProjectionCheckpoint;
+  committedBoundaries: readonly CommittedSegmentBoundary[];
 }): TailCandidate[] {
   const previousIndex = input.previous
     ? input.messages.findIndex(
@@ -707,7 +633,11 @@ function safeTailCandidates(input: {
     : -1;
   const historyStartIndex =
     inheritedCompaction(input.messages)?.historyStartIndex ?? 0;
-  const segments = segmentMessages(input.messages.slice(historyStartIndex));
+  const segments = segmentMessages(
+    input.messages.slice(historyStartIndex),
+    undefined,
+    input.committedBoundaries,
+  );
   const targetTokens = Math.floor(input.contextLimit * PROJECTION_TAIL_RATIO);
   const candidates = segments.slice(1).flatMap((segment, index) => {
     const archivedSegments = segments.slice(0, index + 1);
@@ -735,6 +665,7 @@ export async function projectMessages(input: {
   inputLimit?: number;
   outputLimit?: number;
   previous?: ProjectionSessionState;
+  loadBoundaries?: () => Promise<readonly CommittedSegmentBoundary[]>;
   loadSummaries: () => Promise<readonly StoredSegmentSummary[]>;
 }): Promise<ProjectionResult> {
   if (!Number.isFinite(input.contextLimit) || input.contextLimit <= 0) {
@@ -806,10 +737,15 @@ export async function projectMessages(input: {
     };
   }
 
+  let committedBoundaries: readonly CommittedSegmentBoundary[] = [];
+  try {
+    committedBoundaries = (await input.loadBoundaries?.()) ?? [];
+  } catch {}
   const tailCandidates = safeTailCandidates({
     messages: input.messages,
     contextLimit: input.contextLimit,
     previous: checkpoint,
+    committedBoundaries,
   });
   if (tailCandidates.length === 0) {
     throw new ProjectionCoverageError(
@@ -872,7 +808,9 @@ export async function projectMessages(input: {
         sessionId: tailStart.info.sessionID ?? "unknown",
         tailStartUserMessageId: tailStart.info.id,
         archivedMessageCount: tailIndex,
-        archivedUserTurnCount: coverage.userCount,
+        archivedUserTurnCount: input.messages
+          .slice(0, tailIndex)
+          .filter(isNormalUserMessage).length,
         includedSummaryCount: built.includedSummaryCount,
         lossy: built.lossy,
         omissionReasons: built.omissionReasons,

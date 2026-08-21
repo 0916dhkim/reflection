@@ -115,9 +115,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @router.get("/sessions/{session_id}/segments", response_model=SessionSegmentsResponse)
     async def get_session_segments(session_id: str) -> SessionSegmentsResponse:
+        segments, boundaries, targets = await database.session_segment_listing(session_id)
         return SessionSegmentsResponse(
             session_id=session_id,
-            segments=await database.segment_summaries(session_id),
+            segments=segments,
+            boundaries=boundaries,
+            targets=targets,
         )
 
     @router.post("/search", response_model=SearchResponse)

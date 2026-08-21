@@ -935,6 +935,32 @@ async def test_prior_summaries_use_current_segment_eligibility() -> None:
         assert [segment.id for segment in await database.segment_summaries("summary-session")] == [
             first_segment_id
         ]
+        summaries, boundaries, targets = await database.session_segment_listing("summary-session")
+        assert [summary.id for summary in summaries] == [first_segment_id]
+        assert {boundary.id: boundary.source_eligible for boundary in boundaries} == {
+            first_segment_id: True,
+            second_segment_id: False,
+        }
+        assert [target.end_user_message_id for target in targets] == ["second-end"]
+
+        future_second = SegmentCreate.model_validate(
+            {
+                **second_request.model_dump(),
+                "end_user_message_id": "second-future-end",
+                "messages": [
+                    {"role": "user", "text": "second"},
+                    {"role": "assistant", "text": "future"},
+                ],
+            }
+        )
+        await database.enqueue(future_second)
+        _, boundaries, targets = await database.session_segment_listing("summary-session")
+        second_boundary = next(
+            boundary for boundary in boundaries if boundary.id == second_segment_id
+        )
+        assert second_boundary.end_user_message_id == "second-end"
+        assert second_boundary.source_eligible is False
+        assert [target.end_user_message_id for target in targets] == ["second-future-end"]
 
         await database.enqueue(second_request)
         assert await database.prior_summaries("summary-session", first_segment_id) == [
@@ -949,6 +975,12 @@ async def test_prior_summaries_use_current_segment_eligibility() -> None:
         assert [segment.id for segment in await database.segment_summaries("summary-session")] == [
             first_segment_id
         ]
+        summaries, boundaries, _ = await database.session_segment_listing("summary-session")
+        assert [summary.id for summary in summaries] == [first_segment_id]
+        assert {boundary.id: boundary.source_eligible for boundary in boundaries} == {
+            first_segment_id: True,
+            second_segment_id: False,
+        }
     finally:
         await database.close()
 
@@ -1543,6 +1575,9 @@ async def test_legacy_schema_migrates_in_place() -> None:
         assert invalid_payload_job is not None
         assert invalid_payload_job.status == "failed"
         assert invalid_payload_job.error == "invalid persisted payload: payload is null"
+        _, legacy_boundaries, _ = await database.session_segment_listing("legacy")
+        assert len(legacy_boundaries) == 1
+        assert legacy_boundaries[0].source_fingerprint is None
 
         async with database.pool.connection() as migrated:
             await migrated.execute(

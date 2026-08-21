@@ -304,6 +304,53 @@ describe("projectMessages", () => {
     expect(loadSummaries).toHaveBeenCalledOnce();
   });
 
+  it("uses tool-aware segment boundaries without modifying the retained tail", async () => {
+    const messages: OpenCodeMessage[] = [];
+    for (let index = 0; index < 11; index += 1) {
+      const userId = `tool-user-${index}`;
+      messages.push(user(userId, `request ${index}`));
+      messages.push(
+        assistant(`tool-answer-${index}`, userId, "working", [
+          {
+            type: "tool",
+            tool: "bash",
+            state: {
+              status: "completed",
+              input: { command: "logs" },
+              output: "x".repeat(30_000),
+            },
+          },
+        ]),
+      );
+    }
+    messages.push(user("current", "continue"));
+
+    const result = await projectMessages({
+      messages,
+      contextLimit: CONTEXT_LIMIT,
+      loadSummaries: async () => summaries(messages),
+    });
+    const tailId = result.state.checkpoint?.tailStartUserMessageId;
+    const tailIndex = messages.findIndex(
+      (message) => message.info.id === tailId,
+    );
+
+    expect(result.reset).toBe(true);
+    expect(tailIndex).toBeGreaterThan(0);
+    expect(result.messages.slice(2)).toEqual(messages.slice(tailIndex));
+    expect(
+      result.messages
+        .slice(2)
+        .flatMap((message) => message.parts)
+        .filter((part) => part.type === "tool")
+        .every((part) =>
+          typeof part.state === "object" && part.state !== null
+            ? !("compacted" in ((part.state as { time?: object }).time ?? {}))
+            : true,
+        ),
+    ).toBe(true);
+  });
+
   it("immediately resets when switching to a smaller context model", async () => {
     const messages = longSession();
     const first = await projectMessages({

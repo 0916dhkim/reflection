@@ -13,6 +13,8 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
+import { segmentMessages } from "../plugin/src/segments.ts";
+
 const HOME = homedir();
 const MAX_SEGMENT_CHARS = 20_000;
 const PROJECTION_VERSION = 1;
@@ -153,79 +155,6 @@ function scheduleLaunchAgentCleanup() {
     label: LAUNCHD_LABEL,
     plist: LAUNCHD_PLIST,
   });
-}
-
-function segmentMessages(rows) {
-  const turns = [];
-  const turnsById = new Map();
-  for (const [index, row] of rows.entries()) {
-    if (row.role !== "user") continue;
-    const turn = {
-      userMessageId: row.id,
-      charCount: row.text.length,
-      messages: [{ index, role: "user", text: row.text }],
-      complete: false,
-    };
-    turns.push(turn);
-    turnsById.set(row.id, turn);
-  }
-
-  for (const [index, row] of rows.entries()) {
-    if (row.role !== "assistant" || !row.parentId) continue;
-    const turn = turnsById.get(row.parentId);
-    if (!turn) continue;
-    turn.messages.push({ index, role: "assistant", text: row.text });
-    turn.charCount += row.text.length;
-    if (
-      !row.error &&
-      typeof row.timeCompleted === "number" &&
-      typeof row.finish === "string" &&
-      !["tool-calls", "unknown"].includes(row.finish)
-    ) {
-      turn.complete = true;
-    }
-  }
-
-  const segments = [];
-  let current = [];
-  let currentChars = 0;
-  for (const turn of turns) {
-    if (!turn.complete) {
-      if (current.length) segments.push(current);
-      current = [];
-      currentChars = 0;
-      continue;
-    }
-    if (turn.charCount > MAX_SEGMENT_CHARS) {
-      if (current.length) segments.push(current);
-      segments.push([turn]);
-      current = [];
-      currentChars = 0;
-      continue;
-    }
-    if (current.length && currentChars + turn.charCount > MAX_SEGMENT_CHARS) {
-      segments.push(current);
-      current = [];
-      currentChars = 0;
-    }
-    current.push(turn);
-    currentChars += turn.charCount;
-    if (currentChars === MAX_SEGMENT_CHARS) {
-      segments.push(current);
-      current = [];
-      currentChars = 0;
-    }
-  }
-  if (current.length) segments.push(current);
-
-  return segments.map((turnGroup) => ({
-    startUserMessageId: turnGroup[0].userMessageId,
-    endUserMessageId: turnGroup.at(-1).userMessageId,
-    messages: turnGroup
-      .flatMap((turn) => turn.messages)
-      .sort((left, right) => left.index - right.index)
-      .map(({ role, text }) => ({ role, text })),
-  }));
 }
 
 async function fetchJson(url, init = {}, attempts = 5) {
@@ -411,53 +340,103 @@ const sessionStatusQuery = sqlite.prepare(
   "SELECT time_updated AS timeUpdated FROM session WHERE id = ?",
 );
 const messageQuery = sqlite.prepare(`
-  SELECT
-    m.id,
-    json_extract(m.data, '$.role') AS role,
-    json_extract(m.data, '$.parentID') AS parentId,
-    json_extract(m.data, '$.error') AS error,
-    json_extract(m.data, '$.finish') AS finish,
-    json_extract(m.data, '$.time.completed') AS timeCompleted,
-    COALESCE((
-      SELECT group_concat(text, '')
-      FROM (
-        SELECT CASE
-          WHEN json_extract(p.data, '$.type') = 'text'
-            THEN COALESCE(json_extract(p.data, '$.text'), '')
-          WHEN json_extract(p.data, '$.type') = 'file'
-            THEN '[Attachment' ||
-                 CASE
-                   WHEN json_extract(p.data, '$.filename') IS NOT NULL
-                     THEN ' ' || substr(json_extract(p.data, '$.filename'), 1, 500)
-                   ELSE ''
-                 END ||
-                 CASE
-                   WHEN json_extract(p.data, '$.mime') IS NOT NULL
-                     THEN ' (' || substr(json_extract(p.data, '$.mime'), 1, 200) || ')'
-                   ELSE ''
-                 END || ']'
-          ELSE ''
-        END AS text
-        FROM part p
-        WHERE p.message_id = m.id
-          AND COALESCE(json_extract(p.data, '$.ignored'), 0) != 1
-        ORDER BY p.id
-      )
-    ), '') AS text
+  SELECT m.id, m.data
   FROM message m
   WHERE m.session_id = ?
   ORDER BY m.time_created, m.id
 `);
+const partQuery = sqlite.prepare(`
+  SELECT id, message_id AS messageId, data
+  FROM part
+  WHERE session_id = ?
+  ORDER BY message_id, id
+`);
+
+function sessionMessages(sessionId) {
+  const parts = Map.groupBy(partQuery.all(sessionId), (row) => row.messageId);
+  return messageQuery.all(sessionId).map((row) => ({
+    info: { ...JSON.parse(row.data), id: row.id, sessionID: sessionId },
+    parts: (parts.get(row.id) ?? []).map((part) => ({
+      ...JSON.parse(part.data),
+      id: part.id,
+      messageID: part.messageId,
+      sessionID: sessionId,
+    })),
+  }));
+}
 
 state.sessionsTotal = sessions.length;
 saveState();
 
+reflectionConfig = loadJson(REFLECTION_CONFIG_PATH);
+serviceHeaders = { "X-Api-Key": reflectionConfig.apiKey };
+
+function boundaryKey(startUserMessageId, endUserMessageId) {
+  return `${startUserMessageId}\0${endUserMessageId}`;
+}
+
+async function sessionListing(sessionId) {
+  const response = await serviceRequest(
+    `/v1/sessions/${encodeURIComponent(sessionId)}/segments`,
+  );
+  if (
+    !Array.isArray(response?.segments) ||
+    !Array.isArray(response?.boundaries) ||
+    !Array.isArray(response?.targets)
+  ) {
+    throw new Error(`invalid segment manifest for ${sessionId}`);
+  }
+  return response;
+}
+
+async function segmentPlan(sessionId, messages) {
+  const listing = await sessionListing(sessionId);
+  const boundaries = listing.boundaries.map((boundary) => ({
+    id: boundary.id,
+    startUserMessageId: boundary.start_user_message_id,
+    endUserMessageId: boundary.end_user_message_id,
+    projectionVersion: boundary.projection_version,
+    sourceEligible: boundary.source_eligible,
+  }));
+  const desiredTargets = listing.targets.map((target) => ({
+      id: target.id,
+      startUserMessageId: target.start_user_message_id,
+      endUserMessageId: target.end_user_message_id,
+      projectionVersion: target.projection_version,
+      sourceEligible: false,
+    }));
+  const eligible = new Set(
+    boundaries
+      .filter((boundary) => boundary.sourceEligible)
+      .map((boundary) =>
+        boundaryKey(boundary.startUserMessageId, boundary.endUserMessageId),
+      ),
+  );
+  const committed = new Set(
+    boundaries.map((boundary) =>
+      boundaryKey(boundary.startUserMessageId, boundary.endUserMessageId),
+    ),
+  );
+  return segmentMessages(messages, MAX_SEGMENT_CHARS, [
+    ...boundaries,
+    ...desiredTargets,
+  ]).map((segment) => {
+    const key = boundaryKey(segment.startUserMessageId, segment.endUserMessageId);
+    return {
+      ...segment,
+      status: eligible.has(key) ? "eligible" : committed.has(key) ? "stale" : "new",
+    };
+  });
+}
+
 if (DRY_RUN) {
   let segmentCount = 0;
   let messageCount = 0;
+  const statuses = { eligible: 0, stale: 0, new: 0 };
   for (const session of sessions) {
-    const segments = segmentMessages(messageQuery.all(session.id));
+    const segments = await segmentPlan(session.id, sessionMessages(session.id));
     segmentCount += segments.length;
+    for (const segment of segments) statuses[segment.status] += 1;
     messageCount += segments.reduce(
       (total, segment) => total + segment.messages.length,
       0,
@@ -468,24 +447,22 @@ if (DRY_RUN) {
       sessions: sessions.length,
       segments: segmentCount,
       messages: messageCount,
+      statuses,
     }),
   );
   process.exit(0);
 }
 
-reflectionConfig = loadJson(REFLECTION_CONFIG_PATH);
-serviceHeaders = { "X-Api-Key": reflectionConfig.apiKey };
-
 function stableSessionSnapshot(session) {
   const before = sessionStatusQuery.get(session.id);
-  if (!before) return { ready: true, segments: [] };
+  if (!before) return { ready: true, messages: [] };
   const beforeUpdatedAt = Number(before.timeUpdated);
   if (beforeUpdatedAt + INACTIVE_MS > Date.now()) {
     return { ready: false, retryAt: beforeUpdatedAt + INACTIVE_MS };
   }
-  const rows = messageQuery.all(session.id);
+  const messages = sessionMessages(session.id);
   const after = sessionStatusQuery.get(session.id);
-  if (!after) return { ready: true, segments: [] };
+  if (!after) return { ready: true, messages: [] };
   const afterUpdatedAt = Number(after.timeUpdated);
   if (
     afterUpdatedAt !== beforeUpdatedAt ||
@@ -493,10 +470,23 @@ function stableSessionSnapshot(session) {
   ) {
     return { ready: false, retryAt: afterUpdatedAt + INACTIVE_MS };
   }
-  return { ready: true, segments: segmentMessages(rows) };
+  return { ready: true, messages, observedUpdatedAt: afterUpdatedAt };
 }
 
-async function processSession(session, segments) {
+function sessionRemainsStable(sessionId, observedUpdatedAt) {
+  const current = sessionStatusQuery.get(sessionId);
+  return (
+    current &&
+    Number(current.timeUpdated) === observedUpdatedAt &&
+    observedUpdatedAt + INACTIVE_MS <= Date.now()
+  );
+}
+
+async function processSession(session, messages, observedUpdatedAt) {
+  if (observedUpdatedAt === undefined) return true;
+  if (!sessionRemainsStable(session.id, observedUpdatedAt)) return false;
+  const segments = await segmentPlan(session.id, messages);
+  if (!sessionRemainsStable(session.id, observedUpdatedAt)) return false;
   state.status = "running";
   state.currentSessionId = session.id;
   state.currentSessionTitle = session.title;
@@ -509,6 +499,7 @@ async function processSession(session, segments) {
       endUserMessageId: segment.endUserMessageId,
     };
     saveState();
+    if (!sessionRemainsStable(session.id, observedUpdatedAt)) return false;
     const submission = {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -542,9 +533,11 @@ async function processSession(session, segments) {
       recordFailure(session.id, segment, completed);
     }
     saveState();
+    if (!sessionRemainsStable(session.id, observedUpdatedAt)) return false;
   }
   state.sessionsVisited += 1;
   saveState();
+  return true;
 }
 
 async function backfill() {
@@ -563,7 +556,18 @@ async function backfill() {
           deferred.push({ session, retryAt: snapshot.retryAt });
           continue;
         }
-        await processSession(session, snapshot.segments);
+        const completed = await processSession(
+          session,
+          snapshot.messages,
+          snapshot.observedUpdatedAt,
+        );
+        if (!completed) {
+          const current = sessionStatusQuery.get(session.id);
+          deferred.push({
+            session,
+            retryAt: Number(current?.timeUpdated ?? Date.now()) + INACTIVE_MS,
+          });
+        }
       }
       if (!deferred.length) break;
       const earliestRetryAt = Math.min(

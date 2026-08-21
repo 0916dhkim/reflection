@@ -9,6 +9,7 @@ import {
   readSegmentMessages,
   segmentMessages,
   textOf,
+  modelVisibleCharWeightOf,
   type OpenCodeMessage,
 } from "../src/segments.js";
 
@@ -183,6 +184,99 @@ describe("textOf", () => {
 });
 
 describe("segmentMessages", () => {
+  it("counts model-visible tool output and reasoning toward segment boundaries", () => {
+    const first = assistant("a1", "u1", "answer");
+    first.parts = [
+      ...first.parts,
+      { type: "reasoning", text: "reason" },
+      {
+        type: "tool",
+        tool: "bash",
+        state: { status: "completed", input: {}, output: "x".repeat(20) },
+      },
+    ];
+    const messages = [user("u1", "request"), first, user("u2", "next")];
+
+    expect(modelVisibleCharWeightOf(first)).toBeGreaterThan(20);
+    expect(segmentMessages(messages, 20)).toMatchObject([
+      { startUserMessageId: "u1", endUserMessageId: "u1", closed: true },
+      { startUserMessageId: "u2", endUserMessageId: "u2", closed: false },
+    ]);
+  });
+
+  it("reserves model-visible media carried by tool results", () => {
+    const message = assistant("a1", "u1", "done");
+    message.parts = [
+      {
+        type: "tool",
+        tool: "read",
+        state: {
+          status: "completed",
+          output: "image",
+          attachments: [
+            { mime: "image/png", url: "https://example.com/image.png" },
+          ],
+        },
+      },
+    ];
+
+    expect(modelVisibleCharWeightOf(message)).toBeGreaterThanOrEqual(32_000);
+
+    const embedded = structuredClone(message);
+    const tool = embedded.parts[0];
+    if (tool?.type === "tool" && typeof tool.state === "object" && tool.state) {
+      (
+        tool.state as { attachments: Array<{ mime: string; url: string }> }
+      ).attachments[0]!.url = `data:image/png;base64,${"x".repeat(1_000_000)}`;
+    }
+    expect(
+      Math.abs(
+        modelVisibleCharWeightOf(embedded) - modelVisibleCharWeightOf(message),
+      ),
+    ).toBeLessThan(100);
+  });
+
+  it("preserves maximum non-overlapping committed coverage and segments gaps", () => {
+    const messages = [
+      user("u1", "1"),
+      user("u2", "2"),
+      user("u3", "3"),
+      user("u4", "4"),
+      user("u5", "5"),
+    ];
+
+    expect(
+      segmentMessages(messages, 2, [
+        {
+          id: "short",
+          startUserMessageId: "u1",
+          endUserMessageId: "u2",
+          sourceEligible: true,
+        },
+        {
+          id: "long",
+          startUserMessageId: "u1",
+          endUserMessageId: "u3",
+          sourceEligible: false,
+        },
+        {
+          id: "tail",
+          startUserMessageId: "u4",
+          endUserMessageId: "u4",
+          sourceEligible: true,
+        },
+      ]).map(({ startUserMessageId, endUserMessageId, closed }) => ({
+        startUserMessageId,
+        endUserMessageId,
+        closed,
+      })),
+    ).toEqual([
+      { startUserMessageId: "u1", endUserMessageId: "u3", closed: true },
+      { startUserMessageId: "u4", endUserMessageId: "u4", closed: true },
+      { startUserMessageId: "u5", endUserMessageId: "u5", closed: false },
+    ]);
+  });
+
   it("keeps turns together and starts a new segment when a turn crosses the limit", () => {
     const messages = [
       user("u1", "123"),

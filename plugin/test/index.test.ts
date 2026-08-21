@@ -13,6 +13,7 @@ import {
 
 import {
   PROJECTION_LOSS_WARNING,
+  segmentMessages,
   type OpenCodeMessage,
 } from "../src/segments.js";
 
@@ -25,7 +26,19 @@ vi.mock("node:os", async (importOriginal) => ({
   homedir: () => paths.home,
 }));
 
-import { Reflection } from "../src/index.js";
+import { Reflection, submissionSourceFingerprint } from "../src/index.js";
+
+function segmentFingerprint(
+  sessionId: string,
+  messages: readonly OpenCodeMessage[],
+  startUserMessageId: string,
+): string {
+  const segment = segmentMessages(messages).find(
+    (candidate) => candidate.startUserMessageId === startUserMessageId,
+  );
+  if (!segment) throw new Error(`missing segment ${startUserMessageId}`);
+  return submissionSourceFingerprint(sessionId, segment);
+}
 
 beforeAll(() => {
   mkdirSync(join(paths.home, ".config", "opencode"), { recursive: true });
@@ -150,6 +163,16 @@ function ok(data: unknown = {}): Response {
   });
 }
 
+function emptyListing(url: string | URL | Request): Response {
+  const match = String(url).match(/\/v1\/sessions\/([^/]+)\/segments/);
+  return ok({
+    session_id: match ? decodeURIComponent(match[1]!) : "unknown",
+    segments: [],
+    boundaries: [],
+    targets: [],
+  });
+}
+
 describe("Reflection plugin hooks", () => {
   it("disables automatic compaction but bypasses projection for manual compaction", async () => {
     const providerList = vi.fn(() => {
@@ -211,7 +234,12 @@ describe("Reflection plugin hooks", () => {
           return ok();
         }
         summaryGets += 1;
-        return ok({ session_id: sessionId, segments: [] });
+        return ok({
+          session_id: sessionId,
+          segments: [],
+          boundaries: [],
+          targets: [],
+        });
       }),
     );
     const hooks = await Reflection(pluginInput(client));
@@ -233,13 +261,13 @@ describe("Reflection plugin hooks", () => {
       output as never,
     );
     await Promise.resolve();
-    expect(summaryGets).toBe(0);
+    expect(summaryGets).toBe(1);
 
     postResolvers.shift()?.();
 
     await Promise.all([firstIdle, secondIdle, projection]);
     expect(maxActivePosts).toBe(1);
-    expect(summaryGets).toBe(1);
+    expect(summaryGets).toBe(4);
     expect(client.session.messages).toHaveBeenCalledTimes(2);
     expect(client.session.status).toHaveBeenCalledTimes(4);
     expect(output.messages[1]?.parts[0]?.text).toContain(
@@ -260,12 +288,12 @@ describe("Reflection plugin hooks", () => {
     let targetPosts = 0;
     vi.stubGlobal(
       "fetch",
-      vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+      vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
         if (init?.method === "POST") {
           targetPosts += 1;
           submittedBodies.push(JSON.parse(String(init.body)));
         }
-        return ok();
+        return emptyListing(url);
       }),
     );
     const hooks = await Reflection(pluginInput(client));
@@ -333,11 +361,11 @@ describe("Reflection plugin hooks", () => {
     const submittedBodies: Array<Record<string, unknown>> = [];
     vi.stubGlobal(
       "fetch",
-      vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+      vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
         if (init?.method === "POST") {
           submittedBodies.push(JSON.parse(String(init.body)));
         }
-        return ok();
+        return emptyListing(url);
       }),
     );
     const hooks = await Reflection(pluginInput(client));
@@ -390,11 +418,11 @@ describe("Reflection plugin hooks", () => {
     const submittedBodies: Array<Record<string, unknown>> = [];
     vi.stubGlobal(
       "fetch",
-      vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+      vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
         if (init?.method === "POST") {
           submittedBodies.push(JSON.parse(String(init.body)));
         }
-        return ok();
+        return emptyListing(url);
       }),
     );
     const hooks = await Reflection(pluginInput(client));
@@ -448,7 +476,7 @@ describe("Reflection plugin hooks", () => {
     let openAttempts = 0;
     vi.stubGlobal(
       "fetch",
-      vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+      vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
         if (init?.method === "POST") {
           const body = JSON.parse(String(init.body));
           if (
@@ -463,6 +491,14 @@ describe("Reflection plugin hooks", () => {
           return ok();
         }
         summaryGets += 1;
+        if (String(url).includes(encodeURIComponent(activeSessionId))) {
+          return ok({
+            session_id: activeSessionId,
+            segments: [],
+            boundaries: [],
+            targets: [],
+          });
+        }
         return ok({
           session_id: inactiveSessionId,
           segments: [
@@ -474,6 +510,21 @@ describe("Reflection plugin hooks", () => {
               summary: "Closed segment summary",
             },
           ],
+          boundaries: [
+            {
+              id: "closed-summary",
+              start_user_message_id: `${inactiveSessionId}-old-user`,
+              end_user_message_id: `${inactiveSessionId}-old-user`,
+              projection_version: 1,
+              source_eligible: true,
+              source_fingerprint: segmentFingerprint(
+                inactiveSessionId,
+                inactiveMessages,
+                `${inactiveSessionId}-old-user`,
+              ),
+            },
+          ],
+          targets: [],
         });
       }),
     );
@@ -497,7 +548,7 @@ describe("Reflection plugin hooks", () => {
     const context = output.messages
       .flatMap((message) => message.parts)
       .find((part) => part.synthetic === true)?.text;
-    expect(summaryGets).toBe(1);
+    expect(summaryGets).toBe(6);
     expect(openAttempts).toBe(2);
     expect(context).toContain("Closed segment summary");
     expect(context).not.toContain(PROJECTION_LOSS_WARNING);
@@ -524,7 +575,12 @@ describe("Reflection plugin hooks", () => {
           return ok();
         }
         summaryGets += 1;
-        return ok({ session_id: sessionId, segments: [] });
+        return ok({
+          session_id: sessionId,
+          segments: [],
+          boundaries: [],
+          targets: [],
+        });
       }),
     );
     const hooks = await Reflection(pluginInput(client));
@@ -546,7 +602,7 @@ describe("Reflection plugin hooks", () => {
     releaseMessages?.();
     await Promise.all([idle, projection]);
     expect(targetPosts).toBe(1);
-    expect(summaryGets).toBe(1);
+    expect(summaryGets).toBe(3);
   });
 
   it("defers one dirty rerun while the active pass is sweeping", async () => {
@@ -573,7 +629,12 @@ describe("Reflection plugin hooks", () => {
           return ok();
         }
         summaryGets += 1;
-        return ok({ session_id: sessionId, segments: [] });
+        return ok({
+          session_id: sessionId,
+          segments: [],
+          boundaries: [],
+          targets: [],
+        });
       }),
     );
     const hooks = await Reflection(pluginInput(client));
@@ -606,14 +667,14 @@ describe("Reflection plugin hooks", () => {
       output as never,
     );
     await Promise.resolve();
-    expect(summaryGets).toBe(0);
+    expect(summaryGets).toBe(1);
 
     releaseList?.();
     await vi.waitFor(() => expect(postResolvers).toHaveLength(1));
     postResolvers.shift()?.();
     await Promise.all([firstIdle, overlappingIdle, projection]);
     expect(client.session.messages).toHaveBeenCalledTimes(2);
-    expect(summaryGets).toBe(1);
+    expect(summaryGets).toBe(4);
   });
 
   it("retries summary loading when a target update registers during the GET", async () => {
@@ -630,10 +691,22 @@ describe("Reflection plugin hooks", () => {
         if (summaryGets === 1) {
           return new Promise<Response>((resolve) => {
             releaseFirstGet = () =>
-              resolve(ok({ session_id: sessionId, segments: [] }));
+              resolve(
+                ok({
+                  session_id: sessionId,
+                  segments: [],
+                  boundaries: [],
+                  targets: [],
+                }),
+              );
           });
         }
-        return ok({ session_id: sessionId, segments: [] });
+        return ok({
+          session_id: sessionId,
+          segments: [],
+          boundaries: [],
+          targets: [],
+        });
       }),
     );
     const hooks = await Reflection(pluginInput(client));
@@ -653,7 +726,7 @@ describe("Reflection plugin hooks", () => {
     releaseFirstGet?.();
     await Promise.all([projection, idle]);
 
-    expect(summaryGets).toBe(2);
+    expect(summaryGets).toBe(3);
   });
 
   it("coalesces duplicate idle events and abandons a snapshot that became busy", async () => {
@@ -696,8 +769,8 @@ describe("Reflection plugin hooks", () => {
     const submittedBodies: Array<Record<string, unknown>> = [];
     vi.stubGlobal(
       "fetch",
-      vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
-        if (init?.method !== "POST") return ok();
+      vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+        if (init?.method !== "POST") return emptyListing(url);
         submittedBodies.push(JSON.parse(String(init.body)));
         await new Promise<void>((resolve) => postResolvers.push(resolve));
         return ok();
@@ -749,8 +822,8 @@ describe("Reflection plugin hooks", () => {
     let postSignal: AbortSignal | undefined;
     vi.stubGlobal(
       "fetch",
-      vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
-        if (init?.method !== "POST") return ok();
+      vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+        if (init?.method !== "POST") return emptyListing(url);
         postSignal = init.signal ?? undefined;
         return new Promise<Response>((_resolve, reject) => {
           postSignal?.addEventListener(
@@ -804,11 +877,11 @@ describe("Reflection plugin hooks", () => {
     const submittedSessions: string[] = [];
     vi.stubGlobal(
       "fetch",
-      vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+      vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
         if (init?.method === "POST") {
           submittedSessions.push(JSON.parse(String(init.body)).session_id);
         }
-        return ok();
+        return emptyListing(url);
       }),
     );
     const hooks = await Reflection(pluginInput(client));
@@ -889,6 +962,21 @@ describe("Reflection plugin hooks", () => {
               summary: synced ? "FRESH SUMMARY" : "STALE SUMMARY",
             },
           ],
+          boundaries: [
+            {
+              id: synced ? "fresh-summary" : "stale-summary",
+              start_user_message_id: `${sessionId}-old-user`,
+              end_user_message_id: `${sessionId}-old-user`,
+              projection_version: 1,
+              source_eligible: true,
+              source_fingerprint: segmentFingerprint(
+                sessionId,
+                messages,
+                `${sessionId}-old-user`,
+              ),
+            },
+          ],
+          targets: [],
         });
       }),
     );
@@ -904,12 +992,12 @@ describe("Reflection plugin hooks", () => {
       output as never,
     );
     await vi.waitFor(() => expect(releaseRestartSync).toBeDefined());
-    expect(summaryGets).toBe(0);
+    expect(summaryGets).toBe(2);
 
     releaseRestartSync?.();
     await projection;
     const context = output.messages[1]?.parts[0]?.text;
-    expect(summaryGets).toBe(1);
+    expect(summaryGets).toBe(3);
     expect(context).toContain("FRESH SUMMARY");
     expect(context).not.toContain("STALE SUMMARY");
     expect(submittedBodies).toHaveLength(2);
@@ -934,7 +1022,7 @@ describe("Reflection plugin hooks", () => {
       messages: structuredClone(messages),
     } as never);
     expect(targetPosts).toBe(2);
-    expect(summaryGets).toBe(2);
+    expect(summaryGets).toBe(5);
   });
 
   it("makes reset lossy without GET when initial closed sync fails", async () => {
@@ -951,7 +1039,12 @@ describe("Reflection plugin hooks", () => {
           return new Response("failed", { status: 500 });
         }
         summaryGets += 1;
-        return ok({ session_id: sessionId, segments: [] });
+        return ok({
+          session_id: sessionId,
+          segments: [],
+          boundaries: [],
+          targets: [],
+        });
       }),
     );
     const hooks = await Reflection(pluginInput(client));
@@ -959,7 +1052,7 @@ describe("Reflection plugin hooks", () => {
 
     await hooks["experimental.chat.messages.transform"]?.({}, output as never);
 
-    expect(summaryGets).toBe(0);
+    expect(summaryGets).toBe(1);
     expect(submittedBodies).toHaveLength(1);
     expect(submittedBodies[0]).toMatchObject({
       start_user_message_id: `${sessionId}-old-user`,
@@ -995,7 +1088,12 @@ describe("Reflection plugin hooks", () => {
           });
         }
         summaryGets += 1;
-        return ok({ session_id: sessionId, segments: [] });
+        return ok({
+          session_id: sessionId,
+          segments: [],
+          boundaries: [],
+          targets: [],
+        });
       }),
     );
     const hooks = await Reflection(pluginInput(client));
@@ -1010,7 +1108,7 @@ describe("Reflection plugin hooks", () => {
     await vi.advanceTimersByTimeAsync(5_000);
     await projection;
 
-    expect(summaryGets).toBe(0);
+    expect(summaryGets).toBe(1);
     expect(submittedBodies).not.toContainEqual(
       expect.objectContaining({
         start_user_message_id: `${sessionId}-current`,
@@ -1035,7 +1133,12 @@ describe("Reflection plugin hooks", () => {
           return new Response("failed", { status: 500 });
         }
         summaryGets += 1;
-        return ok({ session_id: sessionId, segments: [] });
+        return ok({
+          session_id: sessionId,
+          segments: [],
+          boundaries: [],
+          targets: [],
+        });
       }),
     );
     const hooks = await Reflection(pluginInput(client));
@@ -1053,7 +1156,7 @@ describe("Reflection plugin hooks", () => {
     await hooks["experimental.chat.messages.transform"]?.({}, output as never);
 
     expect(targetPosts).toBe(2);
-    expect(summaryGets).toBe(0);
+    expect(summaryGets).toBe(2);
     expect(output.messages[1]?.parts[0]?.text).toContain(
       "Reflection summaries were unavailable",
     );
@@ -1090,6 +1193,17 @@ describe("Reflection plugin hooks", () => {
               summary: "STALE LOSSLESS SUMMARY",
             },
           ],
+          boundaries: [
+            {
+              id: "stale-summary",
+              start_user_message_id: `${sessionId}-old-user`,
+              end_user_message_id: `${sessionId}-old-user`,
+              projection_version: 1,
+              source_eligible: true,
+              source_fingerprint: "fingerprint",
+            },
+          ],
+          targets: [],
         });
       }),
     );
@@ -1106,7 +1220,7 @@ describe("Reflection plugin hooks", () => {
 
     const context = output.messages[1]?.parts[0]?.text;
     expect(targetPosts).toBe(2);
-    expect(summaryGets).toBe(0);
+    expect(summaryGets).toBe(2);
     expect(context).toContain("Reflection summaries were unavailable");
     expect(context).not.toContain("STALE LOSSLESS SUMMARY");
     expect(client.session.messages).toHaveBeenCalledWith({
@@ -1144,7 +1258,12 @@ describe("Reflection plugin hooks", () => {
             : ok();
         }
         summaryGets += 1;
-        return ok({ session_id: sessionId, segments: [] });
+        return ok({
+          session_id: sessionId,
+          segments: [],
+          boundaries: [],
+          targets: [],
+        });
       }),
     );
     const hooks = await Reflection(pluginInput(client));
@@ -1162,7 +1281,7 @@ describe("Reflection plugin hooks", () => {
     await hooks["experimental.chat.messages.transform"]?.({}, output as never);
 
     expect(targetPosts).toBe(2);
-    expect(summaryGets).toBe(0);
+    expect(summaryGets).toBe(3);
     expect(output.messages[1]?.parts[0]?.text).toContain(
       "Reflection summaries were unavailable",
     );
@@ -1184,7 +1303,12 @@ describe("Reflection plugin hooks", () => {
             : ok();
         }
         summaryGets += 1;
-        return ok({ session_id: sessionId, segments: [] });
+        return ok({
+          session_id: sessionId,
+          segments: [],
+          boundaries: [],
+          targets: [],
+        });
       }),
     );
     const hooks = await Reflection(pluginInput(client));
@@ -1200,7 +1324,7 @@ describe("Reflection plugin hooks", () => {
     } as never);
 
     expect(targetPosts).toBe(2);
-    expect(summaryGets).toBe(1);
+    expect(summaryGets).toBe(5);
   });
 
   it("clears a failed closed boundary after replacement-history rewind", async () => {
@@ -1240,6 +1364,17 @@ describe("Reflection plugin hooks", () => {
               summary: "Exact replacement summary",
             },
           ],
+          boundaries: [
+            {
+              id: "replacement-summary",
+              start_user_message_id: replacementUserId,
+              end_user_message_id: replacementUserId,
+              projection_version: 1,
+              source_eligible: true,
+              source_fingerprint: "fingerprint",
+            },
+          ],
+          targets: [],
         });
       }),
     );
@@ -1257,8 +1392,8 @@ describe("Reflection plugin hooks", () => {
     const context = output.messages
       .flatMap((message) => message.parts)
       .find((part) => part.synthetic === true)?.text;
-    expect(targetPosts).toBe(2);
-    expect(summaryGets).toBe(1);
+    expect(targetPosts).toBe(3);
+    expect(summaryGets).toBe(4);
     expect(context).toContain("Exact replacement summary");
     expect(context).not.toContain("Reflection summaries were unavailable");
   });
@@ -1294,6 +1429,17 @@ describe("Reflection plugin hooks", () => {
               summary: "Post-rewind summary",
             },
           ],
+          boundaries: [
+            {
+              id: "post-rewind-summary",
+              start_user_message_id: `${sessionId}-replacement-user`,
+              end_user_message_id: `${sessionId}-replacement-user`,
+              projection_version: 1,
+              source_eligible: true,
+              source_fingerprint: "fingerprint",
+            },
+          ],
+          targets: [],
         });
       }),
     );
@@ -1314,7 +1460,7 @@ describe("Reflection plugin hooks", () => {
     await hooks["experimental.chat.messages.transform"]?.({}, output as never);
 
     expect(targetPosts).toBe(2);
-    expect(summaryGets).toBe(1);
+    expect(summaryGets).toBe(4);
     expect(output.messages[1]?.parts[0]?.text).toContain("Post-rewind summary");
   });
 
@@ -1324,7 +1470,7 @@ describe("Reflection plugin hooks", () => {
     client.session.list.mockRejectedValue(new Error("list failed"));
     vi.stubGlobal(
       "fetch",
-      vi.fn(async () => ok()),
+      vi.fn(async (url: string | URL | Request) => emptyListing(url)),
     );
     const hooks = await Reflection(pluginInput(client));
 
@@ -1371,7 +1517,12 @@ describe("Reflection plugin hooks", () => {
           });
         }
         summaryGets += 1;
-        return ok({ session_id: sessionId, segments: [] });
+        return ok({
+          session_id: sessionId,
+          segments: [],
+          boundaries: [],
+          targets: [],
+        });
       }),
     );
     const hooks = await Reflection(pluginInput(client));
@@ -1388,7 +1539,7 @@ describe("Reflection plugin hooks", () => {
     await vi.advanceTimersByTimeAsync(5_000);
     await Promise.all([idle, projection]);
 
-    expect(summaryGets).toBe(0);
+    expect(summaryGets).toBe(2);
     expect(output.messages[1]?.parts[0]?.text).toContain(
       "Reflection summaries were unavailable",
     );
@@ -1403,7 +1554,12 @@ describe("Reflection plugin hooks", () => {
       vi.fn(async (_url: string | URL | Request, init?: RequestInit) =>
         init?.method === "POST"
           ? ok()
-          : ok({ session_id: sessionId, segments: [] }),
+          : ok({
+              session_id: sessionId,
+              segments: [],
+              boundaries: [],
+              targets: [],
+            }),
       ),
     );
     const hooks = await Reflection(pluginInput(client));
@@ -1477,7 +1633,12 @@ describe("Reflection plugin hooks", () => {
       vi.fn(async (_url: string | URL | Request, init?: RequestInit) =>
         init?.method === "POST"
           ? ok()
-          : ok({ session_id: sessionId, segments: [] }),
+          : ok({
+              session_id: sessionId,
+              segments: [],
+              boundaries: [],
+              targets: [],
+            }),
       ),
     );
     const hooks = await Reflection(pluginInput(client));
@@ -1511,7 +1672,12 @@ describe("Reflection plugin hooks", () => {
       vi.fn(async (_url: string | URL | Request, init?: RequestInit) =>
         init?.method === "POST"
           ? ok()
-          : ok({ session_id: sessionId, segments: [] }),
+          : ok({
+              session_id: sessionId,
+              segments: [],
+              boundaries: [],
+              targets: [],
+            }),
       ),
     );
     const hooks = await Reflection(pluginInput(client));
@@ -1540,7 +1706,12 @@ describe("Reflection plugin hooks", () => {
       vi.fn(async (_url: string | URL | Request, init?: RequestInit) =>
         init?.method === "POST"
           ? ok()
-          : ok({ session_id: sessionId, segments: [] }),
+          : ok({
+              session_id: sessionId,
+              segments: [],
+              boundaries: [],
+              targets: [],
+            }),
       ),
     );
     const firstHooks = await Reflection(pluginInput(firstClient));
@@ -1567,7 +1738,12 @@ describe("Reflection plugin hooks", () => {
       vi.fn(async (_url: string | URL | Request, init?: RequestInit) =>
         init?.method === "POST"
           ? ok()
-          : ok({ session_id: sessionId, segments: [] }),
+          : ok({
+              session_id: sessionId,
+              segments: [],
+              boundaries: [],
+              targets: [],
+            }),
       ),
     );
     const hooks = await Reflection(pluginInput(client));

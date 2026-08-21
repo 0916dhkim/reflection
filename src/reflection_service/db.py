@@ -30,9 +30,11 @@ from reflection_service.domain import (
 from reflection_service.models import (
     PROJECTION_SAFE_VERSION,
     JobResponse,
+    SegmentBoundary,
     SegmentCreate,
     SegmentResponse,
     SegmentSummary,
+    SegmentTargetBoundary,
 )
 
 _SEGMENT_ELIGIBILITY_SQL = """
@@ -1145,21 +1147,93 @@ class Database:
         return SegmentResponse.model_validate({**segment, "claims": claims})
 
     async def segment_summaries(self, session_id: str) -> list[SegmentSummary]:
+        summaries, _, _ = await self.session_segment_listing(session_id)
+        return summaries
+
+    async def session_segment_listing(
+        self, session_id: str
+    ) -> tuple[list[SegmentSummary], list[SegmentBoundary], list[SegmentTargetBoundary]]:
         async with self.pool.connection() as connection:
             cursor = await connection.execute(
                 f"""
-                SELECT s.id, s.start_user_message_id, s.end_user_message_id,
-                       s.projection_version, s.summary
-                FROM segments s
-                LEFT JOIN segment_targets t ON t.segment_id = s.id
-                WHERE s.session_id = %s
-                  AND {_SEGMENT_ELIGIBILITY_SQL}
-                ORDER BY s.created_at, s.id
+                WITH committed AS (
+                    SELECT 'committed' AS row_kind, s.id,
+                           s.start_user_message_id, s.end_user_message_id,
+                           s.projection_version,
+                           COALESCE(({_SEGMENT_ELIGIBILITY_SQL}), FALSE) AS source_eligible,
+                           s.source_fingerprint,
+                           CASE
+                               WHEN {_SEGMENT_ELIGIBILITY_SQL} THEN s.summary
+                               ELSE NULL
+                           END AS eligible_summary,
+                           NULL::text AS status,
+                           s.created_at AS ordered_at
+                    FROM segments s
+                    LEFT JOIN segment_targets t ON t.segment_id = s.id
+                    WHERE s.session_id = %s
+                ), desired AS (
+                    SELECT 'target' AS row_kind, t.segment_id AS id,
+                           t.payload->>'start_user_message_id' AS start_user_message_id,
+                           t.end_user_message_id, t.projection_version,
+                           FALSE AS source_eligible,
+                           t.source_fingerprint,
+                           NULL::text AS eligible_summary,
+                           j.status::text AS status,
+                           t.updated_at AS ordered_at
+                    FROM segment_targets t
+                    JOIN extraction_jobs j ON j.id = t.job_id
+                    WHERE t.payload->>'session_id' = %s
+                )
+                SELECT * FROM committed
+                UNION ALL
+                SELECT * FROM desired
+                ORDER BY ordered_at, id, row_kind
                 """,
-                (session_id,),
+                (session_id, session_id),
             )
             rows = await cursor.fetchall()
-        return [SegmentSummary.model_validate(row) for row in rows]
+        summaries = [
+            SegmentSummary.model_validate(
+                {
+                    "id": row["id"],
+                    "start_user_message_id": row["start_user_message_id"],
+                    "end_user_message_id": row["end_user_message_id"],
+                    "projection_version": row["projection_version"],
+                    "summary": row["eligible_summary"],
+                }
+            )
+            for row in rows
+            if row["row_kind"] == "committed" and row["source_eligible"]
+        ]
+        boundaries = [
+            SegmentBoundary.model_validate(
+                {
+                    "id": row["id"],
+                    "start_user_message_id": row["start_user_message_id"],
+                    "end_user_message_id": row["end_user_message_id"],
+                    "projection_version": row["projection_version"],
+                    "source_eligible": row["source_eligible"],
+                    "source_fingerprint": row["source_fingerprint"],
+                }
+            )
+            for row in rows
+            if row["row_kind"] == "committed"
+        ]
+        targets = [
+            SegmentTargetBoundary.model_validate(
+                {
+                    "id": row["id"],
+                    "start_user_message_id": row["start_user_message_id"],
+                    "end_user_message_id": row["end_user_message_id"],
+                    "projection_version": row["projection_version"],
+                    "status": row["status"],
+                    "source_fingerprint": row["source_fingerprint"],
+                }
+            )
+            for row in rows
+            if row["row_kind"] == "target"
+        ]
+        return summaries, boundaries, targets
 
     async def direct_claims(
         self, embedding: Sequence[float], limit: int = 10

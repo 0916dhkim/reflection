@@ -7,7 +7,7 @@ import pytest
 
 from reflection_service.app import create_app
 from reflection_service.config import Settings
-from reflection_service.models import JobResponse, JobStatus, SegmentSummary
+from reflection_service.models import JobResponse, JobStatus, SegmentBoundary, SegmentSummary
 
 
 def settings() -> Settings:
@@ -129,7 +129,15 @@ async def test_session_segments_returns_ordered_summary_metadata() -> None:
         projection_version=0,
         summary="What happened",
     )
-    app.state.database.segment_summaries = AsyncMock(return_value=[segment])
+    boundary = SegmentBoundary(
+        id=segment.id,
+        start_user_message_id="start",
+        end_user_message_id="end",
+        projection_version=0,
+        source_eligible=True,
+        source_fingerprint="abc123",
+    )
+    app.state.database.session_segment_listing = AsyncMock(return_value=([segment], [boundary], []))
     transport = httpx.ASGITransport(app=app)
     try:
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
@@ -154,4 +162,15 @@ async def test_session_segments_returns_ordered_summary_metadata() -> None:
                 "summary": "What happened",
             }
         ],
+        "boundaries": [
+            {
+                "id": str(segment.id),
+                "start_user_message_id": "start",
+                "end_user_message_id": "end",
+                "projection_version": 0,
+                "source_eligible": True,
+                "source_fingerprint": "abc123",
+            }
+        ],
+        "targets": [],
     }

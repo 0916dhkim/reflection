@@ -120,7 +120,7 @@ allowing an unbounded many-message payload.
 - `GET /v1/jobs/{id}` returns queue state, attempts, timestamps, and a bounded error string.
 - `POST /v1/jobs/{id}/retry` resets a terminal failed job's attempt budget and returns `202`.
 - `GET /v1/segments/{uuid}` returns metadata, summary, and resolved claims, but no source messages.
-- `GET /v1/sessions/{session_id}/segments` returns committed version `0` and version `1` segment IDs, boundaries, versions, and summaries in creation order for authenticated context projection clients.
+- `GET /v1/sessions/{session_id}/segments` returns eligible summaries, all committed boundaries with source fingerprints, and current desired targets as separate arrays for authenticated projection and backfill clients.
 - `POST /v1/search` accepts `{"query":"..."}`.
 
 An old failed mutable-tail snapshot cannot be explicitly retried after any newer job exists for the same
@@ -205,14 +205,15 @@ credentials and configured models. Other terminal failures receive one explicit 
 before the worker continues.
 Sessions updated within the last ten minutes are deferred and rechecked after other stable sessions.
 
-Backfill submissions use projection version `1` and the same hidden-text, attachment-metadata, successful-turn,
-and unanswered-turn barrier rules as the live plugin. After deploying the migration, stop the version `0`
-worker and run the upgraded backfill. Projection may be activated after a mixed-version smoke test and uses
-version `0` summaries until each segment is replaced by version `1`.
+Backfill submissions use projection version `1` and import the live plugin's segmenter directly. The worker
+hydrates original OpenCode message and part JSON, loads committed boundaries from Reflection, preserves a
+maximum-coverage non-overlapping committed partition, and applies the 20,000 model-visible-character policy
+only to uncovered ranges. Replaying an unchanged canonical segment does not rerun extraction.
 
 The worker reads service credentials from `~/.config/opencode/reflection.json`. Progress is atomically
-stored in `~/.local/state/reflection-backfill/state.json`, and a PID lock prevents concurrent workers. Run
-a source inventory without submitting anything using:
+stored in `~/.local/state/reflection-backfill/state.json`, and a PID lock prevents concurrent workers. An
+authoritative dry run reads the service manifest and reports eligible, stale, and new canonical ranges, so
+service credentials and network access are required:
 
 ```bash
 node scripts/backfill.mjs --dry-run

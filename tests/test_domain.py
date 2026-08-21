@@ -21,6 +21,7 @@ from reflection_service.domain import (
 from reflection_service.models import (
     ClaimDecision,
     ExtractedClaim,
+    ExtractionResult,
     Resolution,
     ResolutionResult,
     SegmentCreate,
@@ -208,6 +209,25 @@ def test_claim_predicate_must_use_natural_language() -> None:
         object_value="7200 credits",
     )
     assert claim.predicate == "has monthly credit grant"
+
+
+def test_extraction_normalizes_machine_style_predicates_without_dropping_claims() -> None:
+    result = ExtractionResult.model_validate(
+        {
+            "summary": "Useful summary",
+            "claims": [
+                {
+                    "subject": "Reflection",
+                    "predicate": "has_storageBackend",
+                    "confidence": 0.9,
+                    "object_entity": "PostgreSQL",
+                    "object_value": None,
+                }
+            ],
+        }
+    )
+
+    assert [claim.predicate for claim in result.claims] == ["has storage backend"]
 
 
 def test_literal_and_entity_equivalence_keys_are_distinct() -> None:
