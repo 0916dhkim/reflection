@@ -24,6 +24,7 @@ from reflection_service.domain import (
     normalize_name,
     projection_fingerprint,
     segment_id_for,
+    source_fingerprint,
     union_candidates,
 )
 from reflection_service.models import (
@@ -33,6 +34,16 @@ from reflection_service.models import (
     SegmentResponse,
     SegmentSummary,
 )
+
+_SEGMENT_ELIGIBILITY_SQL = """
+    s.projection_commit_fingerprint = reflection_projection_fingerprint(
+        s.id,
+        s.end_user_message_id,
+        s.summary,
+        s.projection_version
+    )
+    AND (t.segment_id IS NULL OR t.source_fingerprint = s.source_fingerprint)
+"""
 
 
 class JobNotRetryableError(RuntimeError):
@@ -44,6 +55,8 @@ class ClaimedJob:
     id: int
     segment_id: UUID
     lease_id: UUID
+    source_generation: int
+    source_fingerprint: str
     attempts: int
     request: SegmentCreate
 
@@ -92,36 +105,24 @@ class Database:
         async with self.pool.connection() as connection:
             await connection.execute("SELECT 1")
 
+    @staticmethod
+    async def _lock_segment(connection: AsyncConnection[Any], segment_id: UUID) -> None:
+        """Serialize job, target, then segment mutations for one deterministic segment."""
+        await connection.execute(
+            "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+            (str(segment_id),),
+        )
+
     async def enqueue(self, request: SegmentCreate) -> JobResponse:
         segment_id = segment_id_for(request.session_id, request.start_user_message_id)
+        fingerprint = source_fingerprint(request)
+        payload = Jsonb(request.model_dump(mode="json"))
         async with self.pool.connection() as connection, connection.transaction():
-            cursor = await connection.execute(
-                """
-                INSERT INTO extraction_jobs (
-                    segment_id, session_id, start_user_message_id, end_user_message_id,
-                    projection_version, payload
-                )
-                VALUES (%s, %s, %s, %s, %s, %s)
-                ON CONFLICT (session_id, start_user_message_id, end_user_message_id)
-                DO UPDATE SET session_id = EXCLUDED.session_id
-                RETURNING id, segment_id, projection_version, status, attempts, error,
-                          created_at, started_at, finished_at, next_attempt_at
-                """,
-                (
-                    segment_id,
-                    request.session_id,
-                    request.start_user_message_id,
-                    request.end_user_message_id,
-                    request.projection_version,
-                    Jsonb(request.model_dump(mode="json")),
-                ),
-            )
-            row = await cursor.fetchone()
-            if row is None:
-                raise RuntimeError("job insert did not return a row")
+            await self._lock_segment(connection, segment_id)
             jobs_cursor = await connection.execute(
                 """
-                SELECT id, status, projection_version
+                SELECT id, status, projection_version, source_generation, source_fingerprint,
+                       end_user_message_id
                 FROM extraction_jobs
                 WHERE segment_id = %s
                 FOR UPDATE
@@ -129,12 +130,21 @@ class Database:
                 (segment_id,),
             )
             jobs = await jobs_cursor.fetchall()
-            state = next((item for item in jobs if item["id"] == row["id"]), None)
-            if state is None:
-                raise RuntimeError("job state disappeared during enqueue")
+            target_cursor = await connection.execute(
+                """
+                SELECT job_id, projection_version, payload, source_generation,
+                       source_fingerprint
+                FROM segment_targets
+                WHERE segment_id = %s
+                FOR UPDATE
+                """,
+                (segment_id,),
+            )
+            target = await target_cursor.fetchone()
             segment_cursor = await connection.execute(
                 """
-                SELECT s.end_user_message_id, s.projection_version,
+                SELECT s.end_user_message_id, s.projection_version, s.source_generation,
+                       s.source_fingerprint,
                        s.projection_commit_fingerprint = reflection_projection_fingerprint(
                            s.id,
                            s.end_user_message_id,
@@ -143,82 +153,235 @@ class Database:
                        ) AS projection_safe
                 FROM segments s
                 WHERE s.id = %s
+                FOR UPDATE
                 """,
                 (segment_id,),
             )
             current_segment = await segment_cursor.fetchone()
+            boundary_job = next(
+                (
+                    item
+                    for item in jobs
+                    if item["end_user_message_id"] == request.end_user_message_id
+                ),
+                None,
+            )
+
+            lower_version = (
+                (
+                    current_segment is not None
+                    and request.projection_version < current_segment["projection_version"]
+                )
+                or (
+                    target is not None and request.projection_version < target["projection_version"]
+                )
+                or (
+                    boundary_job is not None
+                    and request.projection_version < boundary_job["projection_version"]
+                )
+            )
+            if lower_version:
+                if boundary_job is None:
+                    ignored_cursor = await connection.execute(
+                        """
+                        INSERT INTO extraction_jobs (
+                            segment_id, session_id, start_user_message_id,
+                            end_user_message_id, projection_version, payload, status,
+                            source_fingerprint, finished_at
+                        )
+                        VALUES (%s, %s, %s, %s, %s, NULL, 'succeeded', %s, now())
+                        RETURNING id
+                        """,
+                        (
+                            segment_id,
+                            request.session_id,
+                            request.start_user_message_id,
+                            request.end_user_message_id,
+                            request.projection_version,
+                            fingerprint,
+                        ),
+                    )
+                    ignored = await ignored_cursor.fetchone()
+                    if ignored is None:
+                        raise RuntimeError("ignored job insert did not return a row")
+                    job_id = ignored["id"]
+                else:
+                    job_id = boundary_job["id"]
+                row = await self._job_row(connection, job_id)
+                if row is None:
+                    raise RuntimeError("ignored job disappeared during enqueue")
+                return self._job_response(row)
+
+            if target is not None and (
+                target["source_fingerprint"] == fingerprint
+                and target["projection_version"] == request.projection_version
+            ):
+                if not any(
+                    item["status"] == "running" and item["id"] != target["job_id"] for item in jobs
+                ):
+                    await connection.execute(
+                        """
+                        UPDATE extraction_jobs
+                        SET projection_version = %s, payload = %s, source_generation = %s,
+                            source_fingerprint = %s, status = 'pending', attempts = 0,
+                            lease_id = NULL, error = NULL, started_at = NULL,
+                            finished_at = NULL, next_attempt_at = now()
+                        WHERE id = %s AND status <> 'running'
+                        """,
+                        (
+                            target["projection_version"],
+                            Jsonb(target["payload"]),
+                            target["source_generation"],
+                            target["source_fingerprint"],
+                            target["job_id"],
+                        ),
+                    )
+                row = await self._job_row(connection, target["job_id"])
+                if row is None:
+                    raise RuntimeError("target job disappeared during enqueue")
+                return self._job_response(row)
+
+            if (
+                current_segment is not None
+                and target is None
+                and current_segment["source_fingerprint"] == fingerprint
+                and current_segment["projection_version"] == request.projection_version
+                and (
+                    request.projection_version < PROJECTION_SAFE_VERSION
+                    or current_segment["projection_safe"]
+                )
+            ):
+                if boundary_job is None:
+                    settled_cursor = await connection.execute(
+                        """
+                        INSERT INTO extraction_jobs (
+                            segment_id, session_id, start_user_message_id,
+                            end_user_message_id, projection_version, payload, status,
+                            source_generation, source_fingerprint, finished_at
+                        )
+                        VALUES (%s, %s, %s, %s, %s, NULL, 'succeeded', %s, %s, now())
+                        RETURNING id
+                        """,
+                        (
+                            segment_id,
+                            request.session_id,
+                            request.start_user_message_id,
+                            request.end_user_message_id,
+                            request.projection_version,
+                            current_segment["source_generation"],
+                            fingerprint,
+                        ),
+                    )
+                    settled = await settled_cursor.fetchone()
+                    if settled is None:
+                        raise RuntimeError("settled job insert did not return a row")
+                    job_id = settled["id"]
+                else:
+                    job_id = boundary_job["id"]
+                    await connection.execute(
+                        """
+                        UPDATE extraction_jobs
+                        SET status = 'succeeded', lease_id = NULL, payload = NULL,
+                            projection_version = %s, source_generation = %s,
+                            source_fingerprint = %s, error = NULL, started_at = NULL,
+                            finished_at = COALESCE(finished_at, now())
+                        WHERE id = %s AND status <> 'running'
+                        """,
+                        (
+                            request.projection_version,
+                            current_segment["source_generation"],
+                            fingerprint,
+                            job_id,
+                        ),
+                    )
+                row = await self._job_row(connection, job_id)
+                if row is None:
+                    raise RuntimeError("settled job disappeared during enqueue")
+                return self._job_response(row)
+
+            generation = (
+                max(
+                    [
+                        current_segment["source_generation"] if current_segment else 0,
+                        target["source_generation"] if target else 0,
+                        *(item["source_generation"] for item in jobs),
+                    ]
+                )
+                + 1
+            )
+            job_cursor = await connection.execute(
+                """
+                INSERT INTO extraction_jobs (
+                    segment_id, session_id, start_user_message_id, end_user_message_id,
+                    projection_version, payload, source_generation, source_fingerprint
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (session_id, start_user_message_id, end_user_message_id)
+                DO UPDATE SET
+                    projection_version = EXCLUDED.projection_version,
+                    payload = EXCLUDED.payload,
+                    source_generation = EXCLUDED.source_generation,
+                    source_fingerprint = EXCLUDED.source_fingerprint,
+                    status = 'pending', attempts = 0, lease_id = NULL, error = NULL,
+                    started_at = NULL, finished_at = NULL, next_attempt_at = now()
+                WHERE extraction_jobs.status <> 'running'
+                RETURNING id
+                """,
+                (
+                    segment_id,
+                    request.session_id,
+                    request.start_user_message_id,
+                    request.end_user_message_id,
+                    request.projection_version,
+                    payload,
+                    generation,
+                    fingerprint,
+                ),
+            )
+            job = await job_cursor.fetchone()
+            if job is not None:
+                job_id = job["id"]
+            elif boundary_job is not None:
+                job_id = boundary_job["id"]
+            else:
+                raise RuntimeError("running boundary job disappeared during enqueue")
             await connection.execute(
                 """
                 INSERT INTO segment_targets (
-                    segment_id, job_id, end_user_message_id, projection_version, payload
+                    segment_id, job_id, end_user_message_id, projection_version, payload,
+                    source_generation, source_fingerprint
                 )
-                VALUES (%s, %s, %s, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (segment_id) DO UPDATE
                 SET job_id = EXCLUDED.job_id,
                     end_user_message_id = EXCLUDED.end_user_message_id,
                     projection_version = EXCLUDED.projection_version,
                     payload = EXCLUDED.payload,
+                    source_generation = EXCLUDED.source_generation,
+                    source_fingerprint = EXCLUDED.source_fingerprint,
                     updated_at = now()
                 """,
                 (
                     segment_id,
-                    row["id"],
+                    job_id,
                     request.end_user_message_id,
                     request.projection_version,
-                    Jsonb(request.model_dump(mode="json")),
+                    payload,
+                    generation,
+                    fingerprint,
                 ),
             )
             superseded_ids = [
-                item["id"]
-                for item in jobs
-                if item["id"] > row["id"] and item["status"] in {"pending", "failed"}
+                item["id"] for item in jobs if item["id"] != job_id and item["status"] == "pending"
             ]
             if superseded_ids:
                 await connection.execute(
                     "DELETE FROM extraction_jobs WHERE id = ANY(%s)",
                     (superseded_ids,),
                 )
-            other_running = any(
-                item["id"] != row["id"] and item["status"] == "running" for item in jobs
-            )
-            current_matches = (
-                current_segment is not None
-                and current_segment["end_user_message_id"] == request.end_user_message_id
-                and current_segment["projection_version"] == request.projection_version
-                and (
-                    request.projection_version < PROJECTION_SAFE_VERSION
-                    or current_segment["projection_safe"]
-                )
-            )
-            lower_version = request.projection_version < state["projection_version"] or (
-                current_segment is not None
-                and request.projection_version < current_segment["projection_version"]
-            )
-            can_queue = state["status"] != "running" and not other_running
-            settled = current_matches and state["status"] != "running" and not other_running
-            if lower_version or settled:
-                await connection.execute(
-                    "DELETE FROM segment_targets WHERE segment_id = %s",
-                    (segment_id,),
-                )
-            elif can_queue:
-                await connection.execute(
-                    """
-                    UPDATE extraction_jobs
-                    SET projection_version = %s, payload = %s, status = 'pending',
-                        attempts = 0, lease_id = NULL, error = NULL, started_at = NULL,
-                        finished_at = NULL, next_attempt_at = now()
-                    WHERE id = %s
-                    """,
-                    (
-                        request.projection_version,
-                        Jsonb(request.model_dump(mode="json")),
-                        row["id"],
-                    ),
-                )
-                row = await self._job_row(connection, row["id"])
-                if row is None:
-                    raise RuntimeError("requeued job disappeared during enqueue")
+            row = await self._job_row(connection, job_id)
+            if row is None:
+                raise RuntimeError("target job disappeared during enqueue")
         return self._job_response(row)
 
     async def get_job(self, job_id: int) -> JobResponse | None:
@@ -228,43 +391,65 @@ class Database:
 
     async def retry_failed_job(self, job_id: int) -> JobResponse | None:
         async with self.pool.connection() as connection, connection.transaction():
-            target_cursor = await connection.execute(
+            segment_cursor = await connection.execute(
+                "SELECT segment_id FROM extraction_jobs WHERE id = %s",
+                (job_id,),
+            )
+            segment = await segment_cursor.fetchone()
+            if segment is None:
+                return None
+            await self._lock_segment(connection, segment["segment_id"])
+            job_cursor = await connection.execute(
                 """
-                SELECT id, segment_id, status, lease_id
+                SELECT id, segment_id, status, lease_id, source_generation, source_fingerprint
                 FROM extraction_jobs
                 WHERE id = %s
                 FOR UPDATE
                 """,
                 (job_id,),
             )
-            target = await target_cursor.fetchone()
-            if target is None:
+            job = await job_cursor.fetchone()
+            if job is None:
                 return None
-            if target["status"] != "failed" or target["lease_id"] is not None:
-                raise JobNotRetryableError("only terminal failed jobs can be retried")
-            newer_cursor = await connection.execute(
+            target_cursor = await connection.execute(
                 """
-                SELECT 1
-                FROM extraction_jobs
-                WHERE segment_id = %s AND id > %s
-                LIMIT 1
+                SELECT job_id, projection_version, payload,
+                       source_generation, source_fingerprint
+                FROM segment_targets
+                WHERE segment_id = %s
+                FOR UPDATE
                 """,
-                (target["segment_id"], target["id"]),
+                (job["segment_id"],),
             )
-            if await newer_cursor.fetchone() is not None:
+            target = await target_cursor.fetchone()
+            if job["status"] != "failed" or job["lease_id"] is not None:
+                raise JobNotRetryableError("only terminal failed jobs can be retried")
+            if target is None or (
+                target["job_id"] != job["id"]
+                or target["source_generation"] != job["source_generation"]
+                or target["source_fingerprint"] != job["source_fingerprint"]
+            ):
                 raise JobNotRetryableError(
                     "job cannot be retried because a newer snapshot exists for the segment"
                 )
             cursor = await connection.execute(
                 """
                 UPDATE extraction_jobs
-                SET status = 'pending', attempts = 0, error = NULL, lease_id = NULL,
-                    started_at = NULL, finished_at = NULL, next_attempt_at = now()
+                SET projection_version = %s, payload = %s, source_generation = %s,
+                    source_fingerprint = %s, status = 'pending', attempts = 0,
+                    error = NULL, lease_id = NULL, started_at = NULL,
+                    finished_at = NULL, next_attempt_at = now()
                 WHERE id = %s AND status = 'failed' AND lease_id IS NULL
                 RETURNING id, segment_id, projection_version, status, attempts, error,
                           created_at, started_at, finished_at, next_attempt_at
                 """,
-                (job_id,),
+                (
+                    target["projection_version"],
+                    Jsonb(target["payload"]),
+                    target["source_generation"],
+                    target["source_fingerprint"],
+                    job_id,
+                ),
             )
             row = await cursor.fetchone()
             if row is None:
@@ -272,26 +457,110 @@ class Database:
             return self._job_response(row)
 
     async def recover_running_jobs(self, connection: AsyncConnection[Any]) -> int:
-        cursor = await connection.execute(
-            """
-            UPDATE extraction_jobs
-            SET status = 'pending', lease_id = NULL, started_at = NULL,
-                next_attempt_at = now(), error = 'worker stopped before completing the job'
-            WHERE status = 'running'
-            """
-        )
-        return cursor.rowcount
+        async with connection.transaction():
+            segments_cursor = await connection.execute(
+                """
+                SELECT segment_id
+                FROM extraction_jobs
+                WHERE status = 'running'
+                ORDER BY segment_id, id
+                """
+            )
+            segment_ids = list(
+                dict.fromkeys(row["segment_id"] for row in await segments_cursor.fetchall())
+            )
+            if not segment_ids:
+                return 0
+            for segment_id in segment_ids:
+                await self._lock_segment(connection, segment_id)
+
+            cursor = await connection.execute(
+                """
+                WITH classified AS (
+                    SELECT jobs.id,
+                           targets.job_id = jobs.id AS is_target,
+                           targets.projection_version AS target_projection_version,
+                           targets.payload AS target_payload,
+                           targets.source_generation AS target_generation,
+                           targets.source_fingerprint AS target_fingerprint
+                    FROM extraction_jobs AS jobs
+                    LEFT JOIN segment_targets AS targets ON targets.segment_id = jobs.segment_id
+                    WHERE jobs.status = 'running'
+                      AND jobs.segment_id = ANY(%s)
+                    FOR UPDATE OF jobs
+                )
+                UPDATE extraction_jobs AS jobs
+                SET projection_version = CASE
+                        WHEN classified.is_target
+                        THEN classified.target_projection_version
+                        ELSE jobs.projection_version
+                    END,
+                    payload = CASE
+                        WHEN classified.is_target THEN classified.target_payload
+                        ELSE jobs.payload
+                    END,
+                    source_generation = CASE
+                        WHEN classified.is_target THEN classified.target_generation
+                        ELSE jobs.source_generation
+                    END,
+                    source_fingerprint = CASE
+                        WHEN classified.is_target THEN classified.target_fingerprint
+                        ELSE jobs.source_fingerprint
+                    END,
+                    status = CASE WHEN classified.is_target THEN 'pending' ELSE 'failed' END,
+                    attempts = CASE
+                        WHEN classified.is_target
+                         AND (
+                             classified.target_generation <> jobs.source_generation
+                             OR classified.target_fingerprint
+                                IS DISTINCT FROM jobs.source_fingerprint
+                             OR classified.target_projection_version <> jobs.projection_version
+                         )
+                        THEN 0
+                        ELSE jobs.attempts
+                    END,
+                    lease_id = NULL,
+                    started_at = NULL,
+                    finished_at = CASE WHEN classified.is_target THEN NULL ELSE now() END,
+                    next_attempt_at = now(),
+                    error = CASE
+                        WHEN classified.is_target
+                        THEN 'worker stopped before completing the job'
+                        ELSE 'superseded while worker was stopped'
+                    END
+                FROM classified
+                WHERE jobs.id = classified.id
+                """,
+                (segment_ids,),
+            )
+            return cursor.rowcount
 
     async def claim_oldest_job(self, connection: AsyncConnection[Any]) -> ClaimedJob | None:
         async with connection.transaction():
             cursor = await connection.execute(
                 """
-                SELECT id, segment_id, payload, next_attempt_at <= now() AS ready
-                FROM extraction_jobs
-                WHERE status = 'pending'
-                ORDER BY id
+                SELECT jobs.id, jobs.segment_id, jobs.session_id,
+                       jobs.start_user_message_id, jobs.end_user_message_id,
+                       jobs.projection_version, jobs.payload, jobs.source_generation,
+                       jobs.source_fingerprint, jobs.next_attempt_at <= now() AS ready
+                FROM extraction_jobs AS jobs
+                LEFT JOIN segment_targets AS targets
+                  ON targets.segment_id = jobs.segment_id
+                 AND targets.job_id = jobs.id
+                 AND targets.source_generation = jobs.source_generation
+                 AND targets.source_fingerprint = jobs.source_fingerprint
+                 AND targets.projection_version = jobs.projection_version
+                WHERE jobs.status = 'pending'
+                  AND (targets.segment_id IS NOT NULL OR jobs.source_fingerprint IS NULL)
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM extraction_jobs AS running
+                      WHERE running.segment_id = jobs.segment_id
+                        AND running.status = 'running'
+                  )
+                ORDER BY targets.updated_at, jobs.id
                 LIMIT 1
-                FOR UPDATE
+                FOR UPDATE OF jobs
                 """
             )
             pending = await cursor.fetchone()
@@ -324,6 +593,26 @@ class Database:
                     (f"invalid persisted payload: {exc}"[:4000], pending["id"]),
                 )
                 return None
+            if (
+                request.session_id != pending["session_id"]
+                or request.start_user_message_id != pending["start_user_message_id"]
+                or request.end_user_message_id != pending["end_user_message_id"]
+                or request.projection_version != pending["projection_version"]
+                or segment_id_for(request.session_id, request.start_user_message_id)
+                != pending["segment_id"]
+                or source_fingerprint(request) != pending["source_fingerprint"]
+            ):
+                await connection.execute(
+                    """
+                    UPDATE extraction_jobs
+                    SET status = 'failed', attempts = attempts + 1, lease_id = NULL,
+                        error = 'invalid persisted payload: source identity mismatch',
+                        finished_at = now()
+                    WHERE id = %s AND status = 'pending'
+                    """,
+                    (pending["id"],),
+                )
+                return None
             lease_id = uuid4()
             claimed_cursor = await connection.execute(
                 """
@@ -342,6 +631,8 @@ class Database:
             id=pending["id"],
             segment_id=pending["segment_id"],
             lease_id=lease_id,
+            source_generation=pending["source_generation"],
+            source_fingerprint=pending["source_fingerprint"],
             attempts=claimed["attempts"],
             request=request,
         )
@@ -362,6 +653,44 @@ class Database:
             next_attempt_at = datetime.now(UTC) + timedelta(seconds=retry_after_seconds)
             finished_at = None
         async with self.pool.connection() as connection, connection.transaction():
+            await self._lock_segment(connection, job.segment_id)
+            job_cursor = await connection.execute(
+                """
+                SELECT status, lease_id, source_generation, source_fingerprint
+                FROM extraction_jobs
+                WHERE id = %s
+                FOR UPDATE
+                """,
+                (job.id,),
+            )
+            current = await job_cursor.fetchone()
+            if (
+                current is None
+                or current["status"] != "running"
+                or current["lease_id"] != job.lease_id
+            ):
+                return False
+            target_cursor = await connection.execute(
+                """
+                SELECT job_id, projection_version, payload, source_generation,
+                       source_fingerprint
+                FROM segment_targets
+                WHERE segment_id = %s
+                FOR UPDATE
+                """,
+                (job.segment_id,),
+            )
+            target = await target_cursor.fetchone()
+            target_matches = target is not None and (
+                target["job_id"] == job.id
+                and target["projection_version"] == job.request.projection_version
+                and target["source_generation"] == job.source_generation
+                and target["source_fingerprint"] == job.source_fingerprint
+            )
+            if not target_matches:
+                await self._requeue_latest_target(connection, job, target)
+                return True
+
             cursor = await connection.execute(
                 """
                 UPDATE extraction_jobs
@@ -385,8 +714,9 @@ class Database:
                     USING segments s
                     WHERE t.segment_id = %s
                       AND s.id = t.segment_id
+                      AND s.source_fingerprint = t.source_fingerprint
                       AND s.end_user_message_id = t.end_user_message_id
-                      AND s.projection_version = t.projection_version
+                      AND s.projection_version >= t.projection_version
                       AND s.projection_commit_fingerprint = reflection_projection_fingerprint(
                           s.id,
                           s.end_user_message_id,
@@ -398,14 +728,89 @@ class Database:
                 )
         return cursor.rowcount == 1
 
+    async def _requeue_latest_target(
+        self,
+        connection: AsyncConnection[Any],
+        job: ClaimedJob,
+        target: dict[str, Any] | None,
+    ) -> None:
+        if target is None:
+            cursor = await connection.execute(
+                """
+                UPDATE extraction_jobs
+                SET status = 'failed', lease_id = NULL, started_at = NULL,
+                    finished_at = now(), error = 'snapshot was superseded'
+                WHERE id = %s AND status = 'running' AND lease_id = %s
+                """,
+                (job.id, job.lease_id),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError("job lease changed while superseding extraction")
+            return
+
+        if target["job_id"] == job.id:
+            cursor = await connection.execute(
+                """
+                UPDATE extraction_jobs
+                SET projection_version = %s, payload = %s, source_generation = %s,
+                    source_fingerprint = %s, status = 'pending', attempts = 0,
+                    lease_id = NULL, error = NULL, started_at = NULL,
+                    finished_at = NULL, next_attempt_at = now()
+                WHERE id = %s AND status = 'running' AND lease_id = %s
+                """,
+                (
+                    target["projection_version"],
+                    Jsonb(target["payload"]),
+                    target["source_generation"],
+                    target["source_fingerprint"],
+                    job.id,
+                    job.lease_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError("job lease changed while requeueing latest target")
+            return
+
+        cursor = await connection.execute(
+            """
+            UPDATE extraction_jobs
+            SET status = 'succeeded', lease_id = NULL, payload = NULL,
+                error = NULL, started_at = NULL, finished_at = now()
+            WHERE id = %s AND status = 'running' AND lease_id = %s
+            """,
+            (job.id, job.lease_id),
+        )
+        if cursor.rowcount != 1:
+            raise RuntimeError("job lease changed while superseding extraction")
+        await connection.execute(
+            """
+            UPDATE extraction_jobs
+            SET projection_version = %s, payload = %s, source_generation = %s,
+                source_fingerprint = %s, status = 'pending', attempts = 0,
+                lease_id = NULL, error = NULL, started_at = NULL,
+                finished_at = NULL, next_attempt_at = now()
+            WHERE id = %s AND status <> 'running'
+            """,
+            (
+                target["projection_version"],
+                Jsonb(target["payload"]),
+                target["source_generation"],
+                target["source_fingerprint"],
+                target["job_id"],
+            ),
+        )
+
     async def prior_summaries(self, session_id: str, current_segment_id: UUID) -> list[str]:
         async with self.pool.connection() as connection:
             cursor = await connection.execute(
-                """
-                SELECT summary
-                FROM segments
-                WHERE session_id = %s AND id <> %s
-                ORDER BY created_at, id
+                f"""
+                SELECT s.summary
+                FROM segments AS s
+                LEFT JOIN segment_targets AS t ON t.segment_id = s.id
+                WHERE s.session_id = %s
+                  AND s.id <> %s
+                  AND {_SEGMENT_ELIGIBILITY_SQL}
+                ORDER BY s.created_at, s.id
                 """,
                 (session_id, current_segment_id),
             )
@@ -480,7 +885,54 @@ class Database:
         return union_candidates(convert(trigram_rows), convert(vector_rows))
 
     async def commit_extraction(self, job: ClaimedJob, prepared: PreparedSegment) -> bool:
+        if (
+            prepared.id != job.segment_id
+            or prepared.session_id != job.request.session_id
+            or prepared.start_user_message_id != job.request.start_user_message_id
+            or prepared.end_user_message_id != job.request.end_user_message_id
+            or prepared.projection_version != job.request.projection_version
+        ):
+            raise RuntimeError("prepared extraction does not match its claimed source")
         async with self.pool.connection() as connection, connection.transaction():
+            await self._lock_segment(connection, job.segment_id)
+            job_cursor = await connection.execute(
+                """
+                SELECT status, lease_id, source_generation, source_fingerprint
+                FROM extraction_jobs
+                WHERE id = %s
+                FOR UPDATE
+                """,
+                (job.id,),
+            )
+            current_job = await job_cursor.fetchone()
+            if (
+                current_job is None
+                or current_job["status"] != "running"
+                or current_job["lease_id"] != job.lease_id
+            ):
+                raise RuntimeError("job lease changed before extraction committed")
+            target_cursor = await connection.execute(
+                """
+                SELECT job_id, projection_version, payload, source_generation,
+                       source_fingerprint
+                FROM segment_targets
+                WHERE segment_id = %s
+                FOR UPDATE
+                """,
+                (job.segment_id,),
+            )
+            target = await target_cursor.fetchone()
+            target_matches = target is not None and (
+                target["job_id"] == job.id
+                and target["projection_version"] == prepared.projection_version
+                and target["source_generation"] == job.source_generation
+                and target["source_fingerprint"] == job.source_fingerprint
+                and current_job["source_generation"] == job.source_generation
+                and current_job["source_fingerprint"] == job.source_fingerprint
+            )
+            if not target_matches:
+                await self._requeue_latest_target(connection, job, target)
+                return False
             version_cursor = await connection.execute(
                 "SELECT projection_version FROM segments WHERE id = %s FOR UPDATE",
                 (prepared.id,),
@@ -490,7 +942,24 @@ class Database:
                 existing is not None
                 and existing["projection_version"] > prepared.projection_version
             ):
-                await self._finish_or_requeue_target(connection, job, prepared)
+                cursor = await connection.execute(
+                    """
+                    UPDATE extraction_jobs
+                    SET status = 'succeeded', lease_id = NULL, payload = NULL,
+                        error = NULL, finished_at = now()
+                    WHERE id = %s AND status = 'running' AND lease_id = %s
+                    """,
+                    (job.id, job.lease_id),
+                )
+                if cursor.rowcount != 1:
+                    raise RuntimeError("job lease changed before extraction committed")
+                await connection.execute(
+                    """
+                    DELETE FROM segment_targets
+                    WHERE segment_id = %s AND job_id = %s AND source_generation = %s
+                    """,
+                    (job.segment_id, job.id, job.source_generation),
+                )
                 return True
             old_entity_cursor = await connection.execute(
                 """
@@ -552,14 +1021,17 @@ class Database:
                 """
                 INSERT INTO segments (
                     id, session_id, start_user_message_id, end_user_message_id, summary,
-                    projection_version, projection_commit_fingerprint
+                    projection_version, projection_commit_fingerprint,
+                    source_generation, source_fingerprint
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (id) DO UPDATE
                 SET end_user_message_id = EXCLUDED.end_user_message_id,
                     summary = EXCLUDED.summary,
                     projection_version = EXCLUDED.projection_version,
                     projection_commit_fingerprint = EXCLUDED.projection_commit_fingerprint,
+                    source_generation = EXCLUDED.source_generation,
+                    source_fingerprint = EXCLUDED.source_fingerprint,
                     updated_at = now()
                 """,
                 (
@@ -575,6 +1047,8 @@ class Database:
                         prepared.summary,
                         prepared.projection_version,
                     ),
+                    job.source_generation,
+                    job.source_fingerprint,
                 ),
             )
             await connection.execute("DELETE FROM claims WHERE segment_id = %s", (prepared.id,))
@@ -619,86 +1093,29 @@ class Database:
                     """,
                     (old_entity_ids,),
                 )
-            await self._finish_or_requeue_target(connection, job, prepared)
+            cursor = await connection.execute(
+                """
+                UPDATE extraction_jobs
+                SET status = 'succeeded', lease_id = NULL, payload = NULL,
+                    error = NULL, finished_at = now()
+                WHERE id = %s AND status = 'running' AND lease_id = %s
+                  AND source_generation = %s AND source_fingerprint = %s
+                """,
+                (job.id, job.lease_id, job.source_generation, job.source_fingerprint),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError("job lease changed before extraction committed")
+            deleted = await connection.execute(
+                """
+                DELETE FROM segment_targets
+                WHERE segment_id = %s AND job_id = %s AND source_generation = %s
+                  AND source_fingerprint = %s
+                """,
+                (job.segment_id, job.id, job.source_generation, job.source_fingerprint),
+            )
+            if deleted.rowcount != 1:
+                raise RuntimeError("latest target changed before extraction committed")
         return True
-
-    async def _finish_or_requeue_target(
-        self,
-        connection: AsyncConnection[Any],
-        job: ClaimedJob,
-        prepared: PreparedSegment,
-    ) -> None:
-        target_cursor = await connection.execute(
-            """
-            SELECT job_id, end_user_message_id, projection_version, payload
-            FROM segment_targets
-            WHERE segment_id = %s
-            FOR UPDATE
-            """,
-            (prepared.id,),
-        )
-        target = await target_cursor.fetchone()
-        target_matches = target is not None and (
-            target["end_user_message_id"] == prepared.end_user_message_id
-            and target["projection_version"] == prepared.projection_version
-        )
-        if target is None or target_matches:
-            cursor = await connection.execute(
-                """
-                UPDATE extraction_jobs
-                SET status = 'succeeded', lease_id = NULL, payload = NULL,
-                    error = NULL, finished_at = now()
-                WHERE id = %s AND status = 'running' AND lease_id = %s
-                """,
-                (job.id, job.lease_id),
-            )
-            if cursor.rowcount != 1:
-                raise RuntimeError("job lease changed before extraction committed")
-            if target_matches:
-                await connection.execute(
-                    "DELETE FROM segment_targets WHERE segment_id = %s",
-                    (prepared.id,),
-                )
-            return
-
-        if target["job_id"] != job.id:
-            cursor = await connection.execute(
-                """
-                UPDATE extraction_jobs
-                SET status = 'succeeded', lease_id = NULL, payload = NULL,
-                    error = NULL, finished_at = now()
-                WHERE id = %s AND status = 'running' AND lease_id = %s
-                """,
-                (job.id, job.lease_id),
-            )
-            if cursor.rowcount != 1:
-                raise RuntimeError("job lease changed before extraction committed")
-
-        cursor = await connection.execute(
-            """
-            UPDATE extraction_jobs
-            SET projection_version = %s, payload = %s, status = 'pending',
-                attempts = 0, lease_id = NULL, error = NULL, started_at = NULL,
-                finished_at = NULL, next_attempt_at = now()
-            WHERE id = %s AND status <> 'running'
-            """
-            if target["job_id"] != job.id
-            else """
-            UPDATE extraction_jobs
-            SET projection_version = %s, payload = %s, status = 'pending',
-                attempts = 0, lease_id = NULL, error = NULL, started_at = NULL,
-                finished_at = NULL, next_attempt_at = now()
-            WHERE id = %s AND status = 'running' AND lease_id = %s
-            """,
-            (
-                target["projection_version"],
-                Jsonb(target["payload"]),
-                target["job_id"],
-                *(() if target["job_id"] != job.id else (job.lease_id,)),
-            ),
-        )
-        if cursor.rowcount != 1:
-            raise RuntimeError("target job could not be requeued")
 
     async def get_segment(self, segment_id: UUID) -> SegmentResponse | None:
         async with self.pool.connection() as connection:
@@ -730,17 +1147,13 @@ class Database:
     async def segment_summaries(self, session_id: str) -> list[SegmentSummary]:
         async with self.pool.connection() as connection:
             cursor = await connection.execute(
-                """
+                f"""
                 SELECT s.id, s.start_user_message_id, s.end_user_message_id,
                        s.projection_version, s.summary
                 FROM segments s
+                LEFT JOIN segment_targets t ON t.segment_id = s.id
                 WHERE s.session_id = %s
-                  AND s.projection_commit_fingerprint = reflection_projection_fingerprint(
-                      s.id,
-                      s.end_user_message_id,
-                      s.summary,
-                      s.projection_version
-                  )
+                  AND {_SEGMENT_ELIGIBILITY_SQL}
                 ORDER BY s.created_at, s.id
                 """,
                 (session_id,),

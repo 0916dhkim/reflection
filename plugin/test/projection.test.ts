@@ -4,10 +4,14 @@ import {
   activeModel,
   estimateTokens,
   projectMessages,
-  ProjectionCoverageError,
   type StoredSegmentSummary,
 } from "../src/projection.js";
-import { segmentMessages, type OpenCodeMessage } from "../src/segments.js";
+import {
+  PROJECTION_LOSS_WARNING,
+  PROJECTION_LOSS_WARNING_METADATA,
+  segmentMessages,
+  type OpenCodeMessage,
+} from "../src/segments.js";
 
 const SESSION_ID = "session";
 const PROVIDER_ID = "provider";
@@ -117,6 +121,46 @@ describe("activeModel", () => {
       modelId: MODEL_ID,
     });
   });
+
+  it("requires model metadata on the latest user message", () => {
+    const messages = longSession(1);
+    messages.push({
+      info: { id: "control", sessionID: SESSION_ID, role: "user" },
+      parts: [
+        {
+          type: "text",
+          text: PROJECTION_LOSS_WARNING,
+          synthetic: false,
+          ignored: true,
+          metadata: { reflection: { control: "projection-loss-warning" } },
+        },
+      ],
+    });
+
+    expect(activeModel(messages)).toBeNull();
+  });
+
+  it("ignores the exact persisted projection warning for active-model selection", () => {
+    const messages = longSession(1);
+    messages.push({
+      info: { id: "warning", sessionID: SESSION_ID, role: "user" },
+      parts: [
+        {
+          type: "text",
+          text: PROJECTION_LOSS_WARNING,
+          synthetic: false,
+          ignored: false,
+          metadata: PROJECTION_LOSS_WARNING_METADATA,
+        },
+      ],
+    });
+
+    expect(activeModel(messages)).toEqual({
+      sessionId: SESSION_ID,
+      providerId: PROVIDER_ID,
+      modelId: MODEL_ID,
+    });
+  });
 });
 
 describe("projectMessages", () => {
@@ -142,7 +186,7 @@ describe("projectMessages", () => {
       .find((message) => message.info.role === "assistant");
     if (latestAssistant) {
       latestAssistant.info.tokens = {
-        input: 80_000,
+        input: 90_000,
         output: 1_000,
         reasoning: 0,
         cache: { read: 0, write: 0 },
@@ -158,6 +202,7 @@ describe("projectMessages", () => {
 
     expect(estimateTokens(messages)).toBeLessThan(CONTEXT_LIMIT * 0.25);
     expect(result.reset).toBe(true);
+    expect(result.state.checkpoint?.lossy).toBeUndefined();
   });
 
   it("resets a 75% context to a segment-aligned tail near 25%", async () => {
@@ -221,6 +266,8 @@ describe("projectMessages", () => {
     const result = await projectMessages({
       messages: continued,
       contextLimit: CONTEXT_LIMIT,
+      inputLimit: 100_000,
+      outputLimit: 20_000,
       previous: first.state,
       loadSummaries,
     });
@@ -228,6 +275,33 @@ describe("projectMessages", () => {
     expect(result.reset).toBe(false);
     expect(result.state.checkpoint).toEqual(first.state.checkpoint);
     expect(loadSummaries).not.toHaveBeenCalled();
+  });
+
+  it("resets at the hard limit during an assistant tool loop", async () => {
+    const messages = longSession();
+    const first = await projectMessages({
+      messages,
+      contextLimit: CONTEXT_LIMIT,
+      loadSummaries: async () => summaries(messages),
+    });
+    const continued = [
+      ...messages,
+      assistant("current-assistant", "current", "working", [], 95_000),
+    ];
+    const loadSummaries = vi.fn(async () => summaries(continued));
+
+    const result = await projectMessages({
+      messages: continued,
+      contextLimit: CONTEXT_LIMIT,
+      previous: first.state,
+      loadSummaries,
+    });
+
+    expect(result.reset).toBe(true);
+    expect(result.state.checkpoint?.tailStartUserMessageId).not.toBe(
+      first.state.checkpoint?.tailStartUserMessageId,
+    );
+    expect(loadSummaries).toHaveBeenCalledOnce();
   });
 
   it("immediately resets when switching to a smaller context model", async () => {
@@ -241,6 +315,7 @@ describe("projectMessages", () => {
     const result = await projectMessages({
       messages,
       contextLimit: 60_000,
+      outputLimit: 20_000,
       previous: first.state,
       loadSummaries: async () => summaries(messages),
     });
@@ -250,17 +325,184 @@ describe("projectMessages", () => {
     expect(result.estimatedTokens).toBeLessThan(45_000);
   });
 
-  it("fails closed when the archived prefix lacks contiguous summaries", async () => {
+  it("resets a smaller model during an assistant loop below the hard limit", async () => {
+    const messages = longSession();
+    const first = await projectMessages({
+      messages,
+      contextLimit: CONTEXT_LIMIT,
+      loadSummaries: async () => summaries(messages),
+    });
+    const continued = [
+      ...messages,
+      assistant("current-assistant", "current", "working", [], 30_000),
+    ];
+    const loadSummaries = vi.fn(async () => summaries(continued));
+
+    const result = await projectMessages({
+      messages: continued,
+      contextLimit: 80_000,
+      outputLimit: 20_000,
+      previous: first.state,
+      loadSummaries,
+    });
+
+    expect(result.hardLimitTokens).toBe(60_000);
+    expect(result.reset).toBe(true);
+    expect(loadSummaries).toHaveBeenCalledOnce();
+  });
+
+  it("keeps a lossy checkpoint stable until the next normal compaction", async () => {
+    const messages = longSession();
+    const first = await projectMessages({
+      messages,
+      contextLimit: CONTEXT_LIMIT,
+      loadSummaries: async () => summaries(messages),
+    });
+    const lossy = await projectMessages({
+      messages,
+      contextLimit: 90_000,
+      inputLimit: 80_000,
+      outputLimit: 20_000,
+      previous: first.state,
+      loadSummaries: async () => [],
+    });
+
+    expect(lossy.reset).toBe(true);
+    expect(lossy.state.checkpoint?.lossy).toBe(true);
+    expect(projectedContext(lossy.messages)).toContain(PROJECTION_LOSS_WARNING);
+
+    const answered = [
+      ...messages,
+      assistant("current-answer", "current", "done", [], 55_000),
+    ];
+    const loadSummaries = vi.fn(async () => summaries(answered));
+    const toolLoop = await projectMessages({
+      messages: answered,
+      contextLimit: 90_000,
+      inputLimit: 80_000,
+      outputLimit: 20_000,
+      previous: lossy.state,
+      loadSummaries,
+    });
+
+    expect(toolLoop.reset).toBe(false);
+    expect(toolLoop.state.checkpoint).toEqual(lossy.state.checkpoint);
+    expect(loadSummaries).not.toHaveBeenCalled();
+
+    const continued = [
+      ...answered,
+      user("next", `continue ${"x".repeat(20_000)}`),
+    ];
+    const retried = await projectMessages({
+      messages: continued,
+      contextLimit: 90_000,
+      inputLimit: 80_000,
+      outputLimit: 20_000,
+      previous: toolLoop.state,
+      loadSummaries: async () => summaries(continued),
+    });
+
+    expect(retried.reset).toBe(true);
+    expect(retried.state.contextLimit).toBe(90_000);
+  });
+
+  it("compacts lossily with explicit markers when coverage is incomplete", async () => {
     const messages = longSession();
     const incomplete = summaries(messages).slice(1);
+
+    const result = await projectMessages({
+      messages,
+      contextLimit: CONTEXT_LIMIT,
+      inputLimit: 110_000,
+      outputLimit: 10_000,
+      loadSummaries: async () => incomplete,
+    });
+
+    expect(result.reset).toBe(true);
+    expect(result.state.checkpoint?.lossy).toBe(true);
+    expect(result.diagnostic?.omissionReasons).toContain(
+      "missing-segment-summaries",
+    );
+    expect(result.diagnostic?.includedSummaryCount).toBeGreaterThan(0);
+    expect(projectedContext(result.messages)).toContain(
+      "one or more archived closed segments had no exact committed Reflection summary",
+    );
+  });
+
+  it("retains the open segment raw and uses only closed segment summaries", async () => {
+    const messages: OpenCodeMessage[] = [];
+    for (let index = 0; index < 20; index += 1) {
+      const userId = `boundary-user-${index}`;
+      messages.push(user(userId, "u".repeat(5_000)));
+      messages.push(
+        assistant(`boundary-assistant-${index}`, userId, "a".repeat(5_000)),
+      );
+    }
+    messages.push(user("open-user", "retain this open turn"));
+    const localSegments = segmentMessages(messages);
+    const closedSegments = localSegments.filter((segment) => segment.closed);
+    const closedSummaries = summaries(messages).slice(0, closedSegments.length);
+
+    const result = await projectMessages({
+      messages,
+      contextLimit: CONTEXT_LIMIT,
+      loadSummaries: async () => closedSummaries,
+    });
+
+    expect(result.reset).toBe(true);
+    expect(result.state.checkpoint?.lossy).toBeUndefined();
+    expect(
+      localSegments.map((segment) => segment.startUserMessageId),
+    ).toContain(result.state.checkpoint?.tailStartUserMessageId);
+    expect(result.messages).toContain(messages.at(-1));
+    expect(closedSummaries).not.toContainEqual(
+      expect.objectContaining({ end_user_message_id: "open-user" }),
+    );
+  });
+
+  it("compacts lossily when the summary service errors", async () => {
+    const messages = longSession();
+
+    const result = await projectMessages({
+      messages,
+      contextLimit: CONTEXT_LIMIT,
+      outputLimit: 0,
+      loadSummaries: async () => {
+        throw new Error("service unavailable");
+      },
+    });
+
+    expect(result.reset).toBe(true);
+    expect(result.diagnostic?.omissionReasons).toContain(
+      "summary-service-unavailable",
+    );
+    expect(projectedContext(result.messages)).not.toContain(
+      "service unavailable",
+    );
+  });
+
+  it("fails only when no safe turn-aligned tail can fit", async () => {
+    const messages = longSession();
+    const current = messages.at(-1);
+    if (current) {
+      current.parts = [
+        ...current.parts,
+        {
+          type: "file",
+          filename: "remote.pdf",
+          mime: "application/pdf",
+          url: "https://example.com/remote.pdf",
+        },
+      ];
+    }
 
     await expect(
       projectMessages({
         messages,
         contextLimit: CONTEXT_LIMIT,
-        loadSummaries: async () => incomplete,
+        loadSummaries: async () => [],
       }),
-    ).rejects.toThrow(ProjectionCoverageError);
+    ).rejects.toThrow("safe turn-aligned projection tail");
   });
 
   it("keeps a cutoff when switching to a larger context model", async () => {
@@ -285,7 +527,7 @@ describe("projectMessages", () => {
     expect(loadSummaries).not.toHaveBeenCalled();
   });
 
-  it("carries forward an existing native summary and its partial leading segment", async () => {
+  it("carries forward an existing native summary and marks missing tail coverage", async () => {
     const tail = longSession();
     const compactionUser: OpenCodeMessage = {
       info: {
@@ -318,33 +560,107 @@ describe("projectMessages", () => {
     const context = projectedContext(result.messages);
     expect(result.reset).toBe(true);
     expect(context).toContain("Previous anchored summary");
-    expect(context).toContain("Unsummarized User context");
-    expect(context).toContain("request 0");
+    expect(context).toContain(
+      "archived closed segments had no exact committed Reflection summary",
+    );
+    expect(result.state.checkpoint?.lossy).toBe(true);
   });
 
-  it("rejects legacy summaries that span an unanswered user message", async () => {
+  it("compacts lossily when no Reflection segment follows native compaction", async () => {
+    const compactionUser: OpenCodeMessage = {
+      info: {
+        id: "compaction-user",
+        sessionID: SESSION_ID,
+        role: "user",
+        model: { providerID: PROVIDER_ID, modelID: MODEL_ID },
+      },
+      parts: [{ type: "compaction" }],
+    };
+    const compactionSummary: OpenCodeMessage = {
+      info: {
+        id: "compaction-summary",
+        sessionID: SESSION_ID,
+        role: "assistant",
+        parentID: "compaction-user",
+        summary: true,
+      },
+      parts: [{ type: "text", text: "Previous anchored summary" }],
+    };
+    const messages = [compactionUser, compactionSummary, ...longSession()];
+
+    const result = await projectMessages({
+      messages,
+      contextLimit: CONTEXT_LIMIT,
+      inputLimit: 110_000,
+      outputLimit: 10_000,
+      loadSummaries: async () => [],
+    });
+
+    expect(result.reset).toBe(true);
+    expect(result.state.checkpoint?.lossy).toBe(true);
+    expect(projectedContext(result.messages)).toContain(
+      "Previous anchored summary",
+    );
+  });
+
+  it("does not treat a cross-segment summary as closed-segment coverage", async () => {
     const messages = [
       user("u0", "x".repeat(400_000)),
       assistant("a0", "u0", "answer", [], 100_000),
-      user("unanswered", "do not erase me"),
+      user("unanswered", `do not erase me ${"x".repeat(200_000)}`),
       user("current", "continue"),
     ];
 
-    await expect(
-      projectMessages({
-        messages,
-        contextLimit: CONTEXT_LIMIT,
-        loadSummaries: async () => [
-          {
-            id: "legacy",
-            start_user_message_id: "u0",
-            end_user_message_id: "unanswered",
-            projection_version: 0,
-            summary: "Incorrectly bridged summary",
-          },
-        ],
-      }),
-    ).rejects.toThrow(ProjectionCoverageError);
+    const result = await projectMessages({
+      messages,
+      contextLimit: CONTEXT_LIMIT,
+      loadSummaries: async () => [
+        {
+          id: "legacy",
+          start_user_message_id: "u0",
+          end_user_message_id: "unanswered",
+          projection_version: 0,
+          summary: "Summary including the unanswered request",
+        },
+      ],
+    });
+
+    expect(result.reset).toBe(true);
+    expect(result.state.checkpoint?.lossy).toBe(true);
+    expect(result.diagnostic?.omissionReasons).toContain(
+      "missing-segment-summaries",
+    );
+  });
+
+  it("projects an unanswered turn even when no assistant exists to clone", async () => {
+    const messages = [
+      user("unanswered", "x".repeat(400_000)),
+      user("current", "continue"),
+    ];
+
+    const result = await projectMessages({
+      messages,
+      contextLimit: CONTEXT_LIMIT,
+      loadSummaries: async () => [
+        {
+          id: "unanswered-segment",
+          start_user_message_id: "unanswered",
+          end_user_message_id: "unanswered",
+          projection_version: 1,
+          summary: "The unanswered request",
+        },
+      ],
+    });
+
+    expect(result.reset).toBe(true);
+    expect(result.state.checkpoint?.lossy).toBeUndefined();
+    expect(result.messages[1]?.info).toMatchObject({
+      role: "assistant",
+      providerID: PROVIDER_ID,
+      modelID: MODEL_ID,
+      finish: "stop",
+      cost: 0,
+    });
   });
 
   it("does not resurrect compacted tool output", async () => {
@@ -375,30 +691,255 @@ describe("projectMessages", () => {
     expect(context).toContain("report.pdf (application/pdf)");
   });
 
-  it("does not project away a failed assistant turn", async () => {
-    const failed = assistant("a0", "u0", "partial", [], 100_000);
+  it("archives provider-visible ignored assistant tool records", async () => {
+    const messages = longSession();
+    const firstAssistant = messages.find(
+      (message) => message.info.role === "assistant",
+    );
+    if (firstAssistant) {
+      firstAssistant.parts = [
+        ...firstAssistant.parts,
+        {
+          type: "tool",
+          tool: "bash",
+          ignored: true,
+          state: {
+            status: "completed",
+            input: { command: "read secret" },
+            output: "IGNORED_SECRET",
+          },
+        },
+      ];
+    }
+
+    const result = await projectMessages({
+      messages,
+      contextLimit: CONTEXT_LIMIT,
+      loadSummaries: async () => summaries(messages),
+    });
+
+    expect(projectedContext(result.messages)).toContain("IGNORED_SECRET");
+    expect(result.diagnostic?.omissionReasons).not.toContain(
+      "tool-record-truncation",
+    );
+  });
+
+  it("counts 600k of ignored assistant text as provider-visible", async () => {
+    const ignoredAssistant = assistant("a0", "u0", "");
+    ignoredAssistant.parts = [
+      { type: "text", text: "x".repeat(600_000), ignored: true },
+    ];
+    const messages = [
+      user("u0", "old request"),
+      ignoredAssistant,
+      user("current", "continue"),
+    ];
+    const loadSummaries = vi.fn(async () => summaries(messages));
+
+    const result = await projectMessages({
+      messages,
+      contextLimit: CONTEXT_LIMIT,
+      loadSummaries,
+    });
+
+    expect(result.reset).toBe(true);
+    expect(loadSummaries).toHaveBeenCalledOnce();
+  });
+
+  it("marks summary and tool budget omissions as lossy", async () => {
+    const messages = longSession();
+    const firstAssistant = messages.find(
+      (message) => message.info.role === "assistant",
+    );
+    if (firstAssistant) {
+      firstAssistant.parts = [
+        ...firstAssistant.parts,
+        ...Array.from({ length: 10 }, (_, index) => ({
+          type: "tool",
+          tool: `tool-${index}`,
+          state: {
+            status: "completed",
+            input: { index },
+            output: "t".repeat(1_000),
+          },
+        })),
+      ];
+    }
+    const oversized = summaries(messages).map((summary) => ({
+      ...summary,
+      summary: "s".repeat(30_000),
+    }));
+
+    const result = await projectMessages({
+      messages,
+      contextLimit: CONTEXT_LIMIT,
+      loadSummaries: async () => oversized,
+    });
+
+    expect(result.reset).toBe(true);
+    expect(result.diagnostic?.omissionReasons).toEqual(
+      expect.arrayContaining([
+        "summary-budget-omission",
+        "tool-budget-omission",
+      ]),
+    );
+    expect(projectedContext(result.messages)).toContain(
+      "older summary context exceeded",
+    );
+    expect(projectedContext(result.messages)).toContain(
+      "older tool records exceeded",
+    );
+  });
+
+  it("marks unfinished tools and archived media as lossy", async () => {
+    const messages = longSession();
+    const firstUser = messages.find((message) => message.info.role === "user");
+    const firstAssistant = messages.find(
+      (message) => message.info.role === "assistant",
+    );
+    if (firstUser) {
+      firstUser.parts = [
+        ...firstUser.parts,
+        {
+          type: "file",
+          filename: "reference.png",
+          mime: "image/png",
+          url: "data:image/png;base64,YQ==",
+        },
+      ];
+    }
+    if (firstAssistant) {
+      firstAssistant.parts = [
+        ...firstAssistant.parts,
+        {
+          type: "tool",
+          tool: "bash",
+          state: { status: "running", input: { command: "sleep 10" } },
+        },
+      ];
+    }
+
+    const result = await projectMessages({
+      messages,
+      contextLimit: CONTEXT_LIMIT,
+      loadSummaries: async () => summaries(messages),
+    });
+
+    expect(result.diagnostic?.omissionReasons).toEqual(
+      expect.arrayContaining([
+        "unfinished-tool-records-omitted",
+        "archived-media-omitted",
+      ]),
+    );
+    expect(projectedContext(result.messages)).toContain(
+      "pending, running, or unsupported archived tool records",
+    );
+    expect(projectedContext(result.messages)).toContain(
+      "archived media content",
+    );
+  });
+
+  it("does not count 400k of generic errored assistant text", async () => {
+    const failed = assistant("a0", "u0", "x".repeat(400_000));
     failed.info.error = { name: "UnknownError" };
     const messages = [
-      user("u0", "must remain raw"),
+      user("u0", "request"),
+      failed,
+      user("current", "continue"),
+    ];
+    const loadSummaries = vi.fn(async () => summaries(messages));
+
+    const result = await projectMessages({
+      messages,
+      contextLimit: CONTEXT_LIMIT,
+      loadSummaries,
+    });
+
+    expect(result.reset).toBe(false);
+    expect(result.estimatedTokens).toBeLessThan(CONTEXT_LIMIT * 0.75);
+    expect(loadSummaries).not.toHaveBeenCalled();
+    expect(segmentMessages(messages)[0]?.messages).not.toContainEqual({
+      role: "assistant",
+      text: expect.any(String),
+    });
+  });
+
+  it("does not archive or classify generic errored assistant parts", async () => {
+    const failed = assistant("a0", "u0", "HIDDEN_ERROR_TEXT", [
+      { type: "reasoning", text: "HIDDEN_ERROR_REASONING" },
+      {
+        type: "file",
+        filename: "hidden.png",
+        mime: "image/png",
+        url: "data:image/png;base64,YQ==",
+      },
+      {
+        type: "tool",
+        tool: "bash",
+        state: {
+          status: "completed",
+          input: { command: "read secret" },
+          output: "HIDDEN_ERROR_TOOL",
+        },
+      },
+    ]);
+    failed.info.error = { name: "UnknownError" };
+    const messages = [
+      user("u0", "x".repeat(400_000)),
       failed,
       user("current", "continue"),
     ];
 
-    await expect(
-      projectMessages({
-        messages,
-        contextLimit: CONTEXT_LIMIT,
-        loadSummaries: async () => [
-          {
-            id: "failed",
-            start_user_message_id: "u0",
-            end_user_message_id: "u0",
-            projection_version: 0,
-            summary: "Partial turn",
-          },
-        ],
-      }),
-    ).rejects.toThrow(ProjectionCoverageError);
+    const result = await projectMessages({
+      messages,
+      contextLimit: CONTEXT_LIMIT,
+      loadSummaries: async () => [
+        {
+          id: "u0-summary",
+          start_user_message_id: "u0",
+          end_user_message_id: "u0",
+          projection_version: 1,
+          summary: "The old request",
+        },
+      ],
+    });
+    const context = projectedContext(result.messages);
+
+    expect(result.reset).toBe(true);
+    expect(result.state.checkpoint?.lossy).toBeUndefined();
+    expect(result.diagnostic?.omissionReasons).toEqual([]);
+    expect(context).not.toContain("HIDDEN_ERROR_TEXT");
+    expect(context).not.toContain("HIDDEN_ERROR_REASONING");
+    expect(context).not.toContain("HIDDEN_ERROR_TOOL");
+    expect(context).not.toContain("hidden.png");
+  });
+
+  it("counts an aborted assistant with visible text", async () => {
+    const aborted = assistant("a0", "u0", "x".repeat(400_000));
+    aborted.info.error = { name: "MessageAbortedError" };
+    aborted.parts = [
+      { type: "step-start" },
+      { type: "reasoning", text: "internal" },
+      ...aborted.parts,
+    ];
+    const messages = [user("u0", "request"), aborted, user("current", "go")];
+    const loadSummaries = vi.fn(async () => summaries(messages));
+
+    const result = await projectMessages({
+      messages,
+      contextLimit: CONTEXT_LIMIT,
+      loadSummaries,
+    });
+
+    expect(result.reset).toBe(true);
+    expect(loadSummaries).toHaveBeenCalledOnce();
+    expect(result.diagnostic?.omissionReasons).toContain(
+      "archived-reasoning-omitted",
+    );
+    expect(segmentMessages(messages)[0]?.messages).toContainEqual({
+      role: "assistant",
+      text: "x".repeat(400_000),
+    });
   });
 
   it("does not count opaque attachment bytes as text tokens", async () => {
@@ -462,7 +1003,7 @@ describe("projectMessages", () => {
     expect(result.reset).toBe(true);
   });
 
-  it("does not archive an unanswered gap after a native summary", async () => {
+  it("marks an uncovered unanswered gap after a native summary as lossy", async () => {
     const compactionUser = user("compaction-user", "");
     compactionUser.parts = [{ type: "compaction" }];
     const compactionSummary = assistant(
@@ -480,21 +1021,24 @@ describe("projectMessages", () => {
       user("current", "continue"),
     ];
 
-    await expect(
-      projectMessages({
-        messages,
-        contextLimit: CONTEXT_LIMIT,
-        loadSummaries: async () => [
-          {
-            id: "covered-segment",
-            start_user_message_id: "covered",
-            end_user_message_id: "covered",
-            projection_version: 1,
-            summary: "Covered summary",
-          },
-        ],
-      }),
-    ).rejects.toThrow("Native compaction tail contains an unanswered turn");
+    const result = await projectMessages({
+      messages,
+      contextLimit: CONTEXT_LIMIT,
+      loadSummaries: async () => [
+        {
+          id: "covered-segment",
+          start_user_message_id: "covered",
+          end_user_message_id: "covered",
+          projection_version: 1,
+          summary: "Covered summary",
+        },
+      ],
+    });
+
+    expect(result.reset).toBe(true);
+    expect(result.diagnostic?.omissionReasons).toContain(
+      "missing-segment-summaries",
+    );
   });
 
   it("preserves an assistant-first native compaction tail", async () => {
@@ -530,7 +1074,7 @@ describe("projectMessages", () => {
     );
   });
 
-  it("fails closed on reasoning in an assistant-first native tail", async () => {
+  it("omits inherited reasoning with a lossy warning", async () => {
     const tail = longSession();
     const compactionUser = user("compaction-user", "");
     compactionUser.parts = [{ type: "compaction" }];
@@ -546,7 +1090,11 @@ describe("projectMessages", () => {
       "",
     );
     retainedReasoning.parts = [
-      { type: "reasoning", text: "CRITICAL RETAINED REASONING" },
+      {
+        type: "reasoning",
+        text: "CRITICAL RETAINED REASONING",
+        ignored: true,
+      },
     ];
     const messages = [
       compactionUser,
@@ -555,13 +1103,19 @@ describe("projectMessages", () => {
       ...tail,
     ];
 
-    await expect(
-      projectMessages({
-        messages,
-        contextLimit: CONTEXT_LIMIT,
-        loadSummaries: async () => summaries(tail),
-      }),
-    ).rejects.toThrow("reasoning that cannot be archived safely");
+    const result = await projectMessages({
+      messages,
+      contextLimit: CONTEXT_LIMIT,
+      loadSummaries: async () => summaries(tail),
+    });
+
+    expect(result.reset).toBe(true);
+    expect(projectedContext(result.messages)).not.toContain(
+      "CRITICAL RETAINED REASONING",
+    );
+    expect(projectedContext(result.messages)).toContain(
+      "inherited reasoning could not be retained safely",
+    );
   });
 
   it("fails closed when non-image media size is unknown", async () => {
@@ -585,6 +1139,6 @@ describe("projectMessages", () => {
         contextLimit: CONTEXT_LIMIT,
         loadSummaries: async () => summaries(messages),
       }),
-    ).rejects.toThrow("could not reduce projected context");
+    ).rejects.toThrow("safe turn-aligned projection tail");
   });
 });

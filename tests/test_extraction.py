@@ -4,7 +4,7 @@ from uuid import uuid4
 import pytest
 
 from reflection_service.db import ClaimedJob
-from reflection_service.domain import MentionContext, segment_id_for
+from reflection_service.domain import MentionContext, segment_id_for, source_fingerprint
 from reflection_service.extraction import ExtractionEngine
 from reflection_service.models import (
     ExtractedClaim,
@@ -31,10 +31,10 @@ class FakeModels:
     def __init__(self) -> None:
         self.contexts: tuple[MentionContext, ...] = ()
         self.priors: list[str] = []
+        self.request: SegmentCreate | None = None
 
-    async def extract(
-        self, _request: SegmentCreate, prior_summaries: list[str]
-    ) -> ExtractionResult:
+    async def extract(self, request: SegmentCreate, prior_summaries: list[str]) -> ExtractionResult:
+        self.request = request
         self.priors = prior_summaries
         return ExtractionResult(
             summary="Contextual summary",
@@ -181,6 +181,8 @@ async def test_prepare_resolves_occurrences_but_not_literals_with_claim_context(
         id=1,
         segment_id=segment_id_for("session", "start"),
         lease_id=uuid4(),
+        source_generation=1,
+        source_fingerprint=source_fingerprint(request),
         attempts=1,
         request=request,
     )
@@ -188,6 +190,7 @@ async def test_prepare_resolves_occurrences_but_not_literals_with_claim_context(
 
     prepared = await engine.prepare(job)
 
+    assert models.request is request
     assert models.priors == ["prior one", "prior two"]
     assert [context.mention_id for context in models.contexts] == [
         "c0.subject",
@@ -225,6 +228,8 @@ async def test_prepare_stores_only_contextualized_kept_claims() -> None:
         id=1,
         segment_id=segment_id_for("session", "start"),
         lease_id=uuid4(),
+        source_generation=1,
+        source_fingerprint=source_fingerprint(request),
         attempts=1,
         request=request,
     )

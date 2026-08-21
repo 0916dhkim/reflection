@@ -13,11 +13,18 @@ from reflection_service.domain import (
     normalize_name,
     rank_and_group_claims,
     segment_id_for,
+    source_fingerprint,
     union_candidates,
     validate_claim_decisions,
     validate_resolutions,
 )
-from reflection_service.models import ClaimDecision, ExtractedClaim, Resolution, ResolutionResult
+from reflection_service.models import (
+    ClaimDecision,
+    ExtractedClaim,
+    Resolution,
+    ResolutionResult,
+    SegmentCreate,
+)
 
 
 def test_segment_and_new_entity_ids_are_deterministic() -> None:
@@ -26,6 +33,36 @@ def test_segment_and_new_entity_ids_are_deterministic() -> None:
     assert segment_id == segment_id_for("session", "start")
     assert segment_id != segment_id_for("session", "other-start")
     assert new_entity_id_for(segment_id, " Example ") == new_entity_id_for(segment_id, "example")
+
+
+def test_source_fingerprint_covers_exact_ordered_source() -> None:
+    request = SegmentCreate(
+        session_id="session",
+        start_user_message_id="start",
+        end_user_message_id="end",
+        messages=[
+            {"role": "user", "text": "hello"},
+            {"role": "assistant", "text": "world"},
+        ],
+    )
+
+    assert source_fingerprint(request) == (
+        "dddcbe20455a0df55fa7c3a01018d29516fa86ea3050fc9a14c4dddfe735ba59"
+    )
+    assert source_fingerprint(request) == source_fingerprint(request.model_copy(deep=True))
+    assert source_fingerprint(
+        request.model_copy(update={"messages": list(reversed(request.messages))})
+    ) != source_fingerprint(request)
+    assert source_fingerprint(
+        request.model_copy(
+            update={
+                "messages": [
+                    request.messages[0].model_copy(update={"text": "hello "}),
+                    request.messages[1],
+                ]
+            }
+        )
+    ) != source_fingerprint(request)
 
 
 def test_normalize_name_is_case_and_whitespace_insensitive() -> None:

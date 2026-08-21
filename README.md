@@ -170,7 +170,8 @@ docker compose up --build
 The Dokploy-oriented Compose file binds PostgreSQL data to `/srv/reflection/postgres`. Ensure that path
 exists and is writable by the container's PostgreSQL user before deployment. The API runs idempotent SQL
 from `migrations/` at startup; the database role therefore needs permission to create the `vector` and
-`pg_trgm` extensions on first boot.
+`pg_trgm` extensions on first boot. Before deploying migration `005`, stop every older API/worker replica;
+pre-`005` workers do not carry source generations and must not run concurrently with the migrated service.
 
 For local development without Compose:
 

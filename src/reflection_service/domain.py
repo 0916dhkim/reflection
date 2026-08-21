@@ -3,7 +3,13 @@ from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from uuid import UUID, uuid5
 
-from reflection_service.models import ExtractedClaim, Resolution, ResolutionResult, SearchClaim
+from reflection_service.models import (
+    ExtractedClaim,
+    Resolution,
+    ResolutionResult,
+    SearchClaim,
+    SegmentCreate,
+)
 
 SEGMENT_NAMESPACE = UUID("b14d5f2c-4cce-4f37-9e32-ea30c1fd1b42")
 ENTITY_NAMESPACE = UUID("966769b5-ab08-4b02-8948-7db052586124")
@@ -24,6 +30,19 @@ def normalize_name(value: str) -> str:
 
 def segment_id_for(session_id: str, start_user_message_id: str) -> UUID:
     return uuid5(SEGMENT_NAMESPACE, f"{session_id}\0{start_user_message_id}")
+
+
+def source_fingerprint(request: SegmentCreate) -> str:
+    def frame(value: str) -> str:
+        return f"{len(value.encode())}:{value}"
+
+    value = (
+        "reflection-source-v1:"
+        f"{frame(request.session_id)}{frame(request.start_user_message_id)}"
+        f"{frame(request.end_user_message_id)}{len(request.messages)}:"
+        + "".join(frame(message.role) + frame(message.text) for message in request.messages)
+    )
+    return hashlib.sha256(value.encode()).hexdigest()
 
 
 def projection_fingerprint(

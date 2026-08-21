@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  PROJECTION_LOSS_WARNING,
+  PROJECTION_LOSS_WARNING_METADATA,
+  isModelVisibleMessage,
+  isNormalUserMessage,
+  isProjectionLossWarningMessage,
   readSegmentMessages,
   segmentMessages,
   textOf,
@@ -46,13 +51,139 @@ describe("textOf", () => {
     };
 
     expect(textOf(message)).toBe(
-      "first second[Attachment image.png (image/png)]",
+      "firstuser-only second[Attachment image.png (image/png)]",
     );
+  });
+
+  it("hides ignored user text", () => {
+    const message: OpenCodeMessage = {
+      info: { id: "u1", role: "user" },
+      parts: [
+        { type: "text", text: "visible" },
+        { type: "text", text: "hidden", ignored: true },
+      ],
+    };
+
+    expect(textOf(message)).toBe("visible");
+  });
+
+  it("matches assistant error visibility", () => {
+    const generic = assistant("generic", "u1", "partial");
+    generic.info.error = { name: "UnknownError" };
+    const aborted = assistant("aborted", "u1", "");
+    aborted.info.error = { name: "MessageAbortedError" };
+    aborted.parts = [
+      { type: "step-start" },
+      { type: "reasoning", text: "internal" },
+    ];
+
+    expect(isModelVisibleMessage(generic)).toBe(false);
+    expect(isModelVisibleMessage(aborted)).toBe(false);
+
+    aborted.parts = [
+      ...aborted.parts,
+      { type: "tool", tool: "bash", state: { status: "running" } },
+    ];
+    expect(isModelVisibleMessage(aborted)).toBe(true);
+  });
+
+  it("excludes the exact persisted projection warning from source boundaries", () => {
+    const warning: OpenCodeMessage = {
+      info: { id: "warning", role: "user" },
+      parts: [
+        {
+          type: "text",
+          text: PROJECTION_LOSS_WARNING,
+          synthetic: false,
+          ignored: false,
+          metadata: PROJECTION_LOSS_WARNING_METADATA,
+        },
+      ],
+    };
+    const messages = [
+      user("u1", "first"),
+      assistant("a1", "u1", "answer"),
+      warning,
+      user("u2", "second"),
+    ];
+
+    expect(isProjectionLossWarningMessage(warning)).toBe(true);
+    expect(isModelVisibleMessage(warning)).toBe(true);
+    expect(isNormalUserMessage(warning)).toBe(false);
+    expect(textOf(warning)).toBe("");
+    expect(segmentMessages(messages)[0]?.messages).toEqual([
+      { role: "user", text: "first" },
+      { role: "assistant", text: "answer" },
+      { role: "user", text: "second" },
+    ]);
+    expect(readSegmentMessages(messages, "u1", "u2")).toEqual([
+      { role: "user", text: "first" },
+      { role: "assistant", text: "answer" },
+      { role: "user", text: "second" },
+    ]);
+  });
+
+  it("retains arbitrary or mixed warning-like metadata as user source", () => {
+    const mixed: OpenCodeMessage = {
+      info: { id: "mixed", role: "user" },
+      parts: [
+        {
+          type: "text",
+          text: PROJECTION_LOSS_WARNING,
+          synthetic: false,
+          ignored: false,
+          metadata: {
+            ...PROJECTION_LOSS_WARNING_METADATA,
+            unrelated: true,
+          },
+        },
+      ],
+    };
+    const arbitrary: OpenCodeMessage = {
+      info: { id: "arbitrary", role: "user" },
+      parts: [
+        {
+          type: "text",
+          text: "ordinary user text",
+          synthetic: false,
+          ignored: false,
+          metadata: PROJECTION_LOSS_WARNING_METADATA,
+        },
+      ],
+    };
+    const nestedMixed: OpenCodeMessage = {
+      info: { id: "nested-mixed", role: "user" },
+      parts: [
+        {
+          type: "text",
+          text: PROJECTION_LOSS_WARNING,
+          synthetic: false,
+          ignored: false,
+          metadata: {
+            reflection: {
+              ...PROJECTION_LOSS_WARNING_METADATA.reflection,
+              unrelated: true,
+            },
+          },
+        },
+      ],
+    };
+
+    expect(isProjectionLossWarningMessage(mixed)).toBe(false);
+    expect(isProjectionLossWarningMessage(arbitrary)).toBe(false);
+    expect(isProjectionLossWarningMessage(nestedMixed)).toBe(false);
+    expect(
+      segmentMessages([mixed, arbitrary, nestedMixed])[0]?.messages,
+    ).toEqual([
+      { role: "user", text: PROJECTION_LOSS_WARNING },
+      { role: "user", text: "ordinary user text" },
+      { role: "user", text: PROJECTION_LOSS_WARNING },
+    ]);
   });
 });
 
 describe("segmentMessages", () => {
-  it("keeps complete turns together and starts a new segment when a turn crosses the limit", () => {
+  it("keeps turns together and starts a new segment when a turn crosses the limit", () => {
     const messages = [
       user("u1", "123"),
       assistant("a1", "u1", "45"),
@@ -74,12 +205,13 @@ describe("segmentMessages", () => {
       },
       {
         startUserMessageId: "u2",
-        endUserMessageId: "u2",
-        charCount: 6,
-        closed: true,
+        endUserMessageId: "u3",
+        charCount: 7,
+        closed: false,
         messages: [
           { role: "user", text: "1234" },
           { role: "assistant", text: "56" },
+          { role: "user", text: "x" },
         ],
       },
     ]);
@@ -184,7 +316,7 @@ describe("segmentMessages", () => {
     ]);
   });
 
-  it("never spans an unanswered user message", () => {
+  it("ingests unanswered normal user turns without changing user boundaries", () => {
     const messages = [
       user("u1", "first"),
       assistant("a1", "u1", "answer"),
@@ -193,19 +325,23 @@ describe("segmentMessages", () => {
       assistant("a3", "u3", "answer"),
     ];
 
-    expect(
-      segmentMessages(messages).map((segment) => ({
-        start: segment.startUserMessageId,
-        end: segment.endUserMessageId,
-        closed: segment.closed,
-      })),
-    ).toEqual([
-      { start: "u1", end: "u1", closed: true },
-      { start: "u3", end: "u3", closed: false },
+    expect(segmentMessages(messages)).toMatchObject([
+      {
+        startUserMessageId: "u1",
+        endUserMessageId: "u3",
+        closed: false,
+        messages: [
+          { role: "user", text: "first" },
+          { role: "assistant", text: "answer" },
+          { role: "user", text: "unanswered" },
+          { role: "user", text: "third" },
+          { role: "assistant", text: "answer" },
+        ],
+      },
     ]);
   });
 
-  it("does not complete failed or intermediate assistant turns", () => {
+  it("excludes errored assistant text but retains model-visible intermediates", () => {
     const failed = assistant("a1", "u1", "partial");
     failed.info.error = { name: "UnknownError" };
     const intermediate = assistant("a2", "u2", "working");
@@ -217,8 +353,12 @@ describe("segmentMessages", () => {
         failed,
         user("u2", "unfinished"),
         intermediate,
-      ]),
-    ).toEqual([]);
+      ])[0]?.messages,
+    ).toEqual([
+      { role: "user", text: "failed" },
+      { role: "user", text: "unfinished" },
+      { role: "assistant", text: "working" },
+    ]);
   });
 });
 
@@ -243,7 +383,7 @@ describe("readSegmentMessages", () => {
     ]);
   });
 
-  it("excludes incomplete user messages between completed boundary turns", () => {
+  it("includes unanswered user messages between inclusive boundaries", () => {
     const messages = [
       user("u1", "first"),
       assistant("a1", "u1", "first answer"),
@@ -255,6 +395,7 @@ describe("readSegmentMessages", () => {
     expect(readSegmentMessages(messages, "u1", "u3")).toEqual([
       { role: "user", text: "first" },
       { role: "assistant", text: "first answer" },
+      { role: "user", text: "incomplete" },
       { role: "user", text: "last" },
       { role: "assistant", text: "last answer" },
     ]);

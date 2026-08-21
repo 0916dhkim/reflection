@@ -34,7 +34,8 @@ function isSessionState(value: unknown): value is ProjectionSessionState {
     typeof checkpoint.summaryText === "string" &&
     checkpoint.summaryText.length > 0 &&
     typeof checkpoint.createdAtMessageId === "string" &&
-    checkpoint.createdAtMessageId.length > 0
+    checkpoint.createdAtMessageId.length > 0 &&
+    (checkpoint.lossy === undefined || typeof checkpoint.lossy === "boolean")
   );
 }
 

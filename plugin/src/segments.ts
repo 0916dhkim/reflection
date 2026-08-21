@@ -1,4 +1,9 @@
 export const DEFAULT_MAX_SEGMENT_CHARS = 20_000;
+export const PROJECTION_LOSS_WARNING =
+  "Reflection compacted older context with omissions. Some archived details are unavailable in this prompt; use memory_search and memory_read_segment when exact history matters.";
+export const PROJECTION_LOSS_WARNING_METADATA = {
+  reflection: { type: "projection-loss-warning", version: 1 },
+};
 
 export interface OpenCodeMessage {
   info: {
@@ -9,6 +14,7 @@ export interface OpenCodeMessage {
     model?: {
       providerID: string;
       modelID: string;
+      variant?: string;
     };
     [key: string]: unknown;
   };
@@ -38,6 +44,8 @@ export interface ReflectionSegment {
   messages: ReflectionMessage[];
 }
 
+type OpenCodePart = OpenCodeMessage["parts"][number];
+
 interface IndexedMessage {
   index: number;
   message: OpenCodeMessage;
@@ -47,13 +55,91 @@ interface CompleteTurn {
   userMessageId: string;
   charCount: number;
   messages: IndexedMessage[];
-  complete: boolean;
+}
+
+function hasExactWarningMetadata(value: unknown): boolean {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return false;
+  }
+  const metadata = value as Record<string, unknown>;
+  if (Object.keys(metadata).length !== 1 || !("reflection" in metadata)) {
+    return false;
+  }
+  const reflection = metadata.reflection;
+  if (
+    typeof reflection !== "object" ||
+    reflection === null ||
+    Array.isArray(reflection)
+  ) {
+    return false;
+  }
+  const marker = reflection as Record<string, unknown>;
+  return (
+    Object.keys(marker).length === 2 &&
+    marker.type === "projection-loss-warning" &&
+    marker.version === 1
+  );
+}
+
+export function isProjectionLossWarningMessage(
+  message: OpenCodeMessage,
+): boolean {
+  if (message.info.role !== "user" || message.parts.length !== 1) return false;
+  const part = message.parts[0];
+  return (
+    part?.type === "text" &&
+    part.text === PROJECTION_LOSS_WARNING &&
+    part.synthetic === false &&
+    part.ignored === false &&
+    hasExactWarningMetadata(part.metadata)
+  );
+}
+
+export function isNormalUserMessage(message: OpenCodeMessage): boolean {
+  return (
+    message.info.role === "user" &&
+    !isProjectionLossWarningMessage(message) &&
+    !message.parts.some((part) => part.type === "compaction")
+  );
+}
+
+export function isModelVisibleMessage(message: OpenCodeMessage): boolean {
+  if (message.info.role === "user") return true;
+  if (!message.info.error) return true;
+  // OpenCode V1 hides generic errors, but retains interrupted output with content.
+  const error = message.info.error;
+  const name =
+    typeof error === "object" &&
+    error !== null &&
+    "name" in error &&
+    typeof error.name === "string"
+      ? error.name
+      : undefined;
+  return (
+    name === "MessageAbortedError" &&
+    message.parts.some(
+      (part) => part.type !== "step-start" && part.type !== "reasoning",
+    )
+  );
+}
+
+export function isModelVisiblePart(
+  message: OpenCodeMessage,
+  part: OpenCodePart,
+): boolean {
+  // OpenCode V1 applies `ignored` only while converting user parts.
+  return (
+    isModelVisibleMessage(message) &&
+    (message.info.role === "assistant" || part.ignored !== true)
+  );
 }
 
 export function textOf(message: OpenCodeMessage): string {
+  if (isProjectionLossWarningMessage(message)) return "";
+  if (!isModelVisibleMessage(message)) return "";
   return message.parts
     .flatMap((part) => {
-      if (part.ignored === true) return [];
+      if (!isModelVisiblePart(message, part)) return [];
       if (part.type === "text") {
         return [part.text ?? ""];
       }
@@ -67,52 +153,36 @@ export function textOf(message: OpenCodeMessage): string {
     .join("");
 }
 
-export function isSuccessfulAssistant(message: OpenCodeMessage): boolean {
-  if (message.info.role !== "assistant" || message.info.error) return false;
-  const time = message.info.time;
-  const completed =
-    typeof time === "object" &&
-    time !== null &&
-    "completed" in time &&
-    typeof time.completed === "number";
-  const finish = message.info.finish;
-  return (
-    completed &&
-    typeof finish === "string" &&
-    !["tool-calls", "unknown"].includes(finish)
-  );
-}
-
 function turns(messages: readonly OpenCodeMessage[]): CompleteTurn[] {
   const users = new Map<string, CompleteTurn>();
   const turns: CompleteTurn[] = [];
 
   messages.forEach((message, index) => {
-    if (message.info.role !== "user") return;
+    if (!isNormalUserMessage(message)) return;
     const turn: CompleteTurn = {
       userMessageId: message.info.id,
       charCount: textOf(message).length,
       messages: [{ index, message }],
-      complete: false,
     };
     users.set(message.info.id, turn);
     turns.push(turn);
   });
 
   messages.forEach((message, index) => {
-    if (message.info.role !== "assistant" || !message.info.parentID) return;
+    if (
+      message.info.role !== "assistant" ||
+      !message.info.parentID ||
+      !isModelVisibleMessage(message)
+    ) {
+      return;
+    }
     const turn = users.get(message.info.parentID);
     if (!turn) return;
     turn.messages.push({ index, message });
     turn.charCount += textOf(message).length;
-    if (isSuccessfulAssistant(message)) turn.complete = true;
   });
 
   return turns;
-}
-
-function completeTurns(messages: readonly OpenCodeMessage[]): CompleteTurn[] {
-  return turns(messages).filter((turn) => turn.complete);
 }
 
 function reflectionMessages(
@@ -153,12 +223,6 @@ export function segmentMessages(
   let currentChars = 0;
 
   for (const turn of turns(messages)) {
-    if (!turn.complete) {
-      if (current.length > 0) segments.push(makeSegment(current, true));
-      current = [];
-      currentChars = 0;
-      continue;
-    }
     if (turn.charCount > maxChars) {
       if (current.length > 0) segments.push(makeSegment(current, true));
       segments.push(makeSegment([turn], true));
@@ -193,11 +257,11 @@ export function readSegmentMessages(
 ): ReflectionMessage[] {
   const startIndex = messages.findIndex(
     (message) =>
-      message.info.role === "user" && message.info.id === startUserMessageId,
+      isNormalUserMessage(message) && message.info.id === startUserMessageId,
   );
   const endIndex = messages.findIndex(
     (message) =>
-      message.info.role === "user" && message.info.id === endUserMessageId,
+      isNormalUserMessage(message) && message.info.id === endUserMessageId,
   );
 
   if (startIndex < 0 || endIndex < 0)
@@ -205,10 +269,10 @@ export function readSegmentMessages(
   if (startIndex > endIndex)
     throw new Error("Segment user boundaries are out of order");
 
-  const turns = completeTurns(messages).filter(
+  const selectedTurns = turns(messages).filter(
     (turn) =>
       turn.messages[0].index >= startIndex &&
       turn.messages[0].index <= endIndex,
   );
-  return reflectionMessages(turns);
+  return reflectionMessages(selectedTurns);
 }

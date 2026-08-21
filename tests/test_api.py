@@ -68,6 +68,9 @@ async def test_segment_api_accepts_empty_text_and_one_large_turn() -> None:
 
     assert empty.status_code == 202
     assert large.status_code == 202
+    requests = [call.args[0] for call in app.state.database.enqueue.await_args_list]
+    assert [(message.role, message.text) for message in requests[0].messages] == [("assistant", "")]
+    assert requests[1].messages[0].text == "x" * 1_000_000
 
 
 @pytest.mark.asyncio

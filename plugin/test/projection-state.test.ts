@@ -1,4 +1,10 @@
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import {
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -26,6 +32,7 @@ describe("ProjectionStateStore", () => {
         tailStartUserMessageId: "user-10",
         summaryText: "summary",
         createdAtMessageId: "user-20",
+        lossy: true,
       },
     };
 
@@ -48,6 +55,30 @@ describe("ProjectionStateStore", () => {
     store.set("session", { contextLimit: 100 });
 
     store.delete("session");
+
+    expect(new ProjectionStateStore(path).get("session")).toBeUndefined();
+  });
+
+  it("rejects a checkpoint with an invalid lossy marker", () => {
+    const directory = mkdtempSync(join(tmpdir(), "reflection-projection-"));
+    directories.push(directory);
+    const path = join(directory, "projection");
+    mkdirSync(path, { recursive: true });
+    writeFileSync(
+      join(path, "session.json"),
+      JSON.stringify({
+        version: 1,
+        state: {
+          contextLimit: 100,
+          checkpoint: {
+            tailStartUserMessageId: "user-1",
+            summaryText: "summary",
+            createdAtMessageId: "user-2",
+            lossy: "yes",
+          },
+        },
+      }),
+    );
 
     expect(new ProjectionStateStore(path).get("session")).toBeUndefined();
   });

@@ -10,6 +10,7 @@ from reflection_service.domain import (
     ExtractionValidationError,
     PreparedSegment,
     TerminalExtractionValidationError,
+    source_fingerprint,
 )
 from reflection_service.models import SegmentCreate
 from reflection_service.worker import ExtractionWorker
@@ -27,17 +28,20 @@ def settings() -> Settings:
 
 
 def job(attempts: int) -> ClaimedJob:
+    request = SegmentCreate(
+        session_id="session",
+        start_user_message_id="start",
+        end_user_message_id="end",
+        messages=[{"role": "user", "text": "text"}],
+    )
     return ClaimedJob(
         id=1,
         segment_id=uuid4(),
         lease_id=uuid4(),
+        source_generation=1,
+        source_fingerprint=source_fingerprint(request),
         attempts=attempts,
-        request=SegmentCreate(
-            session_id="session",
-            start_user_message_id="start",
-            end_user_message_id="end",
-            messages=[{"role": "user", "text": "text"}],
-        ),
+        request=request,
     )
 
 

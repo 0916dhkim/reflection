@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -12,6 +13,9 @@ import {
 } from "./projection.js";
 import { ProjectionStateStore } from "./projection-state.js";
 import {
+  PROJECTION_LOSS_WARNING,
+  PROJECTION_LOSS_WARNING_METADATA,
+  isNormalUserMessage,
   readSegmentMessages,
   segmentMessages,
   type OpenCodeMessage,
@@ -28,7 +32,10 @@ const PROJECTION_STATE_PATH = join(
 );
 const INACTIVE_MS = 10 * 60 * 1000;
 const PROJECTION_REQUEST_TIMEOUT_MS = 5_000;
+const TARGET_POST_TIMEOUT_MS = 5_000;
+const TARGET_WAIT_TIMEOUT_MS = 5_000;
 const PROJECTION_VERSION = 1;
+const DEFAULT_OUTPUT_TOKEN_MAX = 32_000;
 
 interface ReflectionConfig {
   url: string;
@@ -63,6 +70,63 @@ interface ModelLimits {
   contextLimit: number;
   inputLimit?: number;
   outputLimit?: number;
+}
+
+interface TargetUpdateState {
+  tail: Promise<void>;
+  failure?: Error;
+  failedSegmentKey?: string;
+}
+
+interface IdlePassState {
+  promise: Promise<void>;
+  dirty: boolean;
+}
+
+interface IngestionResult {
+  messages: OpenCodeMessage[] | null;
+  fresh: boolean;
+  successfulSegmentKeys: string[];
+  observedSegmentKeys?: string[];
+}
+
+interface PendingProjectionWarning {
+  checkpointKey: string;
+  agent: string;
+  variant?: string;
+  model: {
+    providerID: string;
+    modelID: string;
+  };
+}
+
+interface RuntimePromptBody {
+  agent: string;
+  model: {
+    providerID: string;
+    modelID: string;
+  };
+  variant?: string;
+  noReply: true;
+  parts: [
+    {
+      type: "text";
+      text: string;
+      synthetic: false;
+      ignored: false;
+      metadata: typeof PROJECTION_LOSS_WARNING_METADATA;
+    },
+  ];
+}
+
+class SegmentSubmissionError extends Error {
+  constructor(
+    message: string,
+    readonly segmentKey: string,
+  ) {
+    super(message);
+    this.name = "SegmentSubmissionError";
+  }
 }
 
 function loadConfig(): ReflectionConfig | null {
@@ -226,6 +290,14 @@ export const Reflection: Plugin = async ({ client, directory }) => {
   const modelLimits = new Map<string, ModelLimits>();
   const compactingSessions = new Map<string, number>();
   const sessionGenerations = new Map<string, number>();
+  const targetUpdates = new Map<string, TargetUpdateState>();
+  const targetRevisions = new Map<string, number>();
+  const targetUpdateAborts = new Map<string, Set<AbortController>>();
+  const idlePasses = new Map<string, IdlePassState>();
+  const successfulSegmentFingerprints = new Map<string, Map<string, string>>();
+  const deletedSessions = new Set<string>();
+  const pendingProjectionWarnings = new Map<string, PendingProjectionWarning>();
+  const projectionWarningsInFlight = new Map<string, Promise<void>>();
   const log = async (message: string) => {
     try {
       await client.app.log({
@@ -242,25 +314,212 @@ export const Reflection: Plugin = async ({ client, directory }) => {
     const response = await client.session.messages({
       path: { id: sessionId },
       query: { directory },
+      throwOnError: true,
     });
-    return (response.data ?? []) as OpenCodeMessage[];
+    if (!Array.isArray(response.data)) {
+      throw new Error(`Reflection could not load messages for ${sessionId}`);
+    }
+    return response.data as OpenCodeMessage[];
   };
 
-  const submitSession = async (sessionId: string, includeTail: boolean) => {
-    const segments = segmentMessages(await getSessionMessages(sessionId));
+  const serializeTargetUpdate = (
+    sessionId: string,
+    operation: () => Promise<IngestionResult>,
+  ): Promise<IngestionResult> => {
+    targetRevisions.set(sessionId, (targetRevisions.get(sessionId) ?? 0) + 1);
+    const state = targetUpdates.get(sessionId) ?? {
+      tail: Promise.resolve(),
+    };
+    const current = state.tail.then(operation);
+    const settled = current.then(
+      (result) => {
+        const failedBoundaryRemoved =
+          state.failedSegmentKey !== undefined &&
+          result.observedSegmentKeys !== undefined &&
+          !result.observedSegmentKeys.includes(state.failedSegmentKey);
+        const failedBoundarySucceeded =
+          state.failedSegmentKey !== undefined &&
+          result.successfulSegmentKeys.includes(state.failedSegmentKey);
+        if (
+          failedBoundaryRemoved ||
+          failedBoundarySucceeded ||
+          (state.failedSegmentKey === undefined && result.fresh)
+        ) {
+          state.failure = undefined;
+          state.failedSegmentKey = undefined;
+        }
+      },
+      (error: unknown) => {
+        state.failure =
+          error instanceof Error ? error : new Error(String(error));
+        if (error instanceof SegmentSubmissionError) {
+          state.failedSegmentKey = error.segmentKey;
+        }
+      },
+    );
+    state.tail = settled;
+    targetUpdates.set(sessionId, state);
+    void settled.then(() => {
+      if (
+        !state.failure &&
+        targetUpdates.get(sessionId) === state &&
+        state.tail === settled
+      ) {
+        targetUpdates.delete(sessionId);
+      }
+    });
+    return current;
+  };
+
+  const submitSegments = async (
+    sessionId: string,
+    segments: readonly ReflectionSegment[],
+    includeOpenSegment: boolean,
+    signal: AbortSignal,
+  ): Promise<string[]> => {
+    const fingerprints =
+      successfulSegmentFingerprints.get(sessionId) ?? new Map<string, string>();
+    successfulSegmentFingerprints.set(sessionId, fingerprints);
+    const successful: string[] = [];
     for (const segment of segments) {
-      if (!segment.closed && !includeTail) continue;
-      const response = await apiCall("/v1/segments", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(submissionBody(sessionId, segment)),
-      });
+      if (!segment.closed && !includeOpenSegment) continue;
+      const body = submissionBody(sessionId, segment);
+      const fingerprint = createHash("sha256")
+        .update(JSON.stringify(body))
+        .digest("hex");
+      const segmentKey = segment.startUserMessageId;
+      if (fingerprints.get(segmentKey) === fingerprint) {
+        successful.push(segmentKey);
+        continue;
+      }
+      const response = await apiCall(
+        "/v1/segments",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+          signal,
+        },
+        TARGET_POST_TIMEOUT_MS,
+      );
       if (!response.ok) {
-        await log(
-          formatApiFailure(`segment submission for ${sessionId}`, response),
+        const failure = formatApiFailure(
+          `segment submission for ${sessionId}`,
+          response,
+        );
+        await log(failure);
+        if (!segment.closed) continue;
+        throw new SegmentSubmissionError(failure, segmentKey);
+      }
+      fingerprints.set(segmentKey, fingerprint);
+      successful.push(segmentKey);
+    }
+    return successful;
+  };
+
+  const waitWithin = async (promise: Promise<void>, timeoutMs: number) => {
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        promise,
+        new Promise<never>((_resolve, reject) => {
+          timeout = setTimeout(
+            () =>
+              reject(
+                new Error(`target updates timed out after ${timeoutMs}ms`),
+              ),
+            timeoutMs,
+          );
+        }),
+      ]);
+    } finally {
+      if (timeout) clearTimeout(timeout);
+    }
+  };
+
+  const waitForTargetUpdates = async (
+    sessionId: string,
+    deadline = Date.now() + TARGET_WAIT_TIMEOUT_MS,
+  ): Promise<void> => {
+    while (true) {
+      const state = targetUpdates.get(sessionId);
+      const idle = idlePasses.get(sessionId);
+      const dirtyIdle = idle?.dirty ? idle.promise : undefined;
+      if (!state && !dirtyIdle) return;
+      const observed = state?.tail;
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) {
+        throw new Error(
+          `target updates timed out after ${TARGET_WAIT_TIMEOUT_MS}ms`,
         );
       }
+      await waitWithin(
+        Promise.all([observed, dirtyIdle].filter(Boolean)).then(() => {}),
+        remaining,
+      );
+      if (state?.failure) throw state.failure;
+      if (dirtyIdle) continue;
+      if (
+        state &&
+        targetUpdates.get(sessionId) === state &&
+        observed === state.tail
+      ) {
+        return;
+      }
     }
+  };
+
+  const insertPendingProjectionWarning = (sessionId: string): Promise<void> => {
+    const pending = pendingProjectionWarnings.get(sessionId);
+    if (!pending) return Promise.resolve();
+    const existing = projectionWarningsInFlight.get(sessionId);
+    if (existing) return existing;
+
+    let insertion: Promise<void>;
+    insertion = (async () => {
+      try {
+        const body: RuntimePromptBody = {
+          agent: pending.agent,
+          model: pending.model,
+          ...(pending.variant === undefined
+            ? {}
+            : { variant: pending.variant }),
+          noReply: true,
+          parts: [
+            {
+              type: "text",
+              text: PROJECTION_LOSS_WARNING,
+              synthetic: false,
+              ignored: false,
+              metadata: {
+                reflection: {
+                  ...PROJECTION_LOSS_WARNING_METADATA.reflection,
+                },
+              },
+            },
+          ],
+        };
+        const response = await client.session.prompt({
+          path: { id: sessionId },
+          query: { directory },
+          body,
+          throwOnError: true,
+        });
+        if (
+          response.data !== undefined &&
+          !("error" in response) &&
+          pendingProjectionWarnings.get(sessionId) === pending
+        ) {
+          pendingProjectionWarnings.delete(sessionId);
+        }
+      } catch {}
+    })().finally(() => {
+      if (projectionWarningsInFlight.get(sessionId) === insertion) {
+        projectionWarningsInFlight.delete(sessionId);
+      }
+    });
+    projectionWarningsInFlight.set(sessionId, insertion);
+    return insertion;
   };
 
   const getModelLimits = async (
@@ -277,10 +536,18 @@ export const Reflection: Plugin = async ({ client, directory }) => {
     if (!limit?.context || !Number.isFinite(limit.context)) {
       throw new Error(`Reflection could not resolve context limit for ${key}`);
     }
+    const configuredOutputTokenMax = Number(
+      process.env.OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX,
+    );
+    const outputTokenMax =
+      Number.isInteger(configuredOutputTokenMax) && configuredOutputTokenMax > 0
+        ? configuredOutputTokenMax
+        : DEFAULT_OUTPUT_TOKEN_MAX;
     const result = {
       contextLimit: limit.context,
       inputLimit: limit.input,
-      outputLimit: limit.output,
+      outputLimit:
+        Math.min(limit.output ?? 0, outputTokenMax) || outputTokenMax,
     };
     modelLimits.set(key, result);
     return result;
@@ -304,6 +571,209 @@ export const Reflection: Plugin = async ({ client, directory }) => {
     return summaries;
   };
 
+  const getFreshSegmentSummaries = async (
+    sessionId: string,
+  ): Promise<StoredSegmentSummary[]> => {
+    const deadline = Date.now() + TARGET_WAIT_TIMEOUT_MS;
+    while (true) {
+      await waitForTargetUpdates(sessionId, deadline);
+      const revision = targetRevisions.get(sessionId) ?? 0;
+      const summaries = await getSegmentSummaries(sessionId);
+      await waitForTargetUpdates(sessionId, deadline);
+      if ((targetRevisions.get(sessionId) ?? 0) === revision) return summaries;
+      if (Date.now() >= deadline) {
+        throw new Error(
+          `target updates timed out after ${TARGET_WAIT_TIMEOUT_MS}ms`,
+        );
+      }
+    }
+  };
+
+  const isSessionIdle = async (sessionId: string): Promise<boolean> => {
+    const response = await client.session.status({
+      query: { directory },
+      throwOnError: true,
+    });
+    const statuses = response.data as
+      | Record<string, { type?: string }>
+      | undefined;
+    const status = statuses?.[sessionId];
+    return status === undefined || status.type === "idle";
+  };
+
+  const captureIdleMessages = async (
+    sessionId: string,
+  ): Promise<OpenCodeMessage[] | null> => {
+    if (!(await isSessionIdle(sessionId))) return null;
+    const messages = await getSessionMessages(sessionId);
+    if (!(await isSessionIdle(sessionId))) return null;
+    return messages;
+  };
+
+  const isStillInactive = async (sessionId: string): Promise<boolean> => {
+    try {
+      const response = await client.session.get({
+        path: { id: sessionId },
+        query: { directory },
+      });
+      const updated = response.data?.time.updated;
+      return typeof updated === "number" && updated < Date.now() - INACTIVE_MS;
+    } catch {
+      return false;
+    }
+  };
+
+  const submitSegmentSnapshot = async (
+    sessionId: string,
+    segments: readonly ReflectionSegment[],
+    includeOpenSegment: boolean,
+    generation: number,
+    messages: OpenCodeMessage[] | null,
+  ): Promise<IngestionResult> => {
+    if (
+      deletedSessions.has(sessionId) ||
+      (sessionGenerations.get(sessionId) ?? 0) !== generation
+    ) {
+      return { messages: null, fresh: false, successfulSegmentKeys: [] };
+    }
+    const controller = new AbortController();
+    const controllers = targetUpdateAborts.get(sessionId) ?? new Set();
+    controllers.add(controller);
+    targetUpdateAborts.set(sessionId, controllers);
+    try {
+      const successfulSegmentKeys = await submitSegments(
+        sessionId,
+        segments,
+        includeOpenSegment,
+        controller.signal,
+      );
+      if (
+        deletedSessions.has(sessionId) ||
+        (sessionGenerations.get(sessionId) ?? 0) !== generation
+      ) {
+        return { messages: null, fresh: false, successfulSegmentKeys: [] };
+      }
+      return {
+        messages,
+        fresh: successfulSegmentKeys.length > 0,
+        successfulSegmentKeys,
+        observedSegmentKeys: segments.map(
+          (segment) => segment.startUserMessageId,
+        ),
+      };
+    } finally {
+      controllers.delete(controller);
+      if (
+        controllers.size === 0 &&
+        targetUpdateAborts.get(sessionId) === controllers
+      ) {
+        targetUpdateAborts.delete(sessionId);
+      }
+    }
+  };
+
+  const enqueueClosedTargetSync = (
+    sessionId: string,
+    segments: readonly ReflectionSegment[],
+    generation: number,
+  ): Promise<IngestionResult> =>
+    serializeTargetUpdate(sessionId, () =>
+      submitSegmentSnapshot(sessionId, segments, false, generation, null),
+    );
+
+  const ingestIdleSession = async (
+    sessionId: string,
+    revalidateInactiveOpen = false,
+  ): Promise<IngestionResult> => {
+    if (deletedSessions.has(sessionId)) {
+      return { messages: null, fresh: false, successfulSegmentKeys: [] };
+    }
+    const generation = sessionGenerations.get(sessionId) ?? 0;
+    return serializeTargetUpdate(sessionId, async () => {
+      if (deletedSessions.has(sessionId)) {
+        return { messages: null, fresh: false, successfulSegmentKeys: [] };
+      }
+      if ((sessionGenerations.get(sessionId) ?? 0) !== generation) {
+        return { messages: null, fresh: false, successfulSegmentKeys: [] };
+      }
+      const messages = await captureIdleMessages(sessionId);
+      if (!messages) {
+        return { messages: null, fresh: false, successfulSegmentKeys: [] };
+      }
+      if ((sessionGenerations.get(sessionId) ?? 0) !== generation) {
+        return { messages: null, fresh: false, successfulSegmentKeys: [] };
+      }
+      const segments = segmentMessages(messages);
+      const includeOpenSegment =
+        revalidateInactiveOpen && (await isStillInactive(sessionId));
+      return submitSegmentSnapshot(
+        sessionId,
+        segments,
+        includeOpenSegment,
+        generation,
+        messages,
+      );
+    });
+  };
+
+  const finishIdle = async (sessionId: string): Promise<void> => {
+    const response = await client.session.list({ query: { directory } });
+    const cutoff = Date.now() - INACTIVE_MS;
+    for (const session of response.data ?? []) {
+      if (
+        session.id === sessionId ||
+        deletedSessions.has(session.id) ||
+        session.time.updated >= cutoff
+      ) {
+        continue;
+      }
+      await ingestIdleSession(session.id, true);
+    }
+  };
+
+  const runIdle = (sessionId: string): Promise<void> => {
+    if (deletedSessions.has(sessionId)) return Promise.resolve();
+    const existing = idlePasses.get(sessionId);
+    if (existing) {
+      existing.dirty = true;
+      return existing.promise;
+    }
+    const state: IdlePassState = {
+      promise: Promise.resolve(),
+      dirty: false,
+    };
+    state.promise = (async () => {
+      let shouldFinish = false;
+      do {
+        state.dirty = false;
+        try {
+          const result = await ingestIdleSession(sessionId);
+          shouldFinish ||= result.messages !== null;
+        } catch (error) {
+          await log(`idle ingestion failed: ${String(error)}`);
+        }
+        if (state.dirty) continue;
+        if (shouldFinish) {
+          shouldFinish = false;
+          try {
+            await finishIdle(sessionId);
+          } catch (error) {
+            await log(`idle hook failed: ${String(error)}`);
+          }
+        }
+      } while (state.dirty && !deletedSessions.has(sessionId));
+      if (idlePasses.get(sessionId) === state) idlePasses.delete(sessionId);
+    })()
+      .catch(async (error) => {
+        await log(`idle hook failed: ${String(error)}`);
+      })
+      .finally(() => {
+        if (idlePasses.get(sessionId) === state) idlePasses.delete(sessionId);
+      });
+    idlePasses.set(sessionId, state);
+    return state.promise;
+  };
+
   return {
     config: async (config) => {
       if (!projectionEnabled) return;
@@ -316,11 +786,24 @@ export const Reflection: Plugin = async ({ client, directory }) => {
     event: async ({ event }) => {
       if (event.type === "session.deleted") {
         const sessionId = event.properties.info.id;
+        deletedSessions.add(sessionId);
         sessionGenerations.set(
           sessionId,
           (sessionGenerations.get(sessionId) ?? 0) + 1,
         );
         compactingSessions.delete(sessionId);
+        for (const controller of targetUpdateAborts.get(sessionId) ?? []) {
+          controller.abort(
+            new Error(`Reflection session ${sessionId} was deleted`),
+          );
+        }
+        targetUpdateAborts.delete(sessionId);
+        targetUpdates.delete(sessionId);
+        targetRevisions.delete(sessionId);
+        idlePasses.delete(sessionId);
+        successfulSegmentFingerprints.delete(sessionId);
+        pendingProjectionWarnings.delete(sessionId);
+        projectionWarningsInFlight.delete(sessionId);
         projectionState.delete(sessionId);
         return;
       }
@@ -332,20 +815,8 @@ export const Reflection: Plugin = async ({ client, directory }) => {
             ? event.properties.sessionID
             : null;
       if (!sessionId) return;
-
-      try {
-        await submitSession(sessionId, false);
-
-        const response = await client.session.list({ query: { directory } });
-        const cutoff = Date.now() - INACTIVE_MS;
-        for (const session of response.data ?? []) {
-          if (session.id === sessionId || session.time.updated > cutoff)
-            continue;
-          await submitSession(session.id, true);
-        }
-      } catch (error) {
-        await log(`idle ingestion failed: ${String(error)}`);
-      }
+      await insertPendingProjectionWarning(sessionId);
+      await runIdle(sessionId);
     },
 
     "experimental.session.compacting": async ({ sessionID }) => {
@@ -363,6 +834,12 @@ export const Reflection: Plugin = async ({ client, directory }) => {
           "Reflection context projection could not identify the active session model",
         );
       }
+      const activeUser = [...messages].reverse().find(isNormalUserMessage);
+      if (deletedSessions.has(model.sessionId)) {
+        throw new Error(
+          `Reflection session ${model.sessionId} was deleted before context projection`,
+        );
+      }
       const compactionDeadline = compactingSessions.get(model.sessionId);
       if (compactionDeadline !== undefined) {
         compactingSessions.delete(model.sessionId);
@@ -376,9 +853,22 @@ export const Reflection: Plugin = async ({ client, directory }) => {
           messages,
           ...limits,
           previous,
-          loadSummaries: () => getSegmentSummaries(model.sessionId),
+          loadSummaries: () => {
+            const sync = enqueueClosedTargetSync(
+              model.sessionId,
+              segmentMessages(messages),
+              generation,
+            );
+            void sync.catch((error: unknown) =>
+              log(`projection target sync failed: ${String(error)}`),
+            );
+            return getFreshSegmentSummaries(model.sessionId);
+          },
         });
-        if ((sessionGenerations.get(model.sessionId) ?? 0) !== generation) {
+        if (
+          deletedSessions.has(model.sessionId) ||
+          (sessionGenerations.get(model.sessionId) ?? 0) !== generation
+        ) {
           throw new Error(
             `Reflection session ${model.sessionId} was deleted during context projection`,
           );
@@ -392,12 +882,45 @@ export const Reflection: Plugin = async ({ client, directory }) => {
           ...(result.messages as typeof output.messages),
         );
         if (result.reset) {
+          if (result.diagnostic?.lossy) {
+            const agent = activeUser?.info.agent;
+            const variant = activeUser?.info.model?.variant;
+            const checkpoint = result.state.checkpoint;
+            if (typeof agent === "string" && checkpoint) {
+              const checkpointKey = `${checkpoint.tailStartUserMessageId}:${checkpoint.createdAtMessageId}`;
+              if (
+                pendingProjectionWarnings.get(model.sessionId)
+                  ?.checkpointKey !== checkpointKey
+              ) {
+                pendingProjectionWarnings.set(model.sessionId, {
+                  checkpointKey,
+                  agent,
+                  ...(typeof variant === "string" ? { variant } : {}),
+                  model: {
+                    providerID: model.providerId,
+                    modelID: model.modelId,
+                  },
+                });
+              }
+            } else {
+              await log(
+                `projection warning not queued for ${model.sessionId}: active agent unavailable`,
+              );
+            }
+          }
           try {
             await client.app.log({
               body: {
                 service: "reflection",
                 level: "info",
-                message: `context projection reset ${model.sessionId} at ${result.state.checkpoint?.tailStartUserMessageId}; estimated ${result.estimatedTokens}/${limits.contextLimit} tokens`,
+                message: "context projection reset",
+                extra: {
+                  ...result.diagnostic,
+                  estimatedTokens: result.estimatedTokens,
+                  thresholdTokens: result.thresholdTokens,
+                  hardLimitTokens: result.hardLimitTokens,
+                  contextLimit: limits.contextLimit,
+                },
               },
             });
           } catch {}
