@@ -46,7 +46,7 @@ For each job the worker:
    and claims, marks the leased job successful, and clears its source payload. No extraction data is
    written if a network call or model/schema validation fails.
 
-Extraction and source-aware claim triage/entity resolution use GPT-5.6 Luna through OpenRouter's Azure
+Extraction and source-aware claim triage/entity resolution use GPT-5.6 Luna through OpenRouter's OpenAI
 route at medium reasoning with native strict JSON Schema. The extraction wire format uses one tagged
 object field rather than an ambiguous pair of nullable fields, and Reflection rejects copied source
 identifiers that do not exactly occur in the segment. The route disables fallbacks, and Reflection
@@ -163,7 +163,7 @@ and `WORKER_RETRY_BACKOFF_SECONDS` defaults to `2`.
 
 Provider pinning is incompatible with OpenRouter's zero-data-retention filter when a selected endpoint does
 not satisfy that policy. Voyage retention is also controlled at the organization/account level. Operators
-should review Azure and Voyage retention settings before sending sensitive transcripts.
+should review OpenAI and Voyage retention settings before sending sensitive transcripts.
 
 ## Run
 

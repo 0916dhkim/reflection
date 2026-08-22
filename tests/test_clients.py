@@ -96,11 +96,11 @@ async def test_extraction_call_uses_strict_schema_provider_and_all_prior_summari
     user_payload = json.loads(captured["messages"][2]["content"])
     schema = captured["response_format"]["json_schema"]["schema"]
     assert captured["model"] == "openai/gpt-5.6-luna"
-    assert captured["max_completion_tokens"] == 16_384
-    assert "max_tokens" not in captured
+    assert captured["max_tokens"] == 16_384
+    assert "max_completion_tokens" not in captured
     assert captured["reasoning"] == {"effort": "medium"}
     assert captured["provider"] == {
-        "order": ["azure"],
+        "order": ["openai"],
         "allow_fallbacks": False,
         "require_parameters": True,
     }
@@ -140,6 +140,37 @@ async def test_extraction_call_uses_strict_schema_provider_and_all_prior_summari
     assert result.summary == "A short summary"
     assert result.claims[0].object_entity == "PostgreSQL"
     assert result.claims[0].object_value is None
+
+
+@pytest.mark.asyncio
+async def test_azure_route_uses_azure_token_limit_parameter() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.update(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {"message": {"content": json.dumps({"summary": "Summary", "claims": []})}}
+                ]
+            },
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        await ModelClient(client, settings(extraction_provider="azure")).extract(
+            SegmentCreate(
+                session_id="session",
+                start_user_message_id="start",
+                end_user_message_id="end",
+                messages=[{"role": "user", "text": "source"}],
+            ),
+            [],
+        )
+
+    assert captured["max_completion_tokens"] == 16_384
+    assert "max_tokens" not in captured
+    assert captured["provider"]["order"] == ["azure"]
 
 
 @pytest.mark.asyncio
@@ -219,11 +250,11 @@ async def test_resolution_receives_occurrence_context_summary_and_descriptions()
     user_payload = json.loads(captured["messages"][2]["content"])
     candidate = user_payload["mentions"][0]["candidates"][0]
     assert captured["model"] == "openai/gpt-5.6-luna"
-    assert captured["max_completion_tokens"] == 32_768
-    assert "max_tokens" not in captured
+    assert captured["max_tokens"] == 32_768
+    assert "max_completion_tokens" not in captured
     assert captured["reasoning"] == {"effort": "medium"}
     assert captured["provider"] == {
-        "order": ["azure"],
+        "order": ["openai"],
         "allow_fallbacks": False,
         "require_parameters": True,
     }
@@ -345,7 +376,7 @@ def test_copied_source_tokens_find_only_unambiguous_identifiers() -> None:
 
 
 def test_settings_reject_partial_legacy_model_overrides() -> None:
-    with pytest.raises(ValueError, match="extraction_provider='azure'"):
+    with pytest.raises(ValueError, match="extraction_provider='openai'"):
         settings(extraction_model="deepseek/deepseek-v4-flash-0731")
 
     with pytest.raises(ValueError, match="structured-output support"):
@@ -354,7 +385,7 @@ def test_settings_reject_partial_legacy_model_overrides() -> None:
             extraction_provider="deepseek",
         )
 
-    with pytest.raises(ValueError, match="resolution_provider='azure'"):
+    with pytest.raises(ValueError, match="resolution_provider='openai'"):
         settings(resolution_model="deepseek/deepseek-v4-pro-0813")
 
     with pytest.raises(ValueError, match="structured-output support"):

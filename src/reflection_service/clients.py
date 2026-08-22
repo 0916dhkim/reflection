@@ -469,7 +469,7 @@ class ModelClient:
                         "model": model,
                         **(
                             {"max_completion_tokens": max_tokens}
-                            if model.startswith("openai/")
+                            if model.startswith("openai/") and provider.startswith("azure")
                             else {"max_tokens": max_tokens}
                         ),
                         **({} if model.startswith("openai/") else {"temperature": 0}),

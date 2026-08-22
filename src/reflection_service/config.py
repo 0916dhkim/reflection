@@ -16,11 +16,11 @@ class Settings(BaseSettings):
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
     voyage_base_url: str = "https://api.voyageai.com/v1"
     extraction_model: str = "openai/gpt-5.6-luna"
-    extraction_provider: str = "azure"
+    extraction_provider: str = "openai"
     extraction_reasoning_effort: Literal["none", "low", "medium", "high", "xhigh"] = "medium"
     extraction_native_schema: bool = True
     resolution_model: str = "openai/gpt-5.6-luna"
-    resolution_provider: str = "azure"
+    resolution_provider: str = "openai"
     resolution_reasoning_effort: Literal["none", "low", "medium", "high", "xhigh"] = "medium"
     resolution_native_schema: bool = True
     embedding_model: str = "voyage-4-large"
@@ -88,9 +88,9 @@ class Settings(BaseSettings):
             ),
         )
         for name, model, provider, native_schema in profiles:
-            if model.startswith("deepseek/") and provider == "azure":
+            if model.startswith("deepseek/") and provider in {"azure", "openai"}:
                 raise ValueError(
-                    f"{name}_model={model!r} is incompatible with {name}_provider='azure'"
+                    f"{name}_model={model!r} is incompatible with {name}_provider={provider!r}"
                 )
             if provider == "deepseek" and not model.startswith("deepseek/"):
                 raise ValueError(
