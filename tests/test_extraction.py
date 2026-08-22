@@ -58,11 +58,14 @@ class FakeModels:
 
     async def resolve(
         self,
+        request: SegmentCreate,
         summary: str,
         claims: Sequence[ExtractedClaim],
         contexts: tuple[MentionContext, ...],
     ) -> ResolutionResult:
         assert summary == "Contextual summary"
+        assert self.request is not None
+        assert request == self.request
         self.contexts = contexts
         canonical = {
             "c0.subject": "Alex One",
@@ -74,6 +77,7 @@ class FakeModels:
                 {
                     "claim_id": f"c{index}",
                     "action": "keep",
+                    "reason": "supported",
                 }
                 for index, _claim in enumerate(claims)
             ],
@@ -123,6 +127,7 @@ class TriagingModels(FakeModels):
 
     async def resolve(
         self,
+        _request: SegmentCreate,
         summary: str,
         claims: Sequence[ExtractedClaim],
         contexts: tuple[MentionContext, ...],
@@ -135,14 +140,17 @@ class TriagingModels(FakeModels):
                 {
                     "claim_id": "c0",
                     "action": "drop",
+                    "reason": "unsupported",
                 },
                 {
                     "claim_id": "c1",
                     "action": "drop",
+                    "reason": "transient",
                 },
                 {
                     "claim_id": "c2",
                     "action": "keep",
+                    "reason": "supported",
                 },
             ],
             resolutions=[
@@ -207,9 +215,9 @@ async def test_prepare_resolves_occurrences_but_not_literals_with_claim_context(
     assert prepared.claims[1].object_value == "30 years"
     assert prepared.claims[0].subject_entity_id != prepared.claims[1].subject_entity_id
     assert {entity.description for entity in prepared.entities} == {
-        "Description for Alex One",
-        "Description for Alex Two",
-        "Description for Jordan",
+        "Entity named Alex One.",
+        "Entity named Alex Two.",
+        "Entity named Jordan.",
     }
 
 

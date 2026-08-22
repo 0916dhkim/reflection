@@ -21,7 +21,10 @@ from reflection_service.domain import (
 from reflection_service.models import (
     ClaimDecision,
     ExtractedClaim,
+    ExtractionObjectKind,
     ExtractionResult,
+    ExtractionWireClaim,
+    ExtractionWireResult,
     Resolution,
     ResolutionResult,
     SegmentCreate,
@@ -142,6 +145,7 @@ def test_claim_triage_keeps_original_claim_unchanged() -> None:
             ClaimDecision(
                 claim_id="c0",
                 action="keep",
+                reason="supported",
             )
         ],
         resolutions=[],
@@ -151,6 +155,30 @@ def test_claim_triage_keeps_original_claim_unchanged() -> None:
 
     assert kept == [(0, proposed[0])]
     assert kept[0][1].confidence == 0.7
+
+
+def test_claim_triage_requires_reason_matching_action() -> None:
+    with pytest.raises(ValueError, match="does not match"):
+        ClaimDecision(claim_id="c0", action="keep", reason="unstable_scope")
+
+    with pytest.raises(ValueError, match="does not match"):
+        ClaimDecision(claim_id="c0", action="drop", reason="supported")
+
+    proposed = [
+        ExtractedClaim(
+            subject="Reflection report",
+            predicate="reported",
+            confidence=0.8,
+            object_entity=None,
+            object_value="finding",
+        )
+    ]
+    result = ResolutionResult(
+        claims=[ClaimDecision(claim_id="c0", action="review", reason="unstable_scope")],
+        resolutions=[],
+    )
+
+    assert validate_claim_decisions(proposed, result) == []
 
 
 def test_claim_requires_exactly_one_object_kind() -> None:
@@ -228,6 +256,71 @@ def test_extraction_normalizes_machine_style_predicates_without_dropping_claims(
     )
 
     assert [claim.predicate for claim in result.claims] == ["has storage backend"]
+
+    acronym_result = ExtractionResult.model_validate(
+        {
+            "summary": "Useful summary",
+            "claims": [
+                {
+                    "subject": "Reflection",
+                    "predicate": "usesHTTPClient",
+                    "confidence": 0.9,
+                    "object_entity": "HTTPX",
+                    "object_value": None,
+                }
+            ],
+        }
+    )
+    assert acronym_result.claims[0].predicate == "uses http client"
+
+    preserved_acronyms = ExtractionResult.model_validate(
+        {
+            "summary": "Useful summary",
+            "claims": [
+                {
+                    "subject": "Reflection audit",
+                    "predicate": predicate,
+                    "confidence": 0.9,
+                    "object_entity": None,
+                    "object_value": "true",
+                }
+                for predicate in ("covers PRs", "uses E2E tests", "uses SELinux labels")
+            ],
+        }
+    )
+    assert [claim.predicate for claim in preserved_acronyms.claims] == [
+        "covers prs",
+        "uses e2e tests",
+        "uses selinux labels",
+    ]
+
+
+def test_extraction_wire_uses_one_tagged_object_and_normalizes_predicate() -> None:
+    result = ExtractionWireResult(
+        summary="Useful summary",
+        claims=[
+            ExtractionWireClaim(
+                subject="Reflection",
+                predicate="has_storageBackend",
+                confidence=0.9,
+                object_kind=ExtractionObjectKind.ENTITY,
+                object_text="PostgreSQL",
+            ),
+            ExtractionWireClaim(
+                subject="Reflection",
+                predicate="has timeout",
+                confidence=0.8,
+                object_kind=ExtractionObjectKind.LITERAL,
+                object_text="120 seconds",
+            ),
+        ],
+    ).to_extraction_result()
+
+    assert result.claims[0].predicate == "has storage backend"
+    assert result.claims[0].object_entity == "PostgreSQL"
+    assert result.claims[0].object_value is None
+    assert result.claims[1].object_entity is None
+    assert result.claims[1].object_value == "120 seconds"
 
 
 def test_literal_and_entity_equivalence_keys_are_distinct() -> None:

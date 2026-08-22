@@ -19,9 +19,10 @@ For each job the worker:
 
 1. Loads every prior stored summary for the session, without an application-level cap, while excluding
    the current deterministic segment so a mutable tail does not use its own old snapshot as context.
-2. Calls the configured OpenRouter-compatible extraction model with low reasoning. The strict result is
-   a summary of at most 1000 characters and claims with a confidence from 0 to 1, an entity subject, and
-   exactly one entity object or literal value. Source grounding is a model instruction and best-effort
+2. Calls the configured OpenRouter-compatible extraction model with its configured reasoning effort. The
+   strict wire result is a summary of at most 1000 characters and claims with a confidence from 0 to 1,
+   an entity subject, and one tagged entity object or literal value. Source grounding is a model
+   instruction and best-effort
    property, not a separately validated guarantee. Extraction favors the most specific independently
    referable subject, keeps named plans/products/projects/policies as entities, emits short natural-language
    predicates rather than snake case, and preserves units and qualifiers in literal values.
@@ -29,12 +30,12 @@ For each job the worker:
    occurrence together with its supporting claim and segment summary using Voyage `voyage-4-large` at
    1024 dimensions, then retrieves the union of at most five indexable pg_trgm name/alias candidates and
    five vector candidates. Literal values do not enter entity resolution.
-4. Calls the configured OpenRouter-compatible resolution model once with all proposed claims,
-   occurrences, candidate names and descriptions, and the segment summary using high reasoning. The model
-   keeps or drops every proposed claim before resolving entities. Kept claims are stored unchanged;
-   session-only claims and context-dependent claims that were not already stated against a stable named
-   context are dropped. This prevents PR- or rollout-specific dependencies from becoming universal graph
-   edges.
+4. Calls the configured OpenRouter-compatible resolution model once with the source messages, all proposed
+   claims, occurrences, candidate names and descriptions, and the segment summary. The model keeps, drops,
+   or marks every proposed claim for non-persisted review before resolving entities. Kept claims are stored
+   unchanged; session-only claims and context-dependent claims that were not already stated against a stable
+   named context are dropped. This prevents PR- or rollout-specific dependencies from becoming universal
+   graph edges.
    Identical text occurrences can resolve differently and different real entities receive distinguishable
    canonical names. Newly proposed identical canonical names coalesce to the same deterministic entity UUID
    within the segment.
@@ -45,9 +46,11 @@ For each job the worker:
    and claims, marks the leased job successful, and clears its source payload. No extraction data is
    written if a network call or model/schema validation fails.
 
-Model requests are pinned to OpenRouter's official `deepseek` provider with fallbacks disabled. Reflection
-places the complete schema in a system message, requests one JSON object, and validates every property
-locally. Network, model, schema, and
+Extraction and source-aware claim triage/entity resolution use GPT-5.6 Luna through OpenRouter's Azure
+route at medium reasoning with native strict JSON Schema. The extraction wire format uses one tagged
+object field rather than an ambiguous pair of nullable fields, and Reflection rejects copied source
+identifiers that do not exactly occur in the segment. The route disables fallbacks, and Reflection
+validates every property locally. Network, model, schema, and
 entity-resolution validation failures all retry up to three attempts with a short configurable backoff
 because another model call may succeed. An invalid persisted job payload is terminal at claim time, and a
 generated embedding input over 30,000 UTF-8 bytes is terminal because retrying cannot reduce it. A delayed
@@ -149,17 +152,18 @@ Required variables:
 | `OPENROUTER_API_KEY` | bearer key for structured model calls |
 | `VOYAGE_API_KEY` | bearer key for direct Voyage embedding calls |
 
-The model and upstream URL variables shown in `.env.example` are optional. The service validates that
-the embedding dimension remains 1024 and that the connection pool has at least two connections because
+The model route, reasoning, schema-mode, and upstream URL variables shown in `.env.example` are optional.
+Model/provider combinations are validated together at startup; when overriding a model, review and set its
+provider and schema mode as one route profile. The service validates that the embedding dimension remains
+1024 and that the connection pool has at least two connections because
 the elected worker holds one connection for its advisory lock. `WORKER_MAX_ATTEMPTS` defaults to `3`,
 and `WORKER_RETRY_BACKOFF_SECONDS` defaults to `2`.
 
 ### Data retention prerequisite
 
-Provider pinning is incompatible with OpenRouter's zero-data-retention filter because the official
-DeepSeek endpoint is categorized as allowing paid-model training. Voyage retention is also controlled at
-the organization/account level. Operators should review both providers' retention settings before sending
-sensitive transcripts.
+Provider pinning is incompatible with OpenRouter's zero-data-retention filter when a selected endpoint does
+not satisfy that policy. Voyage retention is also controlled at the organization/account level. Operators
+should review Azure and Voyage retention settings before sending sensitive transcripts.
 
 ## Run
 

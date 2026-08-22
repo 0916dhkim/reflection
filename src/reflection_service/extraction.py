@@ -76,7 +76,7 @@ class ExtractionEngine:
         )
         if contexts:
             resolution_result = await self._models.resolve(
-                extracted.summary, extracted.claims, contexts
+                job.request, extracted.summary, extracted.claims, contexts
             )
             triaged_claims = validate_claim_decisions(extracted.claims, resolution_result)
             kept_context_ids = {f"c{index}.subject" for index, _ in triaged_claims}
@@ -106,21 +106,31 @@ class ExtractionEngine:
             _, resolution = validated[context.mention_id]
             candidate = self._selected_candidate(context, resolution)
             if candidate is None:
-                entity_id = new_entity_id_for(job.segment_id, resolution.canonical_name)
-                canonical_name = resolution.canonical_name
-                description = resolution.description
+                if context.candidates:
+                    canonical_name = resolution.canonical_name
+                    description = resolution.description
+                    aliases = self._unique_aliases(
+                        canonical_name,
+                        context.text,
+                        *resolution.aliases,
+                    )
+                else:
+                    canonical_name = resolution.canonical_name
+                    description = f"Entity named {canonical_name}."
+                    aliases = self._unique_aliases(canonical_name, context.text)
+                entity_id = new_entity_id_for(job.segment_id, canonical_name)
                 is_new = True
             else:
                 entity_id = candidate.id
                 canonical_name = candidate.canonical_name
                 description = candidate.description
+                aliases = self._unique_aliases(
+                    canonical_name,
+                    context.text,
+                    *resolution.aliases,
+                    *candidate.aliases,
+                )
                 is_new = False
-            aliases = self._unique_aliases(
-                canonical_name,
-                context.text,
-                *resolution.aliases,
-                *(candidate.aliases if candidate else ()),
-            )
             previous = entities_by_id.get(entity_id)
             if previous is not None:
                 entity = replace(
