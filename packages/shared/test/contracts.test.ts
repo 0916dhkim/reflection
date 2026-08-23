@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 
 import {
   ContractValidationError,
+  MAX_MESSAGE_TEXT_CHARS,
+  codePointLength,
   parseExtractionResult,
   parseExtractionWireResult,
   parseJobResponse,
@@ -99,6 +101,27 @@ describe("public contracts", () => {
         ContractValidationError,
       );
     }
+  });
+
+  it("counts astral Unicode without allocating code-point arrays", () => {
+    const text = "😀".repeat(MAX_MESSAGE_TEXT_CHARS);
+    expect(codePointLength(text)).toBe(MAX_MESSAGE_TEXT_CHARS);
+    expect(
+      parseSegmentCreate({
+        session_id: "session",
+        start_user_message_id: "turn",
+        end_user_message_id: "turn",
+        messages: [{ role: "user", text }],
+      }).messages[0]?.text,
+    ).toBe(text);
+    expect(() =>
+      parseSegmentCreate({
+        session_id: "session",
+        start_user_message_id: "turn",
+        end_user_message_id: "turn",
+        messages: [{ role: "user", text: `${text}😀` }],
+      }),
+    ).toThrow(ContractValidationError);
   });
 
   it("rejects extra fields and trims search queries", () => {

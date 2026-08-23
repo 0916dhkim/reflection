@@ -189,9 +189,12 @@ class Database:
                         INSERT INTO extraction_jobs (
                             segment_id, session_id, start_user_message_id,
                             end_user_message_id, projection_version, payload, status,
-                            source_fingerprint, finished_at
+                            source_fingerprint, finished_at, error
                         )
-                        VALUES (%s, %s, %s, %s, %s, NULL, 'succeeded', %s, now())
+                        VALUES (
+                            %s, %s, %s, %s, %s, NULL, 'superseded', %s, now(),
+                            'snapshot was superseded'
+                        )
                         RETURNING id
                         """,
                         (
@@ -374,11 +377,19 @@ class Database:
                 ),
             )
             superseded_ids = [
-                item["id"] for item in jobs if item["id"] != job_id and item["status"] == "pending"
+                item["id"]
+                for item in jobs
+                if item["id"] != job_id and item["status"] in {"pending", "failed"}
             ]
             if superseded_ids:
                 await connection.execute(
-                    "DELETE FROM extraction_jobs WHERE id = ANY(%s)",
+                    """
+                    UPDATE extraction_jobs
+                    SET status = 'superseded', payload = NULL, lease_id = NULL,
+                        error = 'snapshot was superseded', started_at = NULL,
+                        finished_at = now()
+                    WHERE id = ANY(%s)
+                    """,
                     (superseded_ids,),
                 )
             row = await self._job_row(connection, job_id)
@@ -499,7 +510,7 @@ class Database:
                     END,
                     payload = CASE
                         WHEN classified.is_target THEN classified.target_payload
-                        ELSE jobs.payload
+                        ELSE NULL
                     END,
                     source_generation = CASE
                         WHEN classified.is_target THEN classified.target_generation
@@ -509,7 +520,10 @@ class Database:
                         WHEN classified.is_target THEN classified.target_fingerprint
                         ELSE jobs.source_fingerprint
                     END,
-                    status = CASE WHEN classified.is_target THEN 'pending' ELSE 'failed' END,
+                    status = CASE
+                        WHEN classified.is_target THEN 'pending'
+                        ELSE 'superseded'
+                    END,
                     attempts = CASE
                         WHEN classified.is_target
                          AND (
@@ -740,8 +754,9 @@ class Database:
             cursor = await connection.execute(
                 """
                 UPDATE extraction_jobs
-                SET status = 'failed', lease_id = NULL, started_at = NULL,
-                    finished_at = now(), error = 'snapshot was superseded'
+                SET status = 'superseded', lease_id = NULL, payload = NULL,
+                    started_at = NULL, finished_at = now(),
+                    error = 'snapshot was superseded'
                 WHERE id = %s AND status = 'running' AND lease_id = %s
                 """,
                 (job.id, job.lease_id),
@@ -776,8 +791,9 @@ class Database:
         cursor = await connection.execute(
             """
             UPDATE extraction_jobs
-            SET status = 'succeeded', lease_id = NULL, payload = NULL,
-                error = NULL, started_at = NULL, finished_at = now()
+            SET status = 'superseded', lease_id = NULL, payload = NULL,
+                error = 'snapshot was superseded', started_at = NULL,
+                finished_at = now()
             WHERE id = %s AND status = 'running' AND lease_id = %s
             """,
             (job.id, job.lease_id),

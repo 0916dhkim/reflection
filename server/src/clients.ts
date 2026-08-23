@@ -2,6 +2,7 @@ import { STATUS_CODES } from "node:http";
 
 import {
   ContractValidationError,
+  codePointLength,
   ExtractionWireResultSchema,
   ResolutionResultSchema,
   parseExtractionWireResult,
@@ -257,10 +258,6 @@ function asRecord(value: unknown): Record<string, unknown> | null {
   return typeof value === "object" && value !== null && !Array.isArray(value)
     ? (value as Record<string, unknown>)
     : null;
-}
-
-function codePointLength(value: string): number {
-  return [...value].length;
 }
 
 function escapeRegExp(value: string): string {

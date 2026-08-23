@@ -707,11 +707,11 @@ export class Database {
                    end_user_message_id, source_boundary_version,
                    start_source_message_id, end_source_message_id,
                    projection_version, payload, status, source_fingerprint,
-                   processing_priority, finished_at
+                   processing_priority, finished_at, error
                )
                VALUES (
-                   $1, $2, $3, $4, $5, $6, $7, $8, NULL, 'succeeded', $9,
-                   $10, now()
+                   $1, $2, $3, $4, $5, $6, $7, $8, NULL, 'superseded', $9,
+                   $10, now(), 'snapshot was superseded'
                )
                RETURNING id
               `,
@@ -967,12 +967,20 @@ export class Database {
       );
       const supersededIds = jobs
         .filter(
-          (item) => !sameBigInt(item.id, jobId) && item.status === "pending",
+          (item) =>
+            !sameBigInt(item.id, jobId) &&
+            (item.status === "pending" || item.status === "failed"),
         )
         .map((item) => item.id);
       if (supersededIds.length > 0) {
         await connection.query(
-          "DELETE FROM extraction_jobs WHERE id = ANY($1::bigint[])",
+          `
+          UPDATE extraction_jobs
+          SET status = 'superseded', payload = NULL, lease_id = NULL,
+              error = 'snapshot was superseded', started_at = NULL,
+              finished_at = now()
+          WHERE id = ANY($1::bigint[])
+          `,
           [supersededIds],
         );
       }
@@ -1049,6 +1057,11 @@ export class Database {
           [job.segment_id],
         )
       ).rows[0];
+      if (job.status === "superseded") {
+        throw new JobNotRetryableError(
+          "job cannot be retried because a newer snapshot exists for the segment",
+        );
+      }
       if (job.status !== "failed" || job.lease_id !== null) {
         throw new JobNotRetryableError(
           "only terminal failed jobs can be retried",
@@ -1177,7 +1190,7 @@ export class Database {
             END,
             payload = CASE
                 WHEN classified.is_target THEN classified.target_payload
-                ELSE jobs.payload
+                ELSE NULL
             END,
             source_generation = CASE
                 WHEN classified.is_target THEN classified.target_generation
@@ -1191,7 +1204,10 @@ export class Database {
                 WHEN classified.is_target THEN classified.target_processing_priority
                 ELSE jobs.processing_priority
             END,
-            status = CASE WHEN classified.is_target THEN 'pending' ELSE 'failed' END,
+            status = CASE
+                WHEN classified.is_target THEN 'pending'
+                ELSE 'superseded'
+            END,
             attempts = CASE
                 WHEN classified.is_target
                  AND (
@@ -1530,8 +1546,9 @@ export class Database {
       const result = await connection.query(
         `
         UPDATE extraction_jobs
-        SET status = 'failed', lease_id = NULL, started_at = NULL,
-            finished_at = now(), error = 'snapshot was superseded'
+        SET status = 'superseded', lease_id = NULL, payload = NULL,
+            started_at = NULL, finished_at = now(),
+            error = 'snapshot was superseded'
         WHERE id = $1 AND status = 'running' AND lease_id = $2
         `,
         [job.id, job.leaseId],

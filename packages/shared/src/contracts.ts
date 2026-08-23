@@ -44,7 +44,7 @@ function trimProperty(value: unknown, property: string): unknown {
   return { ...object, [property]: object[property].trim() };
 }
 
-function codePointLength(value: string): number {
+export function codePointLength(value: string): number {
   let length = 0;
   for (let index = 0; index < value.length; length += 1) {
     const codePoint = value.codePointAt(index);
@@ -95,7 +95,7 @@ function validateSourceBoundaryUsers<
 export const SourceMessageSchema = Type.Object(
   {
     role: Type.Union([Type.Literal("user"), Type.Literal("assistant")]),
-    text: Type.String({ maxLength: MAX_MESSAGE_TEXT_CHARS }),
+    text: Type.String({ maxLength: MAX_MESSAGE_TEXT_CHARS * 2 }),
   },
   { additionalProperties: false },
 );
@@ -214,6 +214,16 @@ export function parseSegmentCreate(value: unknown): SegmentCreate {
     CanonicalSegmentCreateSchema,
     normalized,
   );
+  if (
+    result.messages.some(
+      (message) => codePointLength(message.text) > MAX_MESSAGE_TEXT_CHARS,
+    )
+  ) {
+    throw new ContractValidationError("segment request", SegmentCreateSchema, {
+      ...(record(normalized) ?? {}),
+      messages: "individual message text exceeds limit",
+    });
+  }
   if (
     result.source_boundary_version === 2 &&
     result.start_user_message_id !== result.end_user_message_id

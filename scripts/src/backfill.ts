@@ -15,6 +15,7 @@ import { DatabaseSync } from "node:sqlite";
 
 import {
   parseJobResponse,
+  parseSegmentCreate,
   parseSessionSegmentsResponse,
   type JobResponse,
   type JobStatus,
@@ -616,12 +617,12 @@ export function segmentSubmission(
   ) {
     throw new Error("V2 segment is missing source cursors");
   }
-  return {
+  return parseSegmentCreate({
     ...common,
     source_boundary_version: 2,
     start_source_message_id: segment.startSourceMessageId,
     end_source_message_id: segment.endSourceMessageId,
-  };
+  });
 }
 
 export function validateSegmentManifest(

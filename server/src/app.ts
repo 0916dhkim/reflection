@@ -4,6 +4,7 @@ import swagger from "@fastify/swagger";
 import swaggerUi from "@fastify/swagger-ui";
 import {
   ContractValidationError,
+  codePointLength,
   JobResponseSchema,
   MAX_SEGMENT_TEXT_CHARS,
   SearchRequestSchema,
@@ -177,10 +178,6 @@ function loggerLevel(value: string): string {
     throw new SettingsValidationError(`invalid LOG_LEVEL: ${value}`);
   }
   return level;
-}
-
-function codePointLength(value: string): number {
-  return [...value].length;
 }
 
 function parseRequestContract<T>(

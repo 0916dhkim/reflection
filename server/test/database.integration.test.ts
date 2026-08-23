@@ -490,7 +490,10 @@ describe.sequential("Database PostgreSQL integration", () => {
         const downgradeJob = await database.enqueue(
           updateRequest(legacyRequest, { end_user_message_id: "legacy-end-2" }),
         );
-        expect(downgradeJob.status).toBe("succeeded");
+        expect(downgradeJob).toMatchObject({
+          status: "superseded",
+          error: "snapshot was superseded",
+        });
         const preserved = required(
           await database.getSegment(safeJob.segment_id),
         );
@@ -545,7 +548,19 @@ describe.sequential("Database PostgreSQL integration", () => {
           updateRequest(legacyRequest, { projection_version: 1 }),
         );
         expect(replayCurrent.status).toBe("pending");
-        expect(await database.getJob(pendingFuture.id)).toBeNull();
+        expect(await database.getJob(pendingFuture.id)).toMatchObject({
+          status: "superseded",
+          error: "snapshot was superseded",
+        });
+        const scrubbedFuture = required(
+          (
+            await database.pool.query<{ payload: unknown } & QueryResultRow>(
+              "SELECT payload FROM extraction_jobs WHERE id = $1",
+              [pendingFuture.id],
+            )
+          ).rows[0],
+        );
+        expect(scrubbedFuture.payload).toBeNull();
         const replayCurrentClaim = required(
           await withClient(database, (client) =>
             database.claimOldestJob(client),
@@ -575,7 +590,7 @@ describe.sequential("Database PostgreSQL integration", () => {
             projection_version: 0,
           }),
         );
-        expect(pendingDowngrade.status).toBe("succeeded");
+        expect(pendingDowngrade.status).toBe("superseded");
         const pendingSafeClaim = required(
           await withClient(database, (client) =>
             database.claimOldestJob(client),
@@ -791,12 +806,23 @@ describe.sequential("Database PostgreSQL integration", () => {
           ),
         ).toBe(true);
         const failedPayloads = (
-          await database.pool.query<{ payload: unknown } & QueryResultRow>(
-            "SELECT payload FROM extraction_jobs WHERE id = ANY($1::bigint[])",
+          await database.pool.query<
+            { id: string; status: string; payload: unknown } & QueryResultRow
+          >(
+            "SELECT id, status, payload FROM extraction_jobs WHERE id = ANY($1::bigint[])",
             [[oldSnapshot.id, newerSnapshot.id]],
           )
         ).rows;
-        expect(failedPayloads.every((row) => row.payload !== null)).toBe(true);
+        expect(
+          failedPayloads.find((row) => row.id === String(oldSnapshot.id)),
+        ).toMatchObject({ status: "superseded", payload: null });
+        expect(
+          failedPayloads.find((row) => row.id === String(newerSnapshot.id)),
+        ).toMatchObject({ status: "failed" });
+        expect(
+          failedPayloads.find((row) => row.id === String(newerSnapshot.id))
+            ?.payload,
+        ).not.toBeNull();
 
         const retryRequest = updateRequest(firstRequest, {
           start_user_message_id: "retry-start",

@@ -661,6 +661,14 @@ describe("strict manifest planning", () => {
     );
   });
 
+  it("rejects an unsplittable source span beyond the transport limit", () => {
+    const messages = [user("u1", "x".repeat(1_000_001))];
+
+    expect(() =>
+      planSessionSegments(SESSION_ID, messages, emptyManifest()),
+    ).toThrow(ContractValidationError);
+  });
+
   it("preserves same-user v2 siblings without a whole-turn follow-up", () => {
     const messages = [
       user("u1", "1234"),
