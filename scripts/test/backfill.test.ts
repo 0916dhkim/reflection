@@ -389,6 +389,30 @@ describe("stable session revisions", () => {
     });
   });
 
+  it("reports a stable mutable source span as deferred work", async () => {
+    const session = { id: SESSION_ID, title: "test", timeUpdated: 100 };
+    const store: SessionStore = {
+      sessions: [session],
+      sessionUpdatedAt: () => 100,
+      sessionMessages: () => [user("u1", "x".repeat(25_000))],
+    };
+
+    const summary = await createDryRunSummary(
+      [session],
+      store,
+      { request: vi.fn(async () => emptyManifest()) },
+      { nowMs: () => 1_000_000 },
+    );
+
+    expect(summary).toMatchObject({
+      stableSessions: 0,
+      deferredSessions: 1,
+      segments: 1,
+      statuses: { new: 1 },
+      dispositions: { ready: 0, deferred_mutable_source: 1 },
+    });
+  });
+
   it("reports a malformed manifest explicitly without planning through it", async () => {
     const session = { id: SESSION_ID, title: "test", timeUpdated: 100 };
     const store: SessionStore = {
@@ -453,6 +477,37 @@ describe("stable session revisions", () => {
     });
     expect(context.state.failures[0]?.error).toContain("invalid segment plan");
     expect(context.scheduleLaunchAgentCleanup).toHaveBeenCalledOnce();
+    expect(context.releaseLock).toHaveBeenCalledOnce();
+  });
+
+  it("does not complete or schedule cleanup with deferred source work", async () => {
+    const session = { id: SESSION_ID, title: "test", timeUpdated: 100 };
+    const messages = [user("u1", "x".repeat(25_000))];
+    const store: SessionStore = {
+      sessions: [session],
+      sessionUpdatedAt: () => 100,
+      sessionMessages: () => messages,
+    };
+    const service: ReflectionService = {
+      request: vi.fn(async () => emptyManifest()),
+      getJob: vi.fn(),
+      retryJob: vi.fn(),
+      waitForJob: vi.fn(),
+    };
+    const context = processingContext(service, { store });
+    const stop = new Error("stop after deferred wait");
+    context.sleep = vi.fn(async () => {
+      throw stop;
+    });
+
+    await expect(runBackfill(context)).rejects.toBe(stop);
+
+    expect(context.state).toMatchObject({
+      status: "waiting_for_session_inactivity",
+      sessionsVisited: 0,
+      deferredSessions: 1,
+    });
+    expect(context.scheduleLaunchAgentCleanup).not.toHaveBeenCalled();
     expect(context.releaseLock).toHaveBeenCalledOnce();
   });
 });
@@ -536,11 +591,17 @@ describe("strict manifest planning", () => {
     );
   });
 
-  it("does not plan a mutable open V2 span before its assistant completes", () => {
+  it("defers a mutable open V2 span before its assistant completes", () => {
     const messages = [user("u1", "x".repeat(25_000))];
-    expect(planSessionSegments(SESSION_ID, messages, emptyManifest())).toEqual(
-      [],
-    );
+    expect(
+      planSessionSegments(SESSION_ID, messages, emptyManifest()),
+    ).toMatchObject([
+      {
+        sourceBoundaryVersion: 2,
+        status: "new",
+        disposition: "deferred_mutable_source",
+      },
+    ]);
 
     messages.push({
       info: {
@@ -557,6 +618,24 @@ describe("strict manifest planning", () => {
       {
         sourceBoundaryVersion: 2,
         endSourceMessageId: "a1",
+        disposition: "ready",
+      },
+    ]);
+  });
+
+  it("retains existing target state for a deferred mutable span", () => {
+    const messages = [user("u1", "x".repeat(25_000))];
+    const local = segmentMessages(messages)[0]!;
+    const manifest = manifestWith(
+      [],
+      [targetFor(SESSION_ID, local, "running")],
+    );
+
+    expect(planSessionSegments(SESSION_ID, messages, manifest)).toMatchObject([
+      {
+        status: "target_running",
+        targetStatus: "running",
+        disposition: "deferred_mutable_source",
       },
     ]);
   });

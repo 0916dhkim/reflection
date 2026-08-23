@@ -70,6 +70,7 @@ export type SegmentPlanStatus =
   | "conflicting"
   | "new";
 export type DryRunStatus = SegmentPlanStatus | "invalid";
+export type SegmentPlanDisposition = "ready" | "deferred_mutable_source";
 export type SegmentPlanDrift =
   | "missing_manifest_fingerprint"
   | "source_fingerprint_mismatch"
@@ -113,6 +114,7 @@ export type PlannedSegment = ReflectionSegment & {
   drifts: SegmentPlanDrift[];
   manifestSourceFingerprint: string | null;
   targetStatus: JobStatus | null;
+  disposition: SegmentPlanDisposition;
 };
 
 export interface BackfillFailure {
@@ -629,9 +631,7 @@ export function planSessionSegments(
   );
   let segments: ReflectionSegment[];
   try {
-    segments = segmentMessages(messages, maxSegmentChars, anchors).filter(
-      (segment) => isSafeSegmentSnapshot(segment, messages),
-    );
+    segments = segmentMessages(messages, maxSegmentChars, anchors);
   } catch (error) {
     throw new Error(
       `invalid segment manifest for ${sessionId}: ${errorText(error)}`,
@@ -709,6 +709,9 @@ export function planSessionSegments(
       drifts,
       manifestSourceFingerprint,
       targetStatus,
+      disposition: isSafeSegmentSnapshot(segment, messages)
+        ? "ready"
+        : "deferred_mutable_source",
     };
   });
 }
@@ -1302,6 +1305,7 @@ export interface DryRunSummary {
   segments: number;
   messages: number;
   statuses: Record<DryRunStatus, number>;
+  dispositions: Record<SegmentPlanDisposition, number>;
   drifts: Record<SegmentPlanDrift, number>;
   planningFailures: DryRunPlanningFailure[];
 }
@@ -1326,6 +1330,10 @@ export async function createDryRunSummary(
     conflicting: 0,
     new: 0,
     invalid: 0,
+  };
+  const dispositions: Record<SegmentPlanDisposition, number> = {
+    ready: 0,
+    deferred_mutable_source: 0,
   };
   const drifts: Record<SegmentPlanDrift, number> = {
     missing_manifest_fingerprint: 0,
@@ -1378,8 +1386,16 @@ export async function createDryRunSummary(
       continue;
     }
     segmentCount += segments.length;
+    if (
+      segments.some(
+        (segment) => segment.disposition === "deferred_mutable_source",
+      )
+    ) {
+      deferredSessions += 1;
+    }
     for (const segment of segments) {
       statuses[segment.status] += 1;
+      dispositions[segment.disposition] += 1;
       for (const drift of segment.drifts) drifts[drift] += 1;
     }
     messageCount += segments.reduce(
@@ -1395,6 +1411,7 @@ export async function createDryRunSummary(
     segments: segmentCount,
     messages: messageCount,
     statuses,
+    dispositions,
     drifts,
     planningFailures,
   };
@@ -1504,6 +1521,8 @@ function plannedSegmentDetails(
     endSourceMessageId: segment.endSourceMessageId,
     sourceFingerprint: segment.sourceFingerprint,
     planStatus: segment.status,
+    disposition: segment.disposition,
+    targetStatus: segment.targetStatus,
     drifts: segment.drifts,
   };
 }
@@ -1568,6 +1587,7 @@ async function revalidateExpectedSnapshot(
 export type ProcessSessionOutcome =
   | "completed"
   | "deferred"
+  | "deferred_source"
   | "replan"
   | "failed";
 
@@ -1604,6 +1624,18 @@ export async function processSession(
     context.state.status = "running";
     context.state.currentSessionId = session.id;
     context.state.currentSessionTitle = session.title;
+    const deferredSegments = segments.filter(
+      (segment) => segment.disposition === "deferred_mutable_source",
+    );
+    if (deferredSegments.length > 0) {
+      context.state.currentSegment = null;
+      context.saveState();
+      context.log("session has deferred mutable source spans", {
+        sessionId: session.id,
+        segments: deferredSegments.map(plannedSegmentDetails),
+      });
+      return "deferred_source";
+    }
     for (const [segmentIndex, segment] of segments.entries()) {
       activeSegment = segment;
       context.state.segmentsDiscovered += 1;
@@ -1746,14 +1778,20 @@ export async function runBackfill(context: ProcessingContext): Promise<void> {
           snapshot.messages,
           snapshot.observedUpdatedAt,
         );
-        if (outcome === "deferred" || outcome === "replan") {
+        if (
+          outcome === "deferred" ||
+          outcome === "deferred_source" ||
+          outcome === "replan"
+        ) {
           const currentUpdatedAt = context.store.sessionUpdatedAt(session.id);
           deferred.push({
             session,
             retryAt:
               outcome === "replan"
                 ? context.clock.nowMs() + context.jobPollMs
-                : (currentUpdatedAt ?? context.clock.nowMs()) + INACTIVE_MS,
+                : outcome === "deferred_source"
+                  ? context.clock.nowMs() + 60_000
+                  : (currentUpdatedAt ?? context.clock.nowMs()) + INACTIVE_MS,
           });
         }
       }
