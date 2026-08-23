@@ -1,8 +1,17 @@
 .env
+.env.*
+!.env.example
+.DS_Store
 .mypy_cache/
 .pytest_cache/
 .ruff_cache/
 .venv/
+.pnpm-store/
+.postgres/
+coverage/
+node_modules/
 __pycache__/
 *.egg-info/
+*.log
+*.tsbuildinfo
 dist/

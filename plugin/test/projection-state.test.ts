@@ -29,7 +29,7 @@ describe("ProjectionStateStore", () => {
     const state = {
       contextLimit: 1_000_000,
       checkpoint: {
-        tailStartUserMessageId: "user-10",
+        tailStartMessageId: "assistant-10",
         summaryText: "summary",
         createdAtMessageId: "user-20",
         lossy: true,
@@ -42,9 +42,44 @@ describe("ProjectionStateStore", () => {
     expect(
       JSON.parse(readFileSync(join(path, "session.json"), "utf8")),
     ).toMatchObject({
-      version: 1,
+      version: 2,
       state,
     });
+  });
+
+  it("migrates a version 1 user-tail checkpoint in memory", () => {
+    const directory = mkdtempSync(join(tmpdir(), "reflection-projection-"));
+    directories.push(directory);
+    const path = join(directory, "projection");
+    mkdirSync(path, { recursive: true });
+    writeFileSync(
+      join(path, "session.json"),
+      JSON.stringify({
+        version: 1,
+        state: {
+          contextLimit: 100,
+          checkpoint: {
+            tailStartUserMessageId: "user-1",
+            summaryText: "summary",
+            createdAtMessageId: "user-2",
+            lossy: true,
+          },
+        },
+      }),
+    );
+
+    expect(new ProjectionStateStore(path).get("session")).toEqual({
+      contextLimit: 100,
+      checkpoint: {
+        tailStartMessageId: "user-1",
+        summaryText: "summary",
+        createdAtMessageId: "user-2",
+        lossy: true,
+      },
+    });
+    expect(
+      JSON.parse(readFileSync(join(path, "session.json"), "utf8")),
+    ).toMatchObject({ version: 1 });
   });
 
   it("removes deleted sessions and ignores invalid state", () => {
@@ -72,9 +107,33 @@ describe("ProjectionStateStore", () => {
           contextLimit: 100,
           checkpoint: {
             tailStartUserMessageId: "user-1",
+            tailStartMessageId: "assistant-1",
             summaryText: "summary",
             createdAtMessageId: "user-2",
             lossy: "yes",
+          },
+        },
+      }),
+    );
+
+    expect(new ProjectionStateStore(path).get("session")).toBeUndefined();
+  });
+
+  it("rejects a version 2 envelope with a legacy checkpoint field", () => {
+    const directory = mkdtempSync(join(tmpdir(), "reflection-projection-"));
+    directories.push(directory);
+    const path = join(directory, "projection");
+    mkdirSync(path, { recursive: true });
+    writeFileSync(
+      join(path, "session.json"),
+      JSON.stringify({
+        version: 2,
+        state: {
+          contextLimit: 100,
+          checkpoint: {
+            tailStartUserMessageId: "user-1",
+            summaryText: "summary",
+            createdAtMessageId: "user-2",
           },
         },
       }),

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 
+import { sourceFingerprint } from "../src/domain.js";
 import {
   PROJECTION_LOSS_WARNING,
   PROJECTION_LOSS_WARNING_METADATA,
@@ -8,10 +9,12 @@ import {
   isProjectionLossWarningMessage,
   readSegmentMessages,
   segmentMessages,
+  submissionSourceFingerprint,
   textOf,
   modelVisibleCharWeightOf,
+  type CommittedSegmentBoundary,
   type OpenCodeMessage,
-} from "../src/segments.js";
+} from "../src/segmentation.js";
 
 function user(id: string, ...texts: string[]): OpenCodeMessage {
   return {
@@ -35,6 +38,37 @@ function assistant(
     },
     parts: texts.map((text) => ({ type: "text", text })),
   };
+}
+
+function v1Boundary(
+  startUserMessageId: string,
+  endUserMessageId: string,
+  overrides: Partial<CommittedSegmentBoundary> = {},
+): CommittedSegmentBoundary {
+  return {
+    startUserMessageId,
+    endUserMessageId,
+    sourceBoundaryVersion: 1,
+    startSourceMessageId: null,
+    endSourceMessageId: null,
+    ...overrides,
+  } as CommittedSegmentBoundary;
+}
+
+function v2Boundary(
+  userMessageId: string,
+  startSourceMessageId: string,
+  endSourceMessageId: string,
+  overrides: Partial<CommittedSegmentBoundary> = {},
+): CommittedSegmentBoundary {
+  return {
+    startUserMessageId: userMessageId,
+    endUserMessageId: userMessageId,
+    sourceBoundaryVersion: 2,
+    startSourceMessageId,
+    endSourceMessageId,
+    ...overrides,
+  } as CommittedSegmentBoundary;
 }
 
 describe("textOf", () => {
@@ -184,6 +218,41 @@ describe("textOf", () => {
 });
 
 describe("segmentMessages", () => {
+  it("dispatches submission fingerprints by source boundary version", () => {
+    const v1 = segmentMessages([
+      user("u1", "request"),
+      assistant("a1", "u1", "answer"),
+    ])[0]!;
+    const v2 = segmentMessages([user("u2", "123456")], 5)[0]!;
+
+    expect(submissionSourceFingerprint("session", v1)).toBe(
+      sourceFingerprint({
+        session_id: "session",
+        start_user_message_id: "u1",
+        end_user_message_id: "u1",
+        source_boundary_version: 1,
+        start_source_message_id: null,
+        end_source_message_id: null,
+        projection_version: 0,
+        processing_priority: 0,
+        messages: v1.messages,
+      }),
+    );
+    expect(submissionSourceFingerprint("session", v2)).toBe(
+      sourceFingerprint({
+        session_id: "session",
+        start_user_message_id: "u2",
+        end_user_message_id: "u2",
+        source_boundary_version: 2,
+        start_source_message_id: "u2",
+        end_source_message_id: "u2",
+        projection_version: 0,
+        processing_priority: 0,
+        messages: v2.messages,
+      }),
+    );
+  });
+
   it("counts model-visible tool output and reasoning toward segment boundaries", () => {
     const first = assistant("a1", "u1", "answer");
     first.parts = [
@@ -199,8 +268,20 @@ describe("segmentMessages", () => {
 
     expect(modelVisibleCharWeightOf(first)).toBeGreaterThan(20);
     expect(segmentMessages(messages, 20)).toMatchObject([
-      { startUserMessageId: "u1", endUserMessageId: "u1", closed: true },
-      { startUserMessageId: "u2", endUserMessageId: "u2", closed: false },
+      {
+        startUserMessageId: "u1",
+        endUserMessageId: "u1",
+        sourceBoundaryVersion: 2,
+        startSourceMessageId: "u1",
+        endSourceMessageId: "a1",
+        closed: true,
+      },
+      {
+        startUserMessageId: "u2",
+        endUserMessageId: "u2",
+        sourceBoundaryVersion: 1,
+        closed: false,
+      },
     ]);
   });
 
@@ -247,24 +328,18 @@ describe("segmentMessages", () => {
 
     expect(
       segmentMessages(messages, 2, [
-        {
+        v1Boundary("u1", "u2", {
           id: "short",
-          startUserMessageId: "u1",
-          endUserMessageId: "u2",
           sourceEligible: true,
-        },
-        {
+        }),
+        v1Boundary("u1", "u3", {
           id: "long",
-          startUserMessageId: "u1",
-          endUserMessageId: "u3",
           sourceEligible: false,
-        },
-        {
+        }),
+        v1Boundary("u4", "u4", {
           id: "tail",
-          startUserMessageId: "u4",
-          endUserMessageId: "u4",
           sourceEligible: true,
-        },
+        }),
       ]).map(({ startUserMessageId, endUserMessageId, closed }) => ({
         startUserMessageId,
         endUserMessageId,
@@ -290,6 +365,12 @@ describe("segmentMessages", () => {
       {
         startUserMessageId: "u1",
         endUserMessageId: "u1",
+        sourceBoundaryVersion: 1,
+        startSourceMessageId: null,
+        endSourceMessageId: null,
+        startMessageId: "u1",
+        endMessageId: "a1",
+        sourceMessageIds: ["u1", "a1"],
         charCount: 5,
         closed: true,
         messages: [
@@ -300,6 +381,12 @@ describe("segmentMessages", () => {
       {
         startUserMessageId: "u2",
         endUserMessageId: "u3",
+        sourceBoundaryVersion: 1,
+        startSourceMessageId: null,
+        endSourceMessageId: null,
+        startMessageId: "u2",
+        endMessageId: "u3",
+        sourceMessageIds: ["u2", "a2", "u3"],
         charCount: 7,
         closed: false,
         messages: [
@@ -354,7 +441,7 @@ describe("segmentMessages", () => {
     ]);
   });
 
-  it("places an oversized turn in a closed standalone segment", () => {
+  it("uses exact V2 boundaries for an oversized closed turn", () => {
     const messages = [
       user("u1", "12"),
       assistant("a1", "u1", "3"),
@@ -366,9 +453,22 @@ describe("segmentMessages", () => {
 
     expect(
       segmentMessages(messages, 5).map(
-        ({ startUserMessageId, endUserMessageId, charCount, closed }) => ({
+        ({
           startUserMessageId,
           endUserMessageId,
+          sourceBoundaryVersion,
+          startSourceMessageId,
+          endSourceMessageId,
+          sourceMessageIds,
+          charCount,
+          closed,
+        }) => ({
+          startUserMessageId,
+          endUserMessageId,
+          sourceBoundaryVersion,
+          startSourceMessageId,
+          endSourceMessageId,
+          sourceMessageIds,
           charCount,
           closed,
         }),
@@ -377,18 +477,30 @@ describe("segmentMessages", () => {
       {
         startUserMessageId: "u1",
         endUserMessageId: "u1",
+        sourceBoundaryVersion: 1,
+        startSourceMessageId: null,
+        endSourceMessageId: null,
+        sourceMessageIds: ["u1", "a1"],
         charCount: 3,
         closed: true,
       },
       {
         startUserMessageId: "u2",
         endUserMessageId: "u2",
+        sourceBoundaryVersion: 2,
+        startSourceMessageId: "u2",
+        endSourceMessageId: "a2",
+        sourceMessageIds: ["u2", "a2"],
         charCount: 6,
         closed: true,
       },
       {
         startUserMessageId: "u3",
         endUserMessageId: "u3",
+        sourceBoundaryVersion: 1,
+        startSourceMessageId: null,
+        endSourceMessageId: null,
+        sourceMessageIds: ["u3", "a3"],
         charCount: 2,
         closed: false,
       },
@@ -403,10 +515,25 @@ describe("segmentMessages", () => {
       assistant("orphan", "missing", "ignored"),
     ];
 
-    expect(segmentMessages(messages, 20)[0].messages).toEqual([
+    expect(segmentMessages(messages, 20)[0]!.messages).toEqual([
       { role: "user", text: "" },
       { role: "assistant", text: "" },
       { role: "assistant", text: "answer" },
+    ]);
+  });
+
+  it("uses raw chronological order rather than regrouping by parent", () => {
+    const segment = segmentMessages([
+      user("u1", "first"),
+      user("u2", "second"),
+      assistant("late-a1", "u1", "late answer"),
+    ])[0]!;
+
+    expect(segment.sourceMessageIds).toEqual(["u1", "u2", "late-a1"]);
+    expect(segment.messages).toEqual([
+      { role: "user", text: "first" },
+      { role: "user", text: "second" },
+      { role: "assistant", text: "late answer" },
     ]);
   });
 
@@ -454,6 +581,206 @@ describe("segmentMessages", () => {
       { role: "assistant", text: "working" },
     ]);
   });
+
+  it("fragments a multi-assistant oversized turn at whole messages", () => {
+    const segments = segmentMessages(
+      [
+        user("u1", "1234"),
+        assistant("a1", "u1", "5678"),
+        assistant("a2", "u1", "9012"),
+      ],
+      10,
+    );
+
+    expect(segments).toMatchObject([
+      {
+        sourceBoundaryVersion: 2,
+        startUserMessageId: "u1",
+        endUserMessageId: "u1",
+        startSourceMessageId: "u1",
+        endSourceMessageId: "a1",
+        sourceMessageIds: ["u1", "a1"],
+        charCount: 8,
+        closed: true,
+      },
+      {
+        sourceBoundaryVersion: 2,
+        startSourceMessageId: "a2",
+        endSourceMessageId: "a2",
+        sourceMessageIds: ["a2"],
+        charCount: 4,
+        closed: false,
+      },
+    ]);
+    expect(segments.flatMap((segment) => segment.sourceMessageIds)).toEqual([
+      "u1",
+      "a1",
+      "a2",
+    ]);
+  });
+
+  it("cuts an active turn only after a finite completed assistant", () => {
+    const incomplete = assistant("a1", "u1", "123456");
+    incomplete.info.time = { created: 0, completed: Number.POSITIVE_INFINITY };
+    const segments = segmentMessages(
+      [
+        user("u1", "123456"),
+        incomplete,
+        assistant("a2", "u1", "x"),
+        assistant("a3", "u1", "y"),
+      ],
+      5,
+    );
+
+    expect(segments.map((segment) => segment.sourceMessageIds)).toEqual([
+      ["u1", "a1", "a2"],
+      ["a3"],
+    ]);
+    expect(segments.map((segment) => segment.closed)).toEqual([true, false]);
+  });
+
+  it("keeps every closed prefix append-stable", () => {
+    const initial = [
+      user("u1", "1234"),
+      assistant("a1", "u1", "5678"),
+      assistant("a2", "u1", "9012"),
+    ];
+    const before = segmentMessages(initial, 10);
+    const after = segmentMessages(
+      [...initial, assistant("a3", "u1", "abcdefgh")],
+      10,
+    );
+
+    expect(before[0]!.closed).toBe(true);
+    expect(after[0]).toEqual(before[0]);
+    expect(after.map((segment) => segment.sourceMessageIds)).toEqual([
+      ["u1", "a1"],
+      ["a2"],
+      ["a3"],
+    ]);
+  });
+
+  it("never returns a whole-turn V1 segment after a V2 anchor", () => {
+    const messages = [
+      user("u1", "request"),
+      assistant("a1", "u1", "first"),
+      assistant("a2", "u1", "second"),
+    ];
+    const anchor = v2Boundary("u1", "u1", "a1", { id: "prefix" });
+
+    const segments = segmentMessages(messages, 100, [anchor]);
+    expect(segments.map((segment) => segment.sourceBoundaryVersion)).toEqual([
+      2, 2,
+    ]);
+    expect(segments.map((segment) => segment.sourceMessageIds)).toEqual([
+      ["u1", "a1"],
+      ["a2"],
+    ]);
+    expect(segments.flatMap((segment) => segment.sourceMessageIds)).toEqual([
+      "u1",
+      "a1",
+      "a2",
+    ]);
+  });
+
+  it("freezes selected V1 coverage before reconciling exact V2 anchors", () => {
+    const messages = [
+      user("u1", "one"),
+      assistant("a1", "u1", "answer one"),
+      user("u2", "two"),
+      assistant("a2", "u2", "answer two"),
+      user("u3", "three"),
+      assistant("a3", "u3", "answer three"),
+    ];
+    const segments = segmentMessages(messages, 100, [
+      v1Boundary("u1", "u2", { id: "legacy" }),
+      v2Boundary("u2", "a2", "a2", { id: "covered-exact" }),
+      v2Boundary("u3", "u3", "a3", { id: "uncovered-exact" }),
+    ]);
+
+    expect(
+      segments.map((segment) => ({
+        version: segment.sourceBoundaryVersion,
+        startUser: segment.startUserMessageId,
+        endUser: segment.endUserMessageId,
+        sourceIds: segment.sourceMessageIds,
+      })),
+    ).toEqual([
+      {
+        version: 1,
+        startUser: "u1",
+        endUser: "u2",
+        sourceIds: ["u1", "a1", "u2", "a2"],
+      },
+      {
+        version: 2,
+        startUser: "u3",
+        endUser: "u3",
+        sourceIds: ["u3", "a3"],
+      },
+    ]);
+  });
+
+  it("fails closed for malformed exact source cursors", () => {
+    const messages = [
+      user("u1", "request"),
+      assistant("a1", "u1", "first"),
+      assistant("a2", "u1", "second"),
+      user("u2", "next"),
+    ];
+    const missingCursor = {
+      startUserMessageId: "u1",
+      endUserMessageId: "u1",
+      sourceBoundaryVersion: 2,
+      startSourceMessageId: "u1",
+    } as unknown as CommittedSegmentBoundary;
+    for (const boundary of [
+      missingCursor,
+      v2Boundary("u1", "missing", "a2"),
+      v2Boundary("u1", "a2", "a1"),
+      v2Boundary("u1", "a1", "u2"),
+    ]) {
+      expect(() => segmentMessages(messages, 100, [boundary])).toThrow();
+    }
+  });
+
+  it("keeps an unsplittable oversized message intact", () => {
+    const active = segmentMessages([user("u1", "123456")], 5);
+    expect(active).toMatchObject([
+      {
+        sourceBoundaryVersion: 2,
+        sourceMessageIds: ["u1"],
+        charCount: 6,
+        closed: false,
+      },
+    ]);
+
+    const withOversizedAssistant = segmentMessages(
+      [
+        user("u1", "1"),
+        assistant("a1", "u1", "2"),
+        assistant("huge", "u1", "123456"),
+      ],
+      5,
+    );
+    expect(
+      withOversizedAssistant.map((segment) => segment.sourceMessageIds),
+    ).toEqual([["u1", "a1"], ["huge"]]);
+    expect(withOversizedAssistant[1]).toMatchObject({
+      charCount: 6,
+      closed: true,
+    });
+
+    const closedByFollowingUser = segmentMessages(
+      [user("u1", "123456"), user("u2", "next")],
+      5,
+    );
+    expect(closedByFollowingUser[0]).toMatchObject({
+      sourceBoundaryVersion: 2,
+      sourceMessageIds: ["u1"],
+      closed: true,
+    });
+  });
 });
 
 describe("readSegmentMessages", () => {
@@ -493,6 +820,30 @@ describe("readSegmentMessages", () => {
       { role: "user", text: "last" },
       { role: "assistant", text: "last answer" },
     ]);
+  });
+
+  it("hydrates V2 source spans exactly while V1 reads whole turns", () => {
+    const messages = [
+      user("u1", "request"),
+      assistant("a1", "u1", "first"),
+      assistant("a2", "u1", "second"),
+      user("u2", "outside"),
+    ];
+
+    expect(readSegmentMessages(messages, v2Boundary("u1", "a1", "a2"))).toEqual(
+      [
+        { role: "assistant", text: "first" },
+        { role: "assistant", text: "second" },
+      ],
+    );
+    expect(readSegmentMessages(messages, v1Boundary("u1", "u1"))).toEqual([
+      { role: "user", text: "request" },
+      { role: "assistant", text: "first" },
+      { role: "assistant", text: "second" },
+    ]);
+    expect(() =>
+      readSegmentMessages(messages, v2Boundary("u1", "missing", "a2")),
+    ).toThrow("not found");
   });
 
   it("rejects missing and reversed boundaries", () => {

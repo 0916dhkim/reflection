@@ -1,18 +1,37 @@
-FROM python:3.13-slim AS runtime
+FROM node:24.18.0-bookworm-slim AS build
 
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1
+ENV PNPM_HOME=/pnpm
+ENV PATH=$PNPM_HOME:$PATH
 
-RUN groupadd --system reflection && useradd --system --gid reflection reflection
+RUN corepack enable && corepack prepare pnpm@10.33.0 --activate
 
 WORKDIR /app
-COPY pyproject.toml README.md ./
-COPY src ./src
-COPY migrations ./migrations
-RUN pip install --no-cache-dir .
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml tsconfig.base.json ./
+COPY packages/shared/package.json packages/shared/package.json
+COPY plugin/package.json plugin/package.json
+COPY scripts/package.json scripts/package.json
+COPY server/package.json server/package.json
+RUN pnpm install --frozen-lockfile
 
-USER reflection
+COPY packages/shared packages/shared
+COPY server server
+RUN pnpm --filter @reflection/server build
+RUN pnpm --filter @reflection/server deploy --prod --legacy /deploy
+
+FROM node:24.18.0-bookworm-slim AS runtime
+
+ENV NODE_ENV=production \
+    MIGRATIONS_DIR=/app/migrations
+
+WORKDIR /app
+COPY --from=build --chown=node:node /deploy ./
+COPY --chown=node:node migrations ./migrations
+
+USER node
 EXPOSE 8000
+STOPSIGNAL SIGTERM
 
-CMD ["uvicorn", "reflection_service.main:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers", "--forwarded-allow-ips=*"]
+HEALTHCHECK --interval=10s --timeout=3s --start-period=10s --retries=10 \
+    CMD node -e "fetch('http://127.0.0.1:8000/healthz').then((response) => { if (!response.ok) process.exit(1); }).catch(() => process.exit(1));"
+
+CMD ["node", "dist/main.js"]

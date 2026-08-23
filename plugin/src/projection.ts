@@ -6,12 +6,12 @@ import {
   modelVisibleToolState,
   modelVisibleToolAttachmentTokens,
   PROJECTION_LOSS_WARNING,
-  segmentMessages,
   textOf,
-  type CommittedSegmentBoundary,
   type OpenCodeMessage,
   type ReflectionSegment,
-} from "./segments.js";
+} from "@reflection/shared/segmentation";
+import type { SegmentSummary } from "@reflection/shared/contracts";
+import { segmentIdForRequest } from "@reflection/shared/domain";
 
 export const PROJECTION_THRESHOLD_RATIO = 0.75;
 export const PROJECTION_TAIL_RATIO = 0.25;
@@ -22,16 +22,10 @@ const DEFAULT_OUTPUT_LIMIT = 32_000;
 const MAX_TOOL_OUTPUT_CHARS = 2_000;
 const MAX_TOOL_ATTACHMENTS = 10;
 
-export interface StoredSegmentSummary {
-  id: string;
-  start_user_message_id: string;
-  end_user_message_id: string;
-  projection_version: number;
-  summary: string;
-}
+export type StoredSegmentSummary = SegmentSummary;
 
 export interface ProjectionCheckpoint {
-  tailStartUserMessageId: string;
+  tailStartMessageId: string;
   summaryText: string;
   createdAtMessageId: string;
   lossy?: boolean;
@@ -44,7 +38,7 @@ export interface ProjectionSessionState {
 
 export interface ProjectionResetDiagnostic {
   sessionId: string;
-  tailStartUserMessageId: string;
+  tailStartMessageId: string;
   archivedMessageCount: number;
   archivedUserTurnCount: number;
   includedSummaryCount: number;
@@ -144,20 +138,40 @@ function isNewUserTurn(messages: readonly OpenCodeMessage[]): boolean {
   return latest !== undefined && isNormalUserMessage(latest);
 }
 
+function latestVisibleAssistantIsCompleted(
+  messages: readonly OpenCodeMessage[],
+): boolean {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (!message) continue;
+    if (isNormalUserMessage(message)) return false;
+    if (message.info.role !== "assistant" || !isModelVisibleMessage(message)) {
+      continue;
+    }
+    const time = message.info.time;
+    return (
+      typeof time === "object" &&
+      time !== null &&
+      !Array.isArray(time) &&
+      Number.isFinite((time as Record<string, unknown>).completed)
+    );
+  }
+  return false;
+}
+
 function applyCheckpoint(
   messages: readonly OpenCodeMessage[],
   checkpoint: ProjectionCheckpoint,
 ): OpenCodeMessage[] | null {
   const tailIndex = messages.findIndex(
-    (message) =>
-      message.info.role === "user" &&
-      message.info.id === checkpoint.tailStartUserMessageId,
+    (message) => message.info.id === checkpoint.tailStartMessageId,
   );
   if (tailIndex < 0) return null;
 
   const tail = messages.slice(tailIndex);
   const first = tail[0];
-  if (!first || first.info.role !== "user") return null;
+  const activeUser = latestUserMessage(messages);
+  if (!first || !activeUser) return null;
   const archivedAssistant = messages
     .slice(0, tailIndex)
     .reverse()
@@ -165,9 +179,9 @@ function applyCheckpoint(
       (message) =>
         message.info.role === "assistant" && isModelVisibleMessage(message),
     );
-  const sessionId = first.info.sessionID;
-  if (!sessionId) return null;
-  const model = latestUserMessage(messages)?.info.model;
+  const sessionId = activeUser.info.sessionID;
+  const model = activeUser.info.model;
+  if (!sessionId || !model) return null;
   const userId = `${first.info.id}_reflection_context_user`;
   const assistantId = `${first.info.id}_reflection_context_assistant`;
   const firstTime = first.info.time;
@@ -180,8 +194,10 @@ function applyCheckpoint(
       : 0;
   const contextUser: OpenCodeMessage = {
     info: {
-      ...first.info,
+      ...activeUser.info,
       id: userId,
+      role: "user",
+      sessionID: sessionId,
       time: { created: created - 1 },
       summary: undefined,
       system: undefined,
@@ -202,7 +218,10 @@ function applyCheckpoint(
       ...(archivedAssistant?.info ?? {
         id: assistantId,
         role: "assistant" as const,
-        mode: typeof first.info.agent === "string" ? first.info.agent : "build",
+        mode:
+          typeof activeUser.info.agent === "string"
+            ? activeUser.info.agent
+            : "build",
         path: { cwd: "", root: "" },
         cost: 0,
         tokens: {
@@ -216,8 +235,8 @@ function applyCheckpoint(
       id: assistantId,
       sessionID: sessionId,
       parentID: userId,
-      providerID: model?.providerID,
-      modelID: model?.modelID,
+      providerID: model.providerID,
+      modelID: model.modelID,
       time: { created, completed: created },
       summary: true,
       error: undefined,
@@ -537,7 +556,7 @@ function inheritedCompaction(messages: readonly OpenCodeMessage[]): {
       message.info.summary === true,
   );
   if (summaryIndex < 0) return null;
-  const summary = textOf(messages[summaryIndex]);
+  const summary = textOf(messages[summaryIndex]!);
   return {
     historyStartIndex: summaryIndex + 1,
     context: summary ? [`### Prior OpenCode summary\n${summary}`] : [],
@@ -589,27 +608,58 @@ function inheritedProjectionContext(
   };
 }
 
+function segmentIdentity(
+  sessionId: string,
+  segment: ReflectionSegment,
+): string {
+  if (segment.sourceBoundaryVersion === 1) {
+    return segmentIdForRequest({
+      session_id: sessionId,
+      start_user_message_id: segment.startUserMessageId,
+      source_boundary_version: 1,
+      start_source_message_id: null,
+    });
+  }
+  if (segment.startSourceMessageId === null) {
+    throw new Error("V2 segment identity requires a start source cursor");
+  }
+  return segmentIdForRequest({
+    session_id: sessionId,
+    start_user_message_id: segment.startUserMessageId,
+    source_boundary_version: 2,
+    start_source_message_id: segment.startSourceMessageId,
+  });
+}
+
+function summaryMatchesSegment(
+  summary: StoredSegmentSummary,
+  segment: ReflectionSegment,
+  sessionId: string,
+): boolean {
+  return (
+    summary.id === segmentIdentity(sessionId, segment) &&
+    summary.start_user_message_id === segment.startUserMessageId &&
+    summary.end_user_message_id === segment.endUserMessageId &&
+    summary.source_boundary_version === segment.sourceBoundaryVersion &&
+    summary.start_source_message_id === segment.startSourceMessageId &&
+    summary.end_source_message_id === segment.endSourceMessageId
+  );
+}
+
 function summaryCoverage(input: {
+  sessionId: string;
   archivedSegments: readonly ReflectionSegment[];
   summaries: readonly StoredSegmentSummary[];
-}): { segments: StoredSegmentSummary[]; complete: boolean; userCount: number } {
+}): { segments: StoredSegmentSummary[]; complete: boolean } {
   const selected = input.archivedSegments.flatMap((segment) => {
-    const summary = input.summaries.find(
-      (item) =>
-        item.start_user_message_id === segment.startUserMessageId &&
-        item.end_user_message_id === segment.endUserMessageId,
+    const summary = input.summaries.find((item) =>
+      summaryMatchesSegment(item, segment, input.sessionId),
     );
     return summary ? [summary] : [];
   });
   return {
     segments: selected,
     complete: selected.length === input.archivedSegments.length,
-    userCount: input.archivedSegments.reduce(
-      (count, segment) =>
-        count +
-        segment.messages.filter((message) => message.role === "user").length,
-      0,
-    ),
   };
 }
 
@@ -620,36 +670,55 @@ interface TailCandidate {
 
 function safeTailCandidates(input: {
   messages: readonly OpenCodeMessage[];
+  canonicalSegments: readonly ReflectionSegment[];
   contextLimit: number;
   previous?: ProjectionCheckpoint;
-  committedBoundaries: readonly CommittedSegmentBoundary[];
 }): TailCandidate[] {
   const previousIndex = input.previous
     ? input.messages.findIndex(
-        (message) =>
-          isNormalUserMessage(message) &&
-          message.info.id === input.previous?.tailStartUserMessageId,
+        (message) => message.info.id === input.previous?.tailStartMessageId,
       )
     : -1;
   const historyStartIndex =
     inheritedCompaction(input.messages)?.historyStartIndex ?? 0;
-  const segments = segmentMessages(
-    input.messages.slice(historyStartIndex),
-    undefined,
-    input.committedBoundaries,
+  const modelIndexes = new Map<string, number | null>();
+  input.messages.forEach((message, index) => {
+    modelIndexes.set(
+      message.info.id,
+      modelIndexes.has(message.info.id) ? null : index,
+    );
+  });
+  const mappedStarts = input.canonicalSegments.map((segment) =>
+    modelIndexes.get(segment.startMessageId),
   );
   const targetTokens = Math.floor(input.contextLimit * PROJECTION_TAIL_RATIO);
-  const candidates = segments.slice(1).flatMap((segment, index) => {
-    const archivedSegments = segments.slice(0, index + 1);
-    if (!archivedSegments.every((item) => item.closed)) return [];
-    const tailIndex = input.messages.findIndex(
-      (message) =>
-        isNormalUserMessage(message) &&
-        message.info.id === segment.startUserMessageId,
-    );
-    return tailIndex > previousIndex && tailIndex > 0
-      ? [{ tailIndex, archivedSegments }]
-      : [];
+  const candidates: TailCandidate[] = [];
+  input.canonicalSegments.forEach((segment, index) => {
+    const tailIndex = mappedStarts[index];
+    if (tailIndex === undefined || tailIndex === null) return;
+    if (index === 0) return;
+    const priorIsNonmonotonic = mappedStarts
+      .slice(0, index)
+      .some(
+        (mapped) =>
+          mapped !== undefined && mapped !== null && mapped >= tailIndex,
+      );
+    const laterIsNonmonotonic = mappedStarts
+      .slice(index + 1)
+      .some(
+        (mapped) =>
+          mapped !== undefined && mapped !== null && mapped <= tailIndex,
+      );
+    if (priorIsNonmonotonic || laterIsNonmonotonic) return;
+    const archivedSegments = input.canonicalSegments.slice(0, index);
+    if (!archivedSegments.every((item) => item.closed)) return;
+    if (
+      tailIndex > previousIndex &&
+      tailIndex >= historyStartIndex &&
+      tailIndex > 0
+    ) {
+      candidates.push({ tailIndex, archivedSegments });
+    }
   });
   const preferred = candidates.findIndex(
     (candidate) =>
@@ -659,15 +728,21 @@ function safeTailCandidates(input: {
   return preferred < 0 ? candidates.slice(-1) : candidates.slice(preferred);
 }
 
-export async function projectMessages(input: {
+export interface ProjectMessagesInput {
   messages: readonly OpenCodeMessage[];
   contextLimit: number;
   inputLimit?: number;
   outputLimit?: number;
   previous?: ProjectionSessionState;
-  loadBoundaries?: () => Promise<readonly CommittedSegmentBoundary[]>;
-  loadSummaries: () => Promise<readonly StoredSegmentSummary[]>;
-}): Promise<ProjectionResult> {
+  loadCanonicalSegments: () => Promise<readonly ReflectionSegment[]>;
+  loadSummaries: (
+    requiredSegments: readonly ReflectionSegment[],
+  ) => Promise<readonly StoredSegmentSummary[]>;
+}
+
+export async function projectMessages(
+  input: ProjectMessagesInput,
+): Promise<ProjectionResult> {
   if (!Number.isFinite(input.contextLimit) || input.contextLimit <= 0) {
     throw new Error("Model context limit must be positive");
   }
@@ -681,7 +756,7 @@ export async function projectMessages(input: {
     projected = [...input.messages];
   }
 
-  let estimatedTokens = estimateRequestTokens(
+  const estimatedTokens = estimateRequestTokens(
     projected,
     input.contextLimit,
     checkpoint,
@@ -721,52 +796,73 @@ export async function projectMessages(input: {
     estimatedTokens > target;
   const emergency = estimatedTokens >= hardLimit;
   const resetDue = estimatedTokens >= threshold || modelShrank;
-  const canReset = isNewUserTurn(input.messages) || modelShrank || emergency;
+  const canReset =
+    isNewUserTurn(input.messages) ||
+    latestVisibleAssistantIsCompleted(input.messages) ||
+    modelShrank ||
+    emergency;
+
+  const unchangedResult = (): ProjectionResult => ({
+    messages: projected,
+    state: {
+      contextLimit: input.contextLimit,
+      checkpoint,
+    },
+    estimatedTokens,
+    thresholdTokens: threshold,
+    hardLimitTokens: hardLimit,
+    reset: false,
+  });
 
   if (!resetDue || !canReset) {
-    return {
-      messages: projected,
-      state: {
-        contextLimit: input.contextLimit,
-        checkpoint,
-      },
-      estimatedTokens,
-      thresholdTokens: threshold,
-      hardLimitTokens: hardLimit,
-      reset: false,
-    };
+    return unchangedResult();
   }
 
-  let committedBoundaries: readonly CommittedSegmentBoundary[] = [];
-  try {
-    committedBoundaries = (await input.loadBoundaries?.()) ?? [];
-  } catch {}
+  const canonicalSegments = await input.loadCanonicalSegments();
   const tailCandidates = safeTailCandidates({
     messages: input.messages,
+    canonicalSegments,
     contextLimit: input.contextLimit,
     previous: checkpoint,
-    committedBoundaries,
   });
   if (tailCandidates.length === 0) {
+    if (!emergency) return unchangedResult();
     throw new ProjectionCoverageError(
-      "Reflection could not find a safe turn-aligned projection cutoff",
+      "Reflection could not find a safe message-aligned projection cutoff",
     );
   }
 
+  const sessionId = latestUserMessage(input.messages)?.info.sessionID;
+  if (!sessionId) {
+    throw new ProjectionCoverageError(
+      "Reflection could not identify the projection session",
+    );
+  }
   let summaries: readonly StoredSegmentSummary[] = [];
   let summaryServiceFailed = false;
-  try {
-    summaries = await input.loadSummaries();
-  } catch {
-    summaryServiceFailed = true;
-  }
+  const requestedSegmentIds = new Set<string>();
 
   for (const candidate of tailCandidates) {
     const { tailIndex } = candidate;
     const tailStart = input.messages[tailIndex];
-    if (!tailStart || !isNormalUserMessage(tailStart)) continue;
+    if (!tailStart) continue;
+    const requiredIds = candidate.archivedSegments.map((segment) =>
+      segmentIdentity(sessionId, segment),
+    );
+    if (
+      !summaryServiceFailed &&
+      requiredIds.some((id) => !requestedSegmentIds.has(id))
+    ) {
+      try {
+        summaries = await input.loadSummaries(candidate.archivedSegments);
+        requiredIds.forEach((id) => requestedSegmentIds.add(id));
+      } catch {
+        summaryServiceFailed = true;
+      }
+    }
     const inherited = inheritedProjectionContext(input.messages, tailIndex);
     const coverage = summaryCoverage({
+      sessionId,
       archivedSegments: candidate.archivedSegments,
       summaries,
     });
@@ -784,7 +880,7 @@ export async function projectMessages(input: {
       initialOmissions: omissions,
     });
     const nextCheckpoint: ProjectionCheckpoint = {
-      tailStartUserMessageId: tailStart.info.id,
+      tailStartMessageId: tailStart.info.id,
       createdAtMessageId: input.messages.at(-1)?.info.id ?? tailStart.info.id,
       summaryText: built.text,
       lossy: built.lossy || undefined,
@@ -805,8 +901,8 @@ export async function projectMessages(input: {
       hardLimitTokens: hardLimit,
       reset: true,
       diagnostic: {
-        sessionId: tailStart.info.sessionID ?? "unknown",
-        tailStartUserMessageId: tailStart.info.id,
+        sessionId,
+        tailStartMessageId: tailStart.info.id,
         archivedMessageCount: tailIndex,
         archivedUserTurnCount: input.messages
           .slice(0, tailIndex)
@@ -818,7 +914,8 @@ export async function projectMessages(input: {
     };
   }
 
+  if (!emergency) return unchangedResult();
   throw new ProjectionCoverageError(
-    `Reflection could not fit any safe turn-aligned projection tail below ${threshold} tokens`,
+    `Reflection could not fit any safe message-aligned projection tail below ${threshold} tokens`,
   );
 }

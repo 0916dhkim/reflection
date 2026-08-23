@@ -3,15 +3,18 @@ import { describe, expect, it, vi } from "vitest";
 import {
   activeModel,
   estimateTokens,
-  projectMessages,
+  projectMessages as projectMessagesImplementation,
+  type ProjectMessagesInput,
   type StoredSegmentSummary,
 } from "../src/projection.js";
+import { segmentIdForRequest } from "@reflection/shared/domain";
 import {
   PROJECTION_LOSS_WARNING,
   PROJECTION_LOSS_WARNING_METADATA,
   segmentMessages,
   type OpenCodeMessage,
-} from "../src/segments.js";
+  type ReflectionSegment,
+} from "@reflection/shared/segmentation";
 
 const SESSION_ID = "session";
 const PROVIDER_ID = "provider";
@@ -96,13 +99,72 @@ function longSession(turns = 16): OpenCodeMessage[] {
 function summaries(
   messages: readonly OpenCodeMessage[],
 ): StoredSegmentSummary[] {
-  return segmentMessages(messages).map((segment, index) => ({
-    id: `segment-${index}`,
-    start_user_message_id: segment.startUserMessageId,
-    end_user_message_id: segment.endUserMessageId,
-    projection_version: 1,
-    summary: `Summary ${index}`,
-  }));
+  return segmentMessages(messages).map((segment, index) => {
+    const common = {
+      id: segmentIdForRequest({
+        session_id: SESSION_ID,
+        start_user_message_id: segment.startUserMessageId,
+        source_boundary_version: segment.sourceBoundaryVersion,
+        start_source_message_id: segment.startSourceMessageId,
+      }),
+      start_user_message_id: segment.startUserMessageId,
+      end_user_message_id: segment.endUserMessageId,
+      projection_version: 1,
+      summary: `Summary ${index}`,
+    };
+    return segment.sourceBoundaryVersion === 1
+      ? {
+          ...common,
+          source_boundary_version: 1,
+          start_source_message_id: null,
+          end_source_message_id: null,
+        }
+      : {
+          ...common,
+          source_boundary_version: 2,
+          start_source_message_id: segment.startSourceMessageId!,
+          end_source_message_id: segment.endSourceMessageId!,
+        };
+  });
+}
+
+function v1Summary(
+  startUserMessageId: string,
+  endUserMessageId: string,
+  summary: string,
+  projectionVersion = 1,
+): StoredSegmentSummary {
+  return {
+    id: segmentIdForRequest({
+      session_id: SESSION_ID,
+      start_user_message_id: startUserMessageId,
+      source_boundary_version: 1,
+      start_source_message_id: null,
+    }),
+    start_user_message_id: startUserMessageId,
+    end_user_message_id: endUserMessageId,
+    source_boundary_version: 1,
+    start_source_message_id: null,
+    end_source_message_id: null,
+    projection_version: projectionVersion,
+    summary,
+  };
+}
+
+type TestProjectionInput = Omit<
+  ProjectMessagesInput,
+  "loadCanonicalSegments"
+> & {
+  loadCanonicalSegments?: ProjectMessagesInput["loadCanonicalSegments"];
+};
+
+function projectMessages(input: TestProjectionInput) {
+  return projectMessagesImplementation({
+    ...input,
+    loadCanonicalSegments:
+      input.loadCanonicalSegments ??
+      (async () => segmentMessages(input.messages)),
+  });
 }
 
 function projectedContext(messages: readonly OpenCodeMessage[]): string {
@@ -167,15 +229,18 @@ describe("projectMessages", () => {
   it("leaves history untouched below 75% without loading summaries", async () => {
     const messages = longSession(2);
     const loadSummaries = vi.fn(async () => summaries(messages));
+    const loadCanonicalSegments = vi.fn(async () => segmentMessages(messages));
 
     const result = await projectMessages({
       messages,
       contextLimit: CONTEXT_LIMIT,
+      loadCanonicalSegments,
       loadSummaries,
     });
 
     expect(result.reset).toBe(false);
     expect(result.messages).toEqual(messages);
+    expect(loadCanonicalSegments).not.toHaveBeenCalled();
     expect(loadSummaries).not.toHaveBeenCalled();
   });
 
@@ -217,9 +282,9 @@ describe("projectMessages", () => {
 
     expect(result.reset).toBe(true);
     expect(result.estimatedTokens).toBeLessThan(CONTEXT_LIMIT * 0.75);
-    expect(result.state.checkpoint?.tailStartUserMessageId).toMatch(/^u/);
+    expect(result.state.checkpoint?.tailStartMessageId).toMatch(/^u/);
     expect(result.messages[2]?.info.id).toBe(
-      result.state.checkpoint?.tailStartUserMessageId,
+      result.state.checkpoint?.tailStartMessageId,
     );
     expect(projectedContext(result.messages)).toContain("<reflection-context>");
     expect(projectedContext(result.messages)).toContain("37 tests passed");
@@ -236,7 +301,7 @@ describe("projectMessages", () => {
     expect(result.messages.at(-1)?.info.id).toBe("current");
   });
 
-  it("keeps the checkpoint stable during an assistant tool loop", async () => {
+  it("soft resets after a completed assistant tool step", async () => {
     const messages = longSession();
     const first = await projectMessages({
       messages,
@@ -272,9 +337,9 @@ describe("projectMessages", () => {
       loadSummaries,
     });
 
-    expect(result.reset).toBe(false);
-    expect(result.state.checkpoint).toEqual(first.state.checkpoint);
-    expect(loadSummaries).not.toHaveBeenCalled();
+    expect(result.reset).toBe(true);
+    expect(result.state.checkpoint).not.toEqual(first.state.checkpoint);
+    expect(loadSummaries).toHaveBeenCalledOnce();
   });
 
   it("resets at the hard limit during an assistant tool loop", async () => {
@@ -298,8 +363,8 @@ describe("projectMessages", () => {
     });
 
     expect(result.reset).toBe(true);
-    expect(result.state.checkpoint?.tailStartUserMessageId).not.toBe(
-      first.state.checkpoint?.tailStartUserMessageId,
+    expect(result.state.checkpoint?.tailStartMessageId).not.toBe(
+      first.state.checkpoint?.tailStartMessageId,
     );
     expect(loadSummaries).toHaveBeenCalledOnce();
   });
@@ -330,7 +395,7 @@ describe("projectMessages", () => {
       contextLimit: CONTEXT_LIMIT,
       loadSummaries: async () => summaries(messages),
     });
-    const tailId = result.state.checkpoint?.tailStartUserMessageId;
+    const tailId = result.state.checkpoint?.tailStartMessageId;
     const tailIndex = messages.findIndex(
       (message) => message.info.id === tailId,
     );
@@ -338,6 +403,10 @@ describe("projectMessages", () => {
     expect(result.reset).toBe(true);
     expect(tailIndex).toBeGreaterThan(0);
     expect(result.messages.slice(2)).toEqual(messages.slice(tailIndex));
+    result.messages.slice(2).forEach((message, index) => {
+      expect(message).toBe(messages[tailIndex + index]);
+      expect(message.parts).toBe(messages[tailIndex + index]?.parts);
+    });
     expect(
       result.messages
         .slice(2)
@@ -349,6 +418,120 @@ describe("projectMessages", () => {
             : true,
         ),
     ).toBe(true);
+  });
+
+  it("retains an assistant-starting canonical tail by exact identity", async () => {
+    const messages = [
+      user("turn", "request"),
+      assistant("step-1", "turn", "a".repeat(30_000), [], 100_000),
+      assistant("step-2", "turn", "b".repeat(30_000)),
+      user("current", "continue"),
+    ];
+    const canonical = segmentMessages(messages);
+
+    const result = await projectMessages({
+      messages,
+      contextLimit: CONTEXT_LIMIT,
+      loadCanonicalSegments: async () => canonical,
+      loadSummaries: async () => summaries(messages),
+    });
+
+    expect(canonical.map((segment) => segment.startMessageId)).toContain(
+      "step-2",
+    );
+    expect(result.reset).toBe(true);
+    expect(result.state.checkpoint?.tailStartMessageId).toBe("step-2");
+    expect(result.messages[2]).toBe(messages[2]);
+    expect(result.messages[2]?.parts).toBe(messages[2]?.parts);
+    expect(result.messages[3]).toBe(messages[3]);
+    expect(result.messages[0]?.info).toMatchObject({
+      role: "user",
+      sessionID: SESSION_ID,
+      model: { providerID: PROVIDER_ID, modelID: MODEL_ID },
+    });
+    expect(result.messages[1]?.info).toMatchObject({
+      role: "assistant",
+      sessionID: SESSION_ID,
+      providerID: PROVIDER_ID,
+      modelID: MODEL_ID,
+      parentID: result.messages[0]?.info.id,
+    });
+  });
+
+  it("maps canonical raw cutoffs into native-compacted model order", async () => {
+    const raw = longSession();
+    const retainedIndex = raw.findIndex((message) => message.info.id === "u8");
+    const compactionUser = user("compaction-user", "");
+    compactionUser.parts = [{ type: "compaction" }];
+    const compactionSummary = assistant(
+      "compaction-summary",
+      "compaction-user",
+      "Previous native summary",
+    );
+    compactionSummary.info.summary = true;
+    const filtered = [
+      compactionUser,
+      compactionSummary,
+      ...raw.slice(retainedIndex),
+    ];
+    const canonical = segmentMessages(raw);
+    const loadSummaries = vi.fn(
+      async (_required: readonly ReflectionSegment[]) => summaries(raw),
+    );
+
+    const result = await projectMessages({
+      messages: filtered,
+      contextLimit: CONTEXT_LIMIT,
+      loadCanonicalSegments: async () => canonical,
+      loadSummaries,
+    });
+
+    expect(result.reset).toBe(true);
+    expect(projectedContext(result.messages)).toContain(
+      "Previous native summary",
+    );
+    expect(loadSummaries.mock.calls[0]?.[0][0]?.startMessageId).toBe("u0");
+    const tailId = result.state.checkpoint?.tailStartMessageId;
+    const tailIndex = filtered.findIndex(
+      (message) => message.info.id === tailId,
+    );
+    expect(tailIndex).toBeGreaterThan(1);
+    result.messages.slice(2).forEach((message, index) => {
+      expect(message).toBe(filtered[tailIndex + index]);
+    });
+  });
+
+  it("skips canonical cutoffs that are nonmonotonic in model order", async () => {
+    const raw = [
+      user("u0", "request 0"),
+      assistant("a0", "u0", "a".repeat(30_000)),
+      user("u1", "request 1"),
+      assistant("a1", "u1", "b".repeat(30_000), [], 100_000),
+      user("u2", "request 2"),
+      assistant("a2", "u2", "c".repeat(30_000)),
+      user("current", "continue"),
+    ];
+    const filtered = [
+      raw[0]!,
+      raw[1]!,
+      raw[4]!,
+      raw[5]!,
+      raw[2]!,
+      raw[3]!,
+      raw[6]!,
+    ];
+    const canonical = segmentMessages(raw);
+
+    const result = await projectMessages({
+      messages: filtered,
+      contextLimit: CONTEXT_LIMIT,
+      loadCanonicalSegments: async () => canonical,
+      loadSummaries: async () => summaries(raw),
+    });
+
+    expect(result.reset).toBe(true);
+    expect(result.state.checkpoint?.tailStartMessageId).toBe("current");
+    expect(result.messages[2]).toBe(raw[6]);
   });
 
   it("immediately resets when switching to a smaller context model", async () => {
@@ -476,6 +659,37 @@ describe("projectMessages", () => {
     );
   });
 
+  it("requires the deterministic ID and complete V2 source boundary for coverage", async () => {
+    const messages = [
+      user("turn", "request"),
+      assistant("step-1", "turn", "a".repeat(30_000), [], 100_000),
+      assistant("step-2", "turn", "b".repeat(30_000)),
+      user("current", "continue"),
+    ];
+    const canonical = segmentMessages(messages);
+    const first = summaries(messages)[0];
+    if (!first || first.source_boundary_version !== 2) {
+      throw new Error("expected a V2 summary");
+    }
+    const wrongBoundary: StoredSegmentSummary = {
+      ...first,
+      end_source_message_id: "step-2",
+    };
+
+    const result = await projectMessages({
+      messages,
+      contextLimit: CONTEXT_LIMIT,
+      loadCanonicalSegments: async () => canonical,
+      loadSummaries: async () => [wrongBoundary],
+    });
+
+    expect(result.reset).toBe(true);
+    expect(result.state.checkpoint?.lossy).toBe(true);
+    expect(result.diagnostic?.omissionReasons).toContain(
+      "missing-segment-summaries",
+    );
+  });
+
   it("retains the open segment raw and uses only closed segment summaries", async () => {
     const messages: OpenCodeMessage[] = [];
     for (let index = 0; index < 20; index += 1) {
@@ -500,7 +714,7 @@ describe("projectMessages", () => {
     expect(result.state.checkpoint?.lossy).toBeUndefined();
     expect(
       localSegments.map((segment) => segment.startUserMessageId),
-    ).toContain(result.state.checkpoint?.tailStartUserMessageId);
+    ).toContain(result.state.checkpoint?.tailStartMessageId);
     expect(result.messages).toContain(messages.at(-1));
     expect(closedSummaries).not.toContainEqual(
       expect.objectContaining({ end_user_message_id: "open-user" }),
@@ -549,7 +763,7 @@ describe("projectMessages", () => {
         contextLimit: CONTEXT_LIMIT,
         loadSummaries: async () => [],
       }),
-    ).rejects.toThrow("safe turn-aligned projection tail");
+    ).rejects.toThrow("safe message-aligned projection tail");
   });
 
   it("keeps a cutoff when switching to a larger context model", async () => {
@@ -662,13 +876,12 @@ describe("projectMessages", () => {
       messages,
       contextLimit: CONTEXT_LIMIT,
       loadSummaries: async () => [
-        {
-          id: "legacy",
-          start_user_message_id: "u0",
-          end_user_message_id: "unanswered",
-          projection_version: 0,
-          summary: "Summary including the unanswered request",
-        },
+        v1Summary(
+          "u0",
+          "unanswered",
+          "Summary including the unanswered request",
+          0,
+        ),
       ],
     });
 
@@ -688,15 +901,7 @@ describe("projectMessages", () => {
     const result = await projectMessages({
       messages,
       contextLimit: CONTEXT_LIMIT,
-      loadSummaries: async () => [
-        {
-          id: "unanswered-segment",
-          start_user_message_id: "unanswered",
-          end_user_message_id: "unanswered",
-          projection_version: 1,
-          summary: "The unanswered request",
-        },
-      ],
+      loadSummaries: async () => summaries(messages),
     });
 
     expect(result.reset).toBe(true);
@@ -940,15 +1145,7 @@ describe("projectMessages", () => {
     const result = await projectMessages({
       messages,
       contextLimit: CONTEXT_LIMIT,
-      loadSummaries: async () => [
-        {
-          id: "u0-summary",
-          start_user_message_id: "u0",
-          end_user_message_id: "u0",
-          projection_version: 1,
-          summary: "The old request",
-        },
-      ],
+      loadSummaries: async () => summaries(messages),
     });
     const context = projectedContext(result.messages);
 
@@ -1072,13 +1269,7 @@ describe("projectMessages", () => {
       messages,
       contextLimit: CONTEXT_LIMIT,
       loadSummaries: async () => [
-        {
-          id: "covered-segment",
-          start_user_message_id: "covered",
-          end_user_message_id: "covered",
-          projection_version: 1,
-          summary: "Covered summary",
-        },
+        v1Summary("covered", "covered", "Covered summary"),
       ],
     });
 
@@ -1186,6 +1377,18 @@ describe("projectMessages", () => {
         contextLimit: CONTEXT_LIMIT,
         loadSummaries: async () => summaries(messages),
       }),
-    ).rejects.toThrow("safe turn-aligned projection tail");
+    ).rejects.toThrow("safe message-aligned projection tail");
+  });
+
+  it("fails at the hard limit for one unsplittable source message", async () => {
+    const messages = [user("only", "x".repeat(500_000))];
+
+    await expect(
+      projectMessages({
+        messages,
+        contextLimit: CONTEXT_LIMIT,
+        loadSummaries: async () => [],
+      }),
+    ).rejects.toThrow("safe message-aligned projection cutoff");
   });
 });

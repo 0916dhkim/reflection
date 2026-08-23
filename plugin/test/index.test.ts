@@ -16,7 +16,12 @@ import {
   segmentMessages,
   submissionSourceFingerprint,
   type OpenCodeMessage,
-} from "../src/segments.js";
+  type ReflectionSegment,
+} from "@reflection/shared/segmentation";
+import {
+  segmentIdForRequest,
+  sourceFingerprint,
+} from "@reflection/shared/domain";
 
 const paths = vi.hoisted(() => ({
   home: `/tmp/reflection-plugin-test-${process.pid}`,
@@ -28,6 +33,75 @@ vi.mock("node:os", async (importOriginal) => ({
 }));
 
 import { Reflection } from "../src/index.js";
+
+const SUMMARY_WAIT_TIMEOUT_MS = 90_000;
+const SUMMARY_POLL_INTERVAL_MS = 1_000;
+
+function segmentId(sessionId: string, segment: ReflectionSegment): string {
+  return segmentIdForRequest({
+    session_id: sessionId,
+    start_user_message_id: segment.startUserMessageId,
+    source_boundary_version: segment.sourceBoundaryVersion,
+    start_source_message_id: segment.startSourceMessageId,
+  });
+}
+
+function segmentWireBoundary(segment: ReflectionSegment) {
+  return segment.sourceBoundaryVersion === 1
+    ? {
+        source_boundary_version: 1 as const,
+        start_source_message_id: null,
+        end_source_message_id: null,
+      }
+    : {
+        source_boundary_version: 2 as const,
+        start_source_message_id: segment.startSourceMessageId!,
+        end_source_message_id: segment.endSourceMessageId!,
+      };
+}
+
+function segmentSummary(
+  sessionId: string,
+  segment: ReflectionSegment,
+  summary: string,
+) {
+  return {
+    id: segmentId(sessionId, segment),
+    start_user_message_id: segment.startUserMessageId,
+    end_user_message_id: segment.endUserMessageId,
+    ...segmentWireBoundary(segment),
+    projection_version: 1,
+    summary,
+  };
+}
+
+function segmentBoundary(
+  sessionId: string,
+  segment: ReflectionSegment,
+  sourceFingerprint = submissionSourceFingerprint(sessionId, segment),
+) {
+  return {
+    id: segmentId(sessionId, segment),
+    start_user_message_id: segment.startUserMessageId,
+    end_user_message_id: segment.endUserMessageId,
+    ...segmentWireBoundary(segment),
+    projection_version: 1,
+    source_eligible: true,
+    source_fingerprint: sourceFingerprint,
+  };
+}
+
+function segmentTarget(sessionId: string, segment: ReflectionSegment) {
+  return {
+    id: segmentId(sessionId, segment),
+    start_user_message_id: segment.startUserMessageId,
+    end_user_message_id: segment.endUserMessageId,
+    ...segmentWireBoundary(segment),
+    projection_version: 1,
+    status: "running",
+    source_fingerprint: submissionSourceFingerprint(sessionId, segment),
+  };
+}
 
 function segmentFingerprint(
   sessionId: string,
@@ -107,6 +181,63 @@ function projectionMessages(sessionId: string): OpenCodeMessage[] {
   ];
 }
 
+function siblingProjectionMessages(sessionId: string): OpenCodeMessage[] {
+  return [
+    {
+      info: {
+        id: `${sessionId}-turn`,
+        sessionID: sessionId,
+        role: "user",
+        agent: "build",
+        model: { providerID: "provider", modelID: "model" },
+      },
+      parts: [{ type: "text", text: "request" }],
+    },
+    {
+      info: {
+        id: `${sessionId}-step-1`,
+        sessionID: sessionId,
+        role: "assistant",
+        parentID: `${sessionId}-turn`,
+        providerID: "provider",
+        modelID: "model",
+        time: { created: 0, completed: 1 },
+        finish: "tool-calls",
+        tokens: {
+          input: 100_000,
+          output: 1_000,
+          reasoning: 0,
+          cache: { read: 0, write: 0 },
+        },
+      },
+      parts: [{ type: "text", text: "a".repeat(25_000) }],
+    },
+    {
+      info: {
+        id: `${sessionId}-step-2`,
+        sessionID: sessionId,
+        role: "assistant",
+        parentID: `${sessionId}-turn`,
+        providerID: "provider",
+        modelID: "model",
+        time: { created: 2, completed: 3 },
+        finish: "stop",
+      },
+      parts: [{ type: "text", text: "b".repeat(25_000) }],
+    },
+    {
+      info: {
+        id: `${sessionId}-current`,
+        sessionID: sessionId,
+        role: "user",
+        agent: "build",
+        model: { providerID: "provider", modelID: "model" },
+      },
+      parts: [{ type: "text", text: "continue" }],
+    },
+  ];
+}
+
 function clientFor(messages: OpenCodeMessage[]) {
   return {
     app: {
@@ -157,8 +288,61 @@ const pluginInput = (client: ReturnType<typeof clientFor>) =>
     directory: "/tmp",
   }) as never;
 
+function v2Manifest(data: unknown): unknown {
+  if (typeof data !== "object" || data === null || Array.isArray(data)) {
+    return data;
+  }
+  const value = data as Record<string, unknown>;
+  if (
+    typeof value.session_id !== "string" ||
+    !Array.isArray(value.segments) ||
+    !Array.isArray(value.boundaries) ||
+    !Array.isArray(value.targets)
+  ) {
+    return data;
+  }
+  const boundary = (item: unknown) => {
+    if (typeof item !== "object" || item === null || Array.isArray(item)) {
+      return item;
+    }
+    const current = item as Record<string, unknown>;
+    const sourceBoundaryVersion = current.source_boundary_version ?? 1;
+    const startSourceMessageId =
+      sourceBoundaryVersion === 1 ? null : current.start_source_message_id;
+    const normalized: Record<string, unknown> = {
+      ...current,
+      source_boundary_version: sourceBoundaryVersion,
+      start_source_message_id: startSourceMessageId,
+      end_source_message_id:
+        sourceBoundaryVersion === 1 ? null : current.end_source_message_id,
+    };
+    if (
+      typeof normalized["start_user_message_id"] === "string" &&
+      (typeof normalized["id"] !== "string" ||
+        !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(
+          normalized["id"],
+        ))
+    ) {
+      normalized["id"] = segmentIdForRequest({
+        session_id: value.session_id as string,
+        start_user_message_id: normalized["start_user_message_id"],
+        source_boundary_version: sourceBoundaryVersion as 1 | 2,
+        start_source_message_id: startSourceMessageId as string | null,
+      });
+    }
+    return normalized;
+  };
+  return {
+    ...value,
+    manifest_version: value.manifest_version ?? 2,
+    segments: value.segments.map(boundary),
+    boundaries: value.boundaries.map(boundary),
+    targets: value.targets.map(boundary),
+  };
+}
+
 function ok(data: unknown = {}): Response {
-  return new Response(JSON.stringify(data), {
+  return new Response(JSON.stringify(v2Manifest(data)), {
     status: 200,
     headers: { "Content-Type": "application/json" },
   });
@@ -214,10 +398,134 @@ describe("Reflection plugin hooks", () => {
     expect(providerList).not.toHaveBeenCalled();
   });
 
+  it("rejects a session manifest without strict version 2 metadata", async () => {
+    const sessionId = "strict-manifest-session";
+    const messages = projectionMessages(sessionId);
+    const client = clientFor(messages);
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(
+        async () =>
+          new Response(
+            JSON.stringify({
+              manifest_version: 1,
+              session_id: sessionId,
+              segments: [],
+              boundaries: [],
+              targets: [],
+            }),
+            { status: 200, headers: { "Content-Type": "application/json" } },
+          ),
+      ),
+    );
+    const hooks = await Reflection(pluginInput(client));
+
+    await expect(
+      hooks["experimental.chat.messages.transform"]?.({}, {
+        messages: structuredClone(messages),
+      } as never),
+    ).rejects.toThrow("invalid segment summaries");
+  });
+
+  it("rejects manifest entries without explicit source boundaries", async () => {
+    const sessionId = "strict-boundary-session";
+    const messages = projectionMessages(sessionId);
+    const client = clientFor(messages);
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(
+        async () =>
+          new Response(
+            JSON.stringify({
+              manifest_version: 2,
+              session_id: sessionId,
+              segments: [
+                {
+                  id: segmentIdForRequest({
+                    session_id: sessionId,
+                    start_user_message_id: `${sessionId}-old-user`,
+                    source_boundary_version: 1,
+                    start_source_message_id: null,
+                  }),
+                  start_user_message_id: `${sessionId}-old-user`,
+                  end_user_message_id: `${sessionId}-old-user`,
+                  projection_version: 1,
+                  summary: "missing source fields",
+                },
+              ],
+              boundaries: [],
+              targets: [],
+            }),
+            { status: 200, headers: { "Content-Type": "application/json" } },
+          ),
+      ),
+    );
+    const hooks = await Reflection(pluginInput(client));
+
+    await expect(
+      hooks["experimental.chat.messages.transform"]?.({}, {
+        messages: structuredClone(messages),
+      } as never),
+    ).rejects.toThrow("invalid segment summaries");
+  });
+
+  it("hydrates only the exact V2 source span in memory_read_segment", async () => {
+    const sessionId = "exact-memory-session";
+    const messages = siblingProjectionMessages(sessionId);
+    const segment = segmentMessages(messages).find(
+      (candidate) => candidate.startMessageId === `${sessionId}-step-2`,
+    );
+    if (!segment || segment.sourceBoundaryVersion !== 2) {
+      throw new Error("expected an assistant-starting V2 segment");
+    }
+    const id = segmentId(sessionId, segment);
+    const client = clientFor(messages);
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        ok({
+          id,
+          session_id: sessionId,
+          start_user_message_id: segment.startUserMessageId,
+          end_user_message_id: segment.endUserMessageId,
+          ...segmentWireBoundary(segment),
+          summary: "Second tool step",
+          claims: [],
+          created_at: "2026-08-22T00:00:00Z",
+          updated_at: "2026-08-22T00:00:00Z",
+        }),
+      ),
+    );
+    const hooks = await Reflection(pluginInput(client));
+    const reader = hooks.tool?.memory_read_segment as unknown as {
+      execute(
+        args: { segment_id: string },
+        context: { abort: AbortSignal },
+      ): Promise<string>;
+    };
+
+    const result = JSON.parse(
+      await reader.execute(
+        { segment_id: id },
+        { abort: new AbortController().signal },
+      ),
+    );
+
+    expect(result).toMatchObject({
+      segment_id: id,
+      session_id: sessionId,
+      source_boundary_version: 2,
+      start_source_message_id: `${sessionId}-step-2`,
+      end_source_message_id: `${sessionId}-step-2`,
+      messages: [{ role: "assistant", text: "b".repeat(25_000) }],
+    });
+  });
+
   it("serializes target updates and waits for all pending updates before loading summaries", async () => {
     const sessionId = "serialized-session";
     const messages = projectionMessages(sessionId);
     const client = clientFor(messages);
+    const submittedBodies: Array<Record<string, unknown>> = [];
     const postResolvers: Array<() => void> = [];
     let activePosts = 0;
     let maxActivePosts = 0;
@@ -227,6 +535,7 @@ describe("Reflection plugin hooks", () => {
       "fetch",
       vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
         if (init?.method === "POST") {
+          submittedBodies.push(JSON.parse(String(init.body)));
           postCount += 1;
           activePosts += 1;
           maxActivePosts = Math.max(maxActivePosts, activePosts);
@@ -265,11 +574,17 @@ describe("Reflection plugin hooks", () => {
     expect(summaryGets).toBe(1);
 
     postResolvers.shift()?.();
+    await vi.waitFor(() => expect(postResolvers).toHaveLength(1));
+    expect(summaryGets).toBe(3);
+    postResolvers.shift()?.();
 
     await Promise.all([firstIdle, secondIdle, projection]);
     expect(maxActivePosts).toBe(1);
+    expect(submittedBodies.map((body) => body.processing_priority)).toEqual([
+      0, 100,
+    ]);
     expect(summaryGets).toBe(4);
-    expect(client.session.messages).toHaveBeenCalledTimes(2);
+    expect(client.session.messages).toHaveBeenCalledTimes(3);
     expect(client.session.status).toHaveBeenCalledTimes(4);
     expect(output.messages[1]?.parts[0]?.text).toContain(
       "Reflection compacted older context with omissions",
@@ -278,7 +593,7 @@ describe("Reflection plugin hooks", () => {
     await hooks.event?.({
       event: { type: "session.idle", properties: { sessionID: sessionId } },
     } as never);
-    expect(postCount).toBe(1);
+    expect(postCount).toBe(2);
   });
 
   it("posts only newly closed segments on active idle", async () => {
@@ -308,6 +623,10 @@ describe("Reflection plugin hooks", () => {
     expect(submittedBodies[0]).toMatchObject({
       start_user_message_id: `${sessionId}-old-user`,
       end_user_message_id: `${sessionId}-old-user`,
+      source_boundary_version: 2,
+      start_source_message_id: `${sessionId}-old-user`,
+      end_source_message_id: `${sessionId}-old-assistant`,
+      processing_priority: 0,
     });
     expect(submittedBodies).not.toContainEqual(
       expect.objectContaining({
@@ -331,6 +650,251 @@ describe("Reflection plugin hooks", () => {
     expect(submittedBodies[1]).toMatchObject({
       start_user_message_id: `${sessionId}-current`,
       end_user_message_id: `${sessionId}-current`,
+      source_boundary_version: 2,
+      start_source_message_id: `${sessionId}-current`,
+      end_source_message_id: `${sessionId}-current-assistant`,
+      processing_priority: 0,
+    });
+  });
+
+  it("keeps same-user sibling caches and cross-writer invalidation independent", async () => {
+    const sessionId = "sibling-cache-session";
+    const messages = siblingProjectionMessages(sessionId);
+    const canonical = segmentMessages(messages);
+    const siblings = canonical.filter(
+      (segment) => segment.startUserMessageId === `${sessionId}-turn`,
+    );
+    expect(siblings).toHaveLength(2);
+    expect(segmentId(sessionId, siblings[0]!)).not.toBe(
+      segmentId(sessionId, siblings[1]!),
+    );
+    const client = clientFor(messages);
+    let boundaries: unknown[] = [];
+    const posted: Array<Record<string, unknown>> = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+        if (init?.method === "POST") {
+          posted.push(JSON.parse(String(init.body)));
+          return ok();
+        }
+        const match = String(url).match(/\/v1\/sessions\/([^/]+)\/segments/);
+        return ok({
+          session_id: match ? decodeURIComponent(match[1]!) : sessionId,
+          segments: [],
+          boundaries,
+          targets: [],
+        });
+      }),
+    );
+    const hooks = await Reflection(pluginInput(client));
+    const idle = {
+      event: { type: "session.idle", properties: { sessionID: sessionId } },
+    } as never;
+
+    await hooks.event?.(idle);
+    await hooks.event?.(idle);
+    expect(posted).toHaveLength(2);
+    expect(posted.map((body) => body.processing_priority)).toEqual([0, 0]);
+    expect(
+      posted.map((body) =>
+        segmentIdForRequest(body as Parameters<typeof segmentIdForRequest>[0]),
+      ),
+    ).toEqual(siblings.map((segment) => segmentId(sessionId, segment)));
+
+    boundaries = [
+      segmentBoundary(sessionId, siblings[0]!, "cross-writer-snapshot"),
+      segmentBoundary(sessionId, siblings[1]!),
+    ];
+    await hooks.event?.(idle);
+    expect(posted).toHaveLength(3);
+    expect(
+      segmentIdForRequest(
+        posted[2] as Parameters<typeof segmentIdForRequest>[0],
+      ),
+    ).toBe(segmentId(sessionId, siblings[0]!));
+
+    boundaries = siblings.map((segment) => segmentBoundary(sessionId, segment));
+    messages[2]!.parts = [{ type: "text", text: "changed sibling source" }];
+    await hooks.event?.(idle);
+    expect(posted).toHaveLength(4);
+    expect(
+      segmentIdForRequest(
+        posted[3] as Parameters<typeof segmentIdForRequest>[0],
+      ),
+    ).toBe(segmentId(sessionId, siblings[1]!));
+  });
+
+  it("promotes an idle submission once for foreground processing", async () => {
+    const sessionId = "priority-promotion-session";
+    const messages = projectionMessages(sessionId);
+    const client = clientFor(messages);
+    const submittedBodies: Array<Record<string, unknown>> = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+        if (init?.method === "POST") {
+          submittedBodies.push(JSON.parse(String(init.body)));
+          return ok();
+        }
+        return emptyListing(url);
+      }),
+    );
+    const hooks = await Reflection(pluginInput(client));
+    const idle = {
+      event: { type: "session.idle", properties: { sessionID: sessionId } },
+    } as never;
+
+    await hooks.event?.(idle);
+    await hooks["experimental.chat.messages.transform"]?.({}, {
+      messages: structuredClone(messages),
+    } as never);
+    expect(submittedBodies.map((body) => body.processing_priority)).toEqual([
+      0, 100,
+    ]);
+
+    rmSync(
+      join(
+        paths.home,
+        ".local",
+        "state",
+        "reflection",
+        "projection",
+        `${encodeURIComponent(sessionId)}.json`,
+      ),
+      { force: true },
+    );
+    await hooks["experimental.chat.messages.transform"]?.({}, {
+      messages: structuredClone(messages),
+    } as never);
+
+    expect(submittedBodies.map((body) => body.processing_priority)).toEqual([
+      0, 100,
+    ]);
+  });
+
+  it("clears only a removed sibling failure after a history rewind", async () => {
+    const sessionId = "sibling-rewind-session";
+    const original = siblingProjectionMessages(sessionId);
+    let currentMessages = original;
+    const originalSegments = segmentMessages(original);
+    const siblings = originalSegments.filter(
+      (segment) => segment.startUserMessageId === `${sessionId}-turn`,
+    );
+    const retained = siblings[0]!;
+    const removed = siblings[1]!;
+    const client = clientFor(original);
+    client.session.messages.mockImplementation(async () => ({
+      data: currentMessages,
+    }));
+    let failRemoved = true;
+    const postedIds: string[] = [];
+    const postedPriorities: number[] = [];
+    let manifest = {
+      segments: [] as unknown[],
+      boundaries: [] as unknown[],
+    };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+        if (init?.method === "POST") {
+          const body = JSON.parse(String(init.body));
+          const id = segmentIdForRequest(body);
+          postedIds.push(id);
+          postedPriorities.push(body.processing_priority);
+          if (id === segmentId(sessionId, removed) && failRemoved) {
+            failRemoved = false;
+            return new Response("failed", { status: 500 });
+          }
+          return ok();
+        }
+        return ok({
+          session_id: sessionId,
+          segments: manifest.segments,
+          boundaries: manifest.boundaries,
+          targets: [],
+        });
+      }),
+    );
+    const hooks = await Reflection(pluginInput(client));
+    const idle = {
+      event: { type: "session.idle", properties: { sessionID: sessionId } },
+    } as never;
+
+    await hooks.event?.(idle);
+    expect(postedIds).toEqual([
+      segmentId(sessionId, retained),
+      segmentId(sessionId, removed),
+    ]);
+
+    currentMessages = original.filter(
+      (message) => message.info.id !== `${sessionId}-step-2`,
+    );
+    manifest = {
+      segments: [segmentSummary(sessionId, retained, "Retained summary")],
+      boundaries: [segmentBoundary(sessionId, retained)],
+    };
+    await hooks.event?.(idle);
+    const output = { messages: structuredClone(currentMessages) };
+    await hooks["experimental.chat.messages.transform"]?.({}, output as never);
+
+    expect(postedIds).toEqual([
+      segmentId(sessionId, retained),
+      segmentId(sessionId, removed),
+      segmentId(sessionId, retained),
+    ]);
+    expect(postedPriorities).toEqual([0, 0, 100]);
+    expect(output.messages[1]?.parts[0]?.text).toContain("Retained summary");
+    expect(output.messages[1]?.parts[0]?.text).not.toContain(
+      "Reflection summaries were unavailable",
+    );
+  });
+
+  it("plans and submits from one raw snapshot instead of filtered history", async () => {
+    const sessionId = "raw-filtered-session";
+    const raw = siblingProjectionMessages(sessionId);
+    const filtered = raw.filter(
+      (message) => message.info.id !== `${sessionId}-step-1`,
+    );
+    const visibleAssistant = filtered.find(
+      (message) => message.info.id === `${sessionId}-step-2`,
+    );
+    visibleAssistant!.info.tokens = {
+      input: 100_000,
+      output: 1_000,
+      reasoning: 0,
+      cache: { read: 0, write: 0 },
+    };
+    const client = clientFor(raw);
+    const posted: Array<Record<string, unknown>> = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+        if (init?.method === "POST") {
+          posted.push(JSON.parse(String(init.body)));
+          return ok();
+        }
+        return emptyListing(url);
+      }),
+    );
+    const hooks = await Reflection(pluginInput(client));
+    const output = { messages: structuredClone(filtered) };
+
+    await hooks["experimental.chat.messages.transform"]?.({}, output as never);
+
+    expect(client.session.messages).toHaveBeenCalledOnce();
+    expect(posted).toHaveLength(2);
+    expect(posted.every((body) => body.processing_priority === 100)).toBe(true);
+    expect(posted[0]).toMatchObject({
+      start_source_message_id: `${sessionId}-turn`,
+      end_source_message_id: `${sessionId}-step-1`,
+      messages: expect.arrayContaining([
+        expect.objectContaining({ text: "a".repeat(25_000) }),
+      ]),
+    });
+    expect(posted[1]).toMatchObject({
+      start_source_message_id: `${sessionId}-step-2`,
+      end_source_message_id: `${sessionId}-step-2`,
     });
   });
 
@@ -560,19 +1124,21 @@ describe("Reflection plugin hooks", () => {
     const messages = projectionMessages(sessionId);
     const client = clientFor(messages);
     let releaseMessages: (() => void) | undefined;
-    client.session.messages.mockImplementation(
-      async () =>
-        new Promise<{ data: OpenCodeMessage[] }>((resolve) => {
-          releaseMessages = () => resolve({ data: messages });
-        }),
-    );
+    client.session.messages
+      .mockResolvedValue({ data: messages })
+      .mockImplementationOnce(
+        async () =>
+          new Promise<{ data: OpenCodeMessage[] }>((resolve) => {
+            releaseMessages = () => resolve({ data: messages });
+          }),
+      );
     let summaryGets = 0;
-    let targetPosts = 0;
+    const submittedBodies: Array<Record<string, unknown>> = [];
     vi.stubGlobal(
       "fetch",
       vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
         if (init?.method === "POST") {
-          targetPosts += 1;
+          submittedBodies.push(JSON.parse(String(init.body)));
           return ok();
         }
         summaryGets += 1;
@@ -599,10 +1165,12 @@ describe("Reflection plugin hooks", () => {
     await Promise.resolve();
 
     expect(summaryGets).toBe(0);
-    expect(targetPosts).toBe(0);
+    expect(submittedBodies).toHaveLength(0);
     releaseMessages?.();
     await Promise.all([idle, projection]);
-    expect(targetPosts).toBe(1);
+    expect(submittedBodies.map((body) => body.processing_priority)).toEqual([
+      0, 100,
+    ]);
     expect(summaryGets).toBe(3);
   });
 
@@ -619,11 +1187,13 @@ describe("Reflection plugin hooks", () => {
     );
     let blockPosts = false;
     const postResolvers: Array<() => void> = [];
+    const submittedBodies: Array<Record<string, unknown>> = [];
     let summaryGets = 0;
     vi.stubGlobal(
       "fetch",
       vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
         if (init?.method === "POST") {
+          submittedBodies.push(JSON.parse(String(init.body)));
           if (blockPosts) {
             await new Promise<void>((resolve) => postResolvers.push(resolve));
           }
@@ -671,10 +1241,21 @@ describe("Reflection plugin hooks", () => {
     expect(summaryGets).toBe(1);
 
     releaseList?.();
-    await vi.waitFor(() => expect(postResolvers).toHaveLength(1));
-    postResolvers.shift()?.();
+    for (let index = 0; index < 3; index += 1) {
+      await vi.waitFor(() => expect(postResolvers).toHaveLength(1));
+      postResolvers.shift()?.();
+    }
     await Promise.all([firstIdle, overlappingIdle, projection]);
-    expect(client.session.messages).toHaveBeenCalledTimes(2);
+    expect(client.session.messages).toHaveBeenCalledTimes(3);
+    expect(submittedBodies.map((body) => body.processing_priority)).toEqual([
+      0, 0, 100, 100,
+    ]);
+    expect(submittedBodies.map((body) => body.start_user_message_id)).toEqual([
+      `${sessionId}-old-user`,
+      `${sessionId}-current`,
+      `${sessionId}-old-user`,
+      `${sessionId}-current`,
+    ]);
     expect(summaryGets).toBe(4);
   });
 
@@ -970,11 +1551,14 @@ describe("Reflection plugin hooks", () => {
               end_user_message_id: `${sessionId}-old-user`,
               projection_version: 1,
               source_eligible: true,
-              source_fingerprint: segmentFingerprint(
-                sessionId,
-                messages,
-                `${sessionId}-old-user`,
-              ),
+              source_fingerprint:
+                synced && submittedBodies[1]
+                  ? sourceFingerprint(
+                      submittedBodies[1] as Parameters<
+                        typeof sourceFingerprint
+                      >[0],
+                    )
+                  : "stale-fingerprint",
             },
           ],
           targets: [],
@@ -1163,7 +1747,7 @@ describe("Reflection plugin hooks", () => {
     );
   });
 
-  it("keeps a failed target through an SDK-resolved message-list error", async () => {
+  it("fails closed when the authoritative raw message snapshot is unavailable", async () => {
     const sessionId = "resolved-message-error-session";
     const messages = projectionMessages(sessionId);
     const client = clientFor(messages);
@@ -1217,13 +1801,12 @@ describe("Reflection plugin hooks", () => {
     resolveWithError = true;
     await hooks.event?.(idle);
     const output = { messages: structuredClone(messages) };
-    await hooks["experimental.chat.messages.transform"]?.({}, output as never);
+    await expect(
+      hooks["experimental.chat.messages.transform"]?.({}, output as never),
+    ).rejects.toThrow(`could not load messages for ${sessionId}`);
 
-    const context = output.messages[1]?.parts[0]?.text;
-    expect(targetPosts).toBe(2);
+    expect(targetPosts).toBe(1);
     expect(summaryGets).toBe(2);
-    expect(context).toContain("Reflection summaries were unavailable");
-    expect(context).not.toContain("STALE LOSSLESS SUMMARY");
     expect(client.session.messages).toHaveBeenCalledWith({
       path: { id: sessionId },
       query: { directory: "/tmp" },
@@ -1231,7 +1814,7 @@ describe("Reflection plugin hooks", () => {
     });
   });
 
-  it("keeps a present failed boundary through capture error and unrelated success", async () => {
+  it("does not transfer a failure to unrelated history reusing a user ID", async () => {
     const sessionId = "present-failure-session";
     const original = projectionMessages(sessionId);
     const presentHistory = projectionMessages(sessionId);
@@ -1247,14 +1830,14 @@ describe("Reflection plugin hooks", () => {
       if (failCapture) throw new Error("capture failed");
       return { data: currentMessages };
     });
-    let targetPosts = 0;
+    const submittedBodies: Array<Record<string, unknown>> = [];
     let summaryGets = 0;
     vi.stubGlobal(
       "fetch",
       vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
         if (init?.method === "POST") {
-          targetPosts += 1;
-          return targetPosts === 1
+          submittedBodies.push(JSON.parse(String(init.body)));
+          return submittedBodies.length === 1
             ? new Response("failed", { status: 500 })
             : ok();
         }
@@ -1281,10 +1864,20 @@ describe("Reflection plugin hooks", () => {
     const output = { messages: structuredClone(presentHistory) };
     await hooks["experimental.chat.messages.transform"]?.({}, output as never);
 
-    expect(targetPosts).toBe(2);
-    expect(summaryGets).toBe(3);
-    expect(output.messages[1]?.parts[0]?.text).toContain(
+    expect(submittedBodies.map((body) => body.processing_priority)).toEqual([
+      0, 0, 100,
+    ]);
+    expect(submittedBodies.map((body) => body.start_user_message_id)).toEqual([
+      failedSegmentKey,
+      newClosedKey,
+      newClosedKey,
+    ]);
+    expect(summaryGets).toBe(4);
+    expect(output.messages[1]?.parts[0]?.text).not.toContain(
       "Reflection summaries were unavailable",
+    );
+    expect(output.messages[1]?.parts[0]?.text).toContain(
+      "archived closed segments had no exact committed Reflection summary",
     );
   });
 
@@ -1292,14 +1885,14 @@ describe("Reflection plugin hooks", () => {
     const sessionId = "failed-segment-retry-session";
     const messages = projectionMessages(sessionId);
     const client = clientFor(messages);
-    let targetPosts = 0;
+    const submittedBodies: Array<Record<string, unknown>> = [];
     let summaryGets = 0;
     vi.stubGlobal(
       "fetch",
       vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
         if (init?.method === "POST") {
-          targetPosts += 1;
-          return targetPosts === 1
+          submittedBodies.push(JSON.parse(String(init.body)));
+          return submittedBodies.length === 1
             ? new Response("failed", { status: 500 })
             : ok();
         }
@@ -1324,7 +1917,9 @@ describe("Reflection plugin hooks", () => {
       messages: structuredClone(messages),
     } as never);
 
-    expect(targetPosts).toBe(2);
+    expect(submittedBodies.map((body) => body.processing_priority)).toEqual([
+      0, 0, 100,
+    ]);
     expect(summaryGets).toBe(5);
   });
 
@@ -1457,6 +2052,7 @@ describe("Reflection plugin hooks", () => {
     replacement[0]!.info.id = `${sessionId}-replacement-user`;
     replacement[1]!.info.id = `${sessionId}-replacement-assistant`;
     replacement[1]!.info.parentID = `${sessionId}-replacement-user`;
+    currentMessages = replacement;
     const output = { messages: structuredClone(replacement) };
     await hooks["experimental.chat.messages.transform"]?.({}, output as never);
 
@@ -1499,7 +2095,170 @@ describe("Reflection plugin hooks", () => {
     });
   });
 
-  it("bounds the aggregate foreground target wait to five seconds", async () => {
+  it("waits for an exact required staged summary to appear", async () => {
+    vi.useFakeTimers();
+    const sessionId = "summary-poll-session";
+    const messages = projectionMessages(sessionId);
+    const required = segmentMessages(messages)[0]!;
+    const client = clientFor(messages);
+    let gets = 0;
+    const posted: Array<Record<string, unknown>> = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+        if (init?.method === "POST") {
+          posted.push(JSON.parse(String(init.body)));
+          return ok();
+        }
+        gets += 1;
+        if (gets === 1) {
+          return ok({
+            session_id: sessionId,
+            segments: [],
+            boundaries: [],
+            targets: [],
+          });
+        }
+        if (gets === 2) {
+          return ok({
+            session_id: sessionId,
+            segments: [],
+            boundaries: [],
+            targets: [segmentTarget(sessionId, required)],
+          });
+        }
+        return ok({
+          session_id: sessionId,
+          segments: [
+            segmentSummary(sessionId, required, "Summary became available"),
+          ],
+          boundaries: [],
+          targets: [segmentTarget(sessionId, required)],
+        });
+      }),
+    );
+    const hooks = await Reflection(pluginInput(client));
+    const output = { messages: structuredClone(messages) };
+    const projection = hooks["experimental.chat.messages.transform"]?.(
+      {},
+      output as never,
+    );
+
+    await vi.advanceTimersByTimeAsync(0);
+    expect(gets).toBe(2);
+    await vi.advanceTimersByTimeAsync(SUMMARY_POLL_INTERVAL_MS - 1);
+    expect(gets).toBe(2);
+    await vi.advanceTimersByTimeAsync(1);
+    await projection;
+
+    expect(gets).toBe(3);
+    expect(posted).toHaveLength(1);
+    expect(posted[0]?.processing_priority).toBe(100);
+    expect(output.messages[1]?.parts[0]?.text).toContain(
+      "Summary became available",
+    );
+    expect(output.messages[1]?.parts[0]?.text).not.toContain(
+      PROJECTION_LOSS_WARNING,
+    );
+  });
+
+  it("bounds summary polling and falls back to explicit lossy projection", async () => {
+    vi.useFakeTimers();
+    const sessionId = "summary-poll-timeout-session";
+    const messages = projectionMessages(sessionId);
+    const required = segmentMessages(messages)[0]!;
+    const client = clientFor(messages);
+    let gets = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+        if (init?.method === "POST") return ok();
+        gets += 1;
+        return ok({
+          session_id: sessionId,
+          segments: [],
+          boundaries: [],
+          targets: gets === 1 ? [] : [segmentTarget(sessionId, required)],
+        });
+      }),
+    );
+    const hooks = await Reflection(pluginInput(client));
+    const output = { messages: structuredClone(messages) };
+    const projection = hooks["experimental.chat.messages.transform"]?.(
+      {},
+      output as never,
+    );
+
+    await vi.advanceTimersByTimeAsync(
+      SUMMARY_WAIT_TIMEOUT_MS + SUMMARY_POLL_INTERVAL_MS,
+    );
+    await projection;
+
+    expect(gets).toBeGreaterThan(2);
+    expect(output.messages[1]?.parts[0]?.text).toContain(
+      "Reflection summaries were unavailable",
+    );
+  });
+
+  it("falls back lossily when summary polling loses the service", async () => {
+    const sessionId = "summary-poll-service-failure";
+    const messages = projectionMessages(sessionId);
+    const client = clientFor(messages);
+    let gets = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+        if (init?.method === "POST") return ok();
+        gets += 1;
+        return gets === 1
+          ? ok({
+              session_id: sessionId,
+              segments: [],
+              boundaries: [],
+              targets: [],
+            })
+          : new Response("service unavailable", { status: 503 });
+      }),
+    );
+    const hooks = await Reflection(pluginInput(client));
+    const output = { messages: structuredClone(messages) };
+
+    await hooks["experimental.chat.messages.transform"]?.({}, output as never);
+
+    expect(gets).toBe(2);
+    expect(output.messages[1]?.parts[0]?.text).toContain(
+      "Reflection summaries were unavailable",
+    );
+  });
+
+  it("falls back without submitting an unanchored plan when the manifest is unavailable", async () => {
+    const sessionId = "initial-manifest-service-failure";
+    const messages = projectionMessages(sessionId);
+    const client = clientFor(messages);
+    let posts = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+        if (init?.method === "POST") {
+          posts += 1;
+          return ok();
+        }
+        return new Response("service unavailable", { status: 503 });
+      }),
+    );
+    const hooks = await Reflection(pluginInput(client));
+    const output = { messages: structuredClone(messages) };
+
+    await hooks["experimental.chat.messages.transform"]?.({}, output as never);
+
+    expect(posts).toBe(0);
+    expect(client.session.messages).toHaveBeenCalledOnce();
+    expect(output.messages[1]?.parts[0]?.text).toContain(
+      "Reflection summaries were unavailable",
+    );
+  });
+
+  it("bounds serialized idle and foreground target waits", async () => {
     vi.useFakeTimers();
     const sessionId = "target-timeout-session";
     const messages = projectionMessages(sessionId);
@@ -1537,7 +2296,7 @@ describe("Reflection plugin hooks", () => {
       output as never,
     );
 
-    await vi.advanceTimersByTimeAsync(5_000);
+    await vi.advanceTimersByTimeAsync(10_000);
     await Promise.all([idle, projection]);
 
     expect(summaryGets).toBe(2);
@@ -1587,7 +2346,7 @@ describe("Reflection plugin hooks", () => {
 
     expect(client.session.prompt).toHaveBeenCalledOnce();
     expect(client.session.status).not.toHaveBeenCalled();
-    expect(client.session.messages).not.toHaveBeenCalled();
+    expect(client.session.messages).toHaveBeenCalledOnce();
     expect(client.session.list).not.toHaveBeenCalled();
     expect(client.session.prompt).toHaveBeenCalledWith({
       path: { id: sessionId },

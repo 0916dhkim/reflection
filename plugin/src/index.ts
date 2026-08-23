@@ -3,14 +3,16 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 
 import { tool, type Plugin } from "@opencode-ai/plugin";
-
-import { requestSignal, safeErrorDetail } from "./http.js";
 import {
-  activeModel,
-  projectMessages,
-  type StoredSegmentSummary,
-} from "./projection.js";
-import { ProjectionStateStore } from "./projection-state.js";
+  parseSegmentResponse,
+  parseSessionSegmentsResponse,
+  type JobStatus,
+  type SegmentCreate,
+  type SegmentResponse,
+  type SegmentSummary,
+  type SessionSegmentsResponse,
+} from "@reflection/shared/contracts";
+import { segmentIdForRequest } from "@reflection/shared/domain";
 import {
   PROJECTION_LOSS_WARNING,
   PROJECTION_LOSS_WARNING_METADATA,
@@ -21,7 +23,15 @@ import {
   submissionSourceFingerprint,
   type OpenCodeMessage,
   type ReflectionSegment,
-} from "./segments.js";
+} from "@reflection/shared/segmentation";
+
+import { requestSignal, safeErrorDetail } from "./http.js";
+import {
+  activeModel,
+  projectMessages,
+  type StoredSegmentSummary,
+} from "./projection.js";
+import { ProjectionStateStore } from "./projection-state.js";
 
 const CONFIG_PATH = join(homedir(), ".config", "opencode", "reflection.json");
 const PROJECTION_STATE_PATH = join(
@@ -35,6 +45,8 @@ const INACTIVE_MS = 10 * 60 * 1000;
 const PROJECTION_REQUEST_TIMEOUT_MS = 5_000;
 const TARGET_POST_TIMEOUT_MS = 5_000;
 const TARGET_WAIT_TIMEOUT_MS = 5_000;
+const SUMMARY_WAIT_TIMEOUT_MS = 90_000;
+const SUMMARY_POLL_INTERVAL_MS = 1_000;
 const PROJECTION_VERSION = 1;
 const DEFAULT_OUTPUT_TOKEN_MAX = 32_000;
 
@@ -51,16 +63,12 @@ interface ApiResult {
   detail: string;
 }
 
-interface StoredSegment {
-  session_id: string;
-  start_user_message_id: string;
-  end_user_message_id: string;
-}
+type StoredSegment = SegmentResponse;
 
 interface SegmentListing {
   summaries: StoredSegmentSummary[];
   boundaries: CommittedSegmentBoundary[];
-  targets: Array<CommittedSegmentBoundary & { status: string }>;
+  targets: Array<CommittedSegmentBoundary & { status: JobStatus }>;
 }
 
 function segmentAnchors(listing: SegmentListing): CommittedSegmentBoundary[] {
@@ -137,6 +145,13 @@ class SegmentSubmissionError extends Error {
   ) {
     super(message);
     this.name = "SegmentSubmissionError";
+  }
+}
+
+class SegmentListingUnavailableError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "SegmentListingUnavailableError";
   }
 }
 
@@ -221,126 +236,116 @@ async function apiCall(
 }
 
 function parseStoredSegment(data: unknown): StoredSegment | null {
-  if (typeof data !== "object" || data === null) return null;
-  const value = data as Record<string, unknown>;
-  if (
-    typeof value.session_id !== "string" ||
-    typeof value.start_user_message_id !== "string" ||
-    typeof value.end_user_message_id !== "string"
-  ) {
+  try {
+    return parseSegmentResponse(data);
+  } catch {
     return null;
   }
-  return {
-    session_id: value.session_id,
-    start_user_message_id: value.start_user_message_id,
-    end_user_message_id: value.end_user_message_id,
-  };
 }
 
-function submissionBody(sessionId: string, segment: ReflectionSegment) {
-  return {
+function submissionBody(
+  sessionId: string,
+  segment: ReflectionSegment,
+  processingPriority: number,
+): SegmentCreate {
+  const common = {
     session_id: sessionId,
     start_user_message_id: segment.startUserMessageId,
     end_user_message_id: segment.endUserMessageId,
-    projection_version: PROJECTION_VERSION,
+    projection_version: PROJECTION_VERSION as 1,
+    processing_priority: processingPriority,
     messages: segment.messages,
   };
+  if (segment.sourceBoundaryVersion === 1) {
+    return {
+      ...common,
+      source_boundary_version: 1,
+      start_source_message_id: null,
+      end_source_message_id: null,
+    };
+  }
+  if (
+    segment.startSourceMessageId === null ||
+    segment.endSourceMessageId === null
+  ) {
+    throw new Error("V2 segments require complete source boundaries");
+  }
+  return {
+    ...common,
+    source_boundary_version: 2,
+    start_source_message_id: segment.startSourceMessageId,
+    end_source_message_id: segment.endSourceMessageId,
+  };
+}
+
+function toCommittedBoundary(
+  value: SessionSegmentsResponse["boundaries"][number],
+): CommittedSegmentBoundary {
+  const common = {
+    id: value.id,
+    startUserMessageId: value.start_user_message_id,
+    endUserMessageId: value.end_user_message_id,
+    projectionVersion: value.projection_version,
+    sourceEligible: value.source_eligible,
+    sourceFingerprint: value.source_fingerprint ?? undefined,
+  };
+  return value.source_boundary_version === 1
+    ? {
+        ...common,
+        sourceBoundaryVersion: 1,
+        startSourceMessageId: null,
+        endSourceMessageId: null,
+      }
+    : {
+        ...common,
+        sourceBoundaryVersion: 2,
+        startSourceMessageId: value.start_source_message_id,
+        endSourceMessageId: value.end_source_message_id,
+      };
+}
+
+function toTargetBoundary(
+  value: SessionSegmentsResponse["targets"][number],
+): SegmentListing["targets"][number] {
+  const common = {
+    id: value.id,
+    startUserMessageId: value.start_user_message_id,
+    endUserMessageId: value.end_user_message_id,
+    projectionVersion: value.projection_version,
+    sourceEligible: false,
+    sourceFingerprint: value.source_fingerprint,
+    status: value.status,
+  };
+  return value.source_boundary_version === 1
+    ? {
+        ...common,
+        sourceBoundaryVersion: 1,
+        startSourceMessageId: null,
+        endSourceMessageId: null,
+      }
+    : {
+        ...common,
+        sourceBoundaryVersion: 2,
+        startSourceMessageId: value.start_source_message_id,
+        endSourceMessageId: value.end_source_message_id,
+      };
 }
 
 function parseSegmentListing(
   data: unknown,
   sessionId: string,
 ): SegmentListing | null {
-  if (
-    typeof data !== "object" ||
-    data === null ||
-    !("segments" in data) ||
-    !("boundaries" in data) ||
-    !("session_id" in data) ||
-    data.session_id !== sessionId
-  ) {
+  try {
+    const parsed = parseSessionSegmentsResponse(data);
+    if (parsed.session_id !== sessionId) return null;
+    return {
+      summaries: parsed.segments,
+      boundaries: parsed.boundaries.map(toCommittedBoundary),
+      targets: parsed.targets.map(toTargetBoundary),
+    };
+  } catch {
     return null;
   }
-  if (
-    !("targets" in data) ||
-    !Array.isArray(data.segments) ||
-    !Array.isArray(data.boundaries) ||
-    !Array.isArray(data.targets)
-  )
-    return null;
-  const result: StoredSegmentSummary[] = [];
-  for (const item of data.segments) {
-    if (typeof item !== "object" || item === null) return null;
-    const value = item as Record<string, unknown>;
-    if (
-      typeof value.id !== "string" ||
-      typeof value.start_user_message_id !== "string" ||
-      typeof value.end_user_message_id !== "string" ||
-      !Number.isInteger(value.projection_version) ||
-      typeof value.summary !== "string"
-    ) {
-      return null;
-    }
-    result.push({
-      id: value.id,
-      start_user_message_id: value.start_user_message_id,
-      end_user_message_id: value.end_user_message_id,
-      projection_version: value.projection_version as number,
-      summary: value.summary,
-    });
-  }
-  const boundaries: CommittedSegmentBoundary[] = [];
-  for (const item of data.boundaries) {
-    if (typeof item !== "object" || item === null) return null;
-    const value = item as Record<string, unknown>;
-    if (
-      typeof value.id !== "string" ||
-      typeof value.start_user_message_id !== "string" ||
-      typeof value.end_user_message_id !== "string" ||
-      !Number.isInteger(value.projection_version) ||
-      typeof value.source_eligible !== "boolean" ||
-      (value.source_fingerprint !== null &&
-        typeof value.source_fingerprint !== "string")
-    ) {
-      return null;
-    }
-    boundaries.push({
-      id: value.id,
-      startUserMessageId: value.start_user_message_id,
-      endUserMessageId: value.end_user_message_id,
-      projectionVersion: value.projection_version as number,
-      sourceEligible: value.source_eligible,
-      sourceFingerprint:
-        typeof value.source_fingerprint === "string"
-          ? value.source_fingerprint
-          : undefined,
-    });
-  }
-  const targets: SegmentListing["targets"] = [];
-  for (const item of data.targets) {
-    if (typeof item !== "object" || item === null) return null;
-    const value = item as Record<string, unknown>;
-    if (
-      typeof value.id !== "string" ||
-      typeof value.start_user_message_id !== "string" ||
-      typeof value.end_user_message_id !== "string" ||
-      !Number.isInteger(value.projection_version) ||
-      typeof value.status !== "string" ||
-      typeof value.source_fingerprint !== "string"
-    ) {
-      return null;
-    }
-    targets.push({
-      id: value.id,
-      startUserMessageId: value.start_user_message_id,
-      endUserMessageId: value.end_user_message_id,
-      projectionVersion: value.projection_version as number,
-      sourceEligible: false,
-      sourceFingerprint: value.source_fingerprint,
-      status: value.status,
-    });
-  }
-  return { summaries: result, boundaries, targets };
 }
 
 function formatData(data: unknown): string {
@@ -363,7 +368,10 @@ export const Reflection: Plugin = async ({ client, directory }) => {
   const targetRevisions = new Map<string, number>();
   const targetUpdateAborts = new Map<string, Set<AbortController>>();
   const idlePasses = new Map<string, IdlePassState>();
-  const successfulSegmentFingerprints = new Map<string, Map<string, string>>();
+  const successfulSegmentFingerprints = new Map<
+    string,
+    Map<string, { fingerprint: string; processingPriority: number }>
+  >();
   const deletedSessions = new Set<string>();
   const pendingProjectionWarnings = new Map<string, PendingProjectionWarning>();
   const projectionWarningsInFlight = new Map<string, Promise<void>>();
@@ -375,15 +383,15 @@ export const Reflection: Plugin = async ({ client, directory }) => {
     if (!cached) return;
     const authoritative = new Map(
       [...listing.boundaries, ...listing.targets].flatMap((boundary) =>
-        boundary.sourceFingerprint
-          ? [[boundary.startUserMessageId, boundary.sourceFingerprint] as const]
+        boundary.id && boundary.sourceFingerprint
+          ? [[boundary.id, boundary.sourceFingerprint] as const]
           : [],
       ),
     );
-    for (const [startUserMessageId, fingerprint] of cached) {
-      const current = authoritative.get(startUserMessageId);
-      if (current !== undefined && current !== fingerprint) {
-        cached.delete(startUserMessageId);
+    for (const [segmentId, submission] of cached) {
+      const current = authoritative.get(segmentId);
+      if (current !== undefined && current !== submission.fingerprint) {
+        cached.delete(segmentId);
       }
     }
   };
@@ -464,18 +472,24 @@ export const Reflection: Plugin = async ({ client, directory }) => {
     sessionId: string,
     segments: readonly ReflectionSegment[],
     includeOpenSegment: boolean,
+    processingPriority: number,
     signal: AbortSignal,
   ): Promise<string[]> => {
     const fingerprints =
-      successfulSegmentFingerprints.get(sessionId) ?? new Map<string, string>();
+      successfulSegmentFingerprints.get(sessionId) ??
+      new Map<string, { fingerprint: string; processingPriority: number }>();
     successfulSegmentFingerprints.set(sessionId, fingerprints);
     const successful: string[] = [];
     for (const segment of segments) {
       if (!segment.closed && !includeOpenSegment) continue;
-      const body = submissionBody(sessionId, segment);
-      const segmentKey = segment.startUserMessageId;
+      const body = submissionBody(sessionId, segment, processingPriority);
+      const segmentKey = segmentIdForRequest(body);
       const fingerprint = submissionSourceFingerprint(sessionId, segment);
-      if (fingerprints.get(segmentKey) === fingerprint) {
+      const previous = fingerprints.get(segmentKey);
+      if (
+        previous?.fingerprint === fingerprint &&
+        previous.processingPriority >= processingPriority
+      ) {
         successful.push(segmentKey);
         continue;
       }
@@ -498,7 +512,7 @@ export const Reflection: Plugin = async ({ client, directory }) => {
         if (!segment.closed) continue;
         throw new SegmentSubmissionError(failure, segmentKey);
       }
-      fingerprints.set(segmentKey, fingerprint);
+      fingerprints.set(segmentKey, { fingerprint, processingPriority });
       successful.push(segmentKey);
     }
     return successful;
@@ -649,7 +663,9 @@ export const Reflection: Plugin = async ({ client, directory }) => {
       PROJECTION_REQUEST_TIMEOUT_MS,
     );
     if (!response.ok) {
-      throw new Error(formatApiFailure("context projection", response));
+      throw new SegmentListingUnavailableError(
+        formatApiFailure("context projection", response),
+      );
     }
     const listing = parseSegmentListing(response.data, sessionId);
     if (!listing) {
@@ -661,8 +677,8 @@ export const Reflection: Plugin = async ({ client, directory }) => {
 
   const getFreshSegmentListing = async (
     sessionId: string,
+    deadline = Date.now() + TARGET_WAIT_TIMEOUT_MS,
   ): Promise<SegmentListing> => {
-    const deadline = Date.now() + TARGET_WAIT_TIMEOUT_MS;
     while (true) {
       await waitForTargetUpdates(sessionId, deadline);
       const revision = targetRevisions.get(sessionId) ?? 0;
@@ -674,6 +690,78 @@ export const Reflection: Plugin = async ({ client, directory }) => {
           `target updates timed out after ${TARGET_WAIT_TIMEOUT_MS}ms`,
         );
       }
+    }
+  };
+
+  const exactSummaryForSegment = (
+    sessionId: string,
+    summaries: readonly SegmentSummary[],
+    segment: ReflectionSegment,
+  ): SegmentSummary | undefined => {
+    const body = submissionBody(sessionId, segment, 100);
+    const segmentId = segmentIdForRequest(body);
+    return summaries.find(
+      (summary) =>
+        summary.id === segmentId &&
+        summary.start_user_message_id === body.start_user_message_id &&
+        summary.end_user_message_id === body.end_user_message_id &&
+        summary.source_boundary_version === body.source_boundary_version &&
+        summary.start_source_message_id === body.start_source_message_id &&
+        summary.end_source_message_id === body.end_source_message_id,
+    );
+  };
+
+  const hasPendingExactTarget = (
+    sessionId: string,
+    listing: SegmentListing,
+    segment: ReflectionSegment,
+  ): boolean => {
+    const body = submissionBody(sessionId, segment, 100);
+    const segmentId = segmentIdForRequest(body);
+    const fingerprint = submissionSourceFingerprint(sessionId, segment);
+    return listing.targets.some(
+      (target) =>
+        target.id === segmentId &&
+        target.status !== "failed" &&
+        target.status !== "succeeded" &&
+        target.startUserMessageId === body.start_user_message_id &&
+        target.endUserMessageId === body.end_user_message_id &&
+        target.sourceBoundaryVersion === body.source_boundary_version &&
+        target.startSourceMessageId === body.start_source_message_id &&
+        target.endSourceMessageId === body.end_source_message_id &&
+        target.sourceFingerprint === fingerprint,
+    );
+  };
+
+  const waitForRequiredSummaries = async (
+    sessionId: string,
+    requiredSegments: readonly ReflectionSegment[],
+    deadline = Date.now() + SUMMARY_WAIT_TIMEOUT_MS,
+  ): Promise<readonly StoredSegmentSummary[]> => {
+    while (true) {
+      const listing = await getFreshSegmentListing(sessionId, deadline);
+      const missing = requiredSegments.filter(
+        (segment) =>
+          exactSummaryForSegment(sessionId, listing.summaries, segment) ===
+          undefined,
+      );
+      if (missing.length === 0) return listing.summaries;
+      if (
+        !missing.some((segment) =>
+          hasPendingExactTarget(sessionId, listing, segment),
+        )
+      ) {
+        return listing.summaries;
+      }
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) {
+        throw new Error(
+          `segment summaries timed out after ${SUMMARY_WAIT_TIMEOUT_MS}ms`,
+        );
+      }
+      await new Promise<void>((resolve) =>
+        setTimeout(resolve, Math.min(SUMMARY_POLL_INTERVAL_MS, remaining)),
+      );
     }
   };
 
@@ -715,6 +803,7 @@ export const Reflection: Plugin = async ({ client, directory }) => {
     sessionId: string,
     segments: readonly ReflectionSegment[],
     includeOpenSegment: boolean,
+    processingPriority: number,
     generation: number,
     messages: OpenCodeMessage[] | null,
   ): Promise<IngestionResult> => {
@@ -733,6 +822,7 @@ export const Reflection: Plugin = async ({ client, directory }) => {
         sessionId,
         segments,
         includeOpenSegment,
+        processingPriority,
         controller.signal,
       );
       if (
@@ -745,8 +835,10 @@ export const Reflection: Plugin = async ({ client, directory }) => {
         messages,
         fresh: successfulSegmentKeys.length > 0,
         successfulSegmentKeys,
-        observedSegmentKeys: segments.map(
-          (segment) => segment.startUserMessageId,
+        observedSegmentKeys: segments.map((segment) =>
+          segmentIdForRequest(
+            submissionBody(sessionId, segment, processingPriority),
+          ),
         ),
       };
     } finally {
@@ -766,7 +858,7 @@ export const Reflection: Plugin = async ({ client, directory }) => {
     generation: number,
   ): Promise<IngestionResult> =>
     serializeTargetUpdate(sessionId, () =>
-      submitSegmentSnapshot(sessionId, segments, false, generation, null),
+      submitSegmentSnapshot(sessionId, segments, false, 100, generation, null),
     );
 
   const ingestIdleSession = async (
@@ -803,6 +895,7 @@ export const Reflection: Plugin = async ({ client, directory }) => {
         sessionId,
         segments,
         includeOpenSegment,
+        0,
         generation,
         messages,
       );
@@ -942,26 +1035,62 @@ export const Reflection: Plugin = async ({ client, directory }) => {
       try {
         const previous = projectionState.get(model.sessionId);
         const limits = await getModelLimits(model.providerId, model.modelId);
-        let initialListing: Promise<SegmentListing> | undefined;
+        let initialListing: Promise<SegmentListing | null> | undefined;
         const listing = () =>
-          (initialListing ??= getSegmentListing(model.sessionId));
+          (initialListing ??= getSegmentListing(model.sessionId).catch(
+            (error: unknown) => {
+              if (error instanceof SegmentListingUnavailableError) return null;
+              throw error;
+            },
+          ));
+        let rawSnapshot: Promise<OpenCodeMessage[]> | undefined;
+        const rawMessages = () =>
+          (rawSnapshot ??= getSessionMessages(model.sessionId));
+        let canonicalPlan: Promise<readonly ReflectionSegment[]> | undefined;
+        const loadCanonicalPlan = () =>
+          (canonicalPlan ??= Promise.all([rawMessages(), listing()]).then(
+            ([raw, current]) =>
+              segmentMessages(
+                raw,
+                undefined,
+                current ? segmentAnchors(current) : [],
+              ),
+          ));
+        let foregroundSync: Promise<IngestionResult> | undefined;
         const result = await projectMessages({
           messages,
           ...limits,
           previous,
-          loadBoundaries: async () => segmentAnchors(await listing()),
-          loadSummaries: () => {
-            return listing().then(async (current) => {
-              const sync = enqueueClosedTargetSync(
-                model.sessionId,
-                segmentMessages(messages, undefined, segmentAnchors(current)),
-                generation,
+          loadCanonicalSegments: loadCanonicalPlan,
+          loadSummaries: async (requiredSegments) => {
+            const current = await listing();
+            if (!current) {
+              throw new SegmentListingUnavailableError(
+                "context projection failed: segment manifest unavailable",
               );
-              void sync.catch((error: unknown) =>
-                log(`projection target sync failed: ${String(error)}`),
+            }
+            const deadline = Date.now() + SUMMARY_WAIT_TIMEOUT_MS;
+            const plan = await loadCanonicalPlan();
+            foregroundSync ??= enqueueClosedTargetSync(
+              model.sessionId,
+              plan,
+              generation,
+            );
+            const remaining = deadline - Date.now();
+            if (remaining <= 0) {
+              throw new Error(
+                `segment summaries timed out after ${SUMMARY_WAIT_TIMEOUT_MS}ms`,
               );
-              return (await getFreshSegmentListing(model.sessionId)).summaries;
-            });
+            }
+            await waitWithin(
+              foregroundSync.then(() => {}),
+              remaining,
+            );
+            return waitForRequiredSummaries(
+              model.sessionId,
+              requiredSegments,
+              deadline,
+            );
           },
         });
         if (
@@ -986,7 +1115,7 @@ export const Reflection: Plugin = async ({ client, directory }) => {
             const variant = activeUser?.info.model?.variant;
             const checkpoint = result.state.checkpoint;
             if (typeof agent === "string" && checkpoint) {
-              const checkpointKey = `${checkpoint.tailStartUserMessageId}:${checkpoint.createdAtMessageId}`;
+              const checkpointKey = `${checkpoint.tailStartMessageId}:${checkpoint.createdAtMessageId}`;
               if (
                 pendingProjectionWarnings.get(model.sessionId)
                   ?.checkpointKey !== checkpointKey
@@ -1073,18 +1202,40 @@ export const Reflection: Plugin = async ({ client, directory }) => {
             return formatApiFailure("memory_read_segment", response);
 
           const segment = parseStoredSegment(response.data);
-          if (!segment)
+          if (!segment || segment.id !== segment_id)
             return "memory_read_segment failed: invalid segment metadata";
 
           try {
+            const boundary: CommittedSegmentBoundary =
+              segment.source_boundary_version === 1
+                ? {
+                    id: segment.id,
+                    startUserMessageId: segment.start_user_message_id,
+                    endUserMessageId: segment.end_user_message_id,
+                    sourceBoundaryVersion: 1,
+                    startSourceMessageId: null,
+                    endSourceMessageId: null,
+                  }
+                : {
+                    id: segment.id,
+                    startUserMessageId: segment.start_user_message_id,
+                    endUserMessageId: segment.end_user_message_id,
+                    sourceBoundaryVersion: 2,
+                    startSourceMessageId: segment.start_source_message_id,
+                    endSourceMessageId: segment.end_source_message_id,
+                  };
             const messages = readSegmentMessages(
               await getSessionMessages(segment.session_id),
-              segment.start_user_message_id,
-              segment.end_user_message_id,
+              boundary,
             );
             return formatData({
               segment_id,
               session_id: segment.session_id,
+              start_user_message_id: segment.start_user_message_id,
+              end_user_message_id: segment.end_user_message_id,
+              source_boundary_version: segment.source_boundary_version,
+              start_source_message_id: segment.start_source_message_id,
+              end_source_message_id: segment.end_source_message_id,
               messages,
             });
           } catch (error) {

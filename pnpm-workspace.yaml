@@ -1,0 +1,9 @@
+packages:
+  - "server"
+  - "plugin"
+  - "scripts"
+  - "packages/*"
+
+allowBuilds:
+  esbuild: true
+  msgpackr-extract: false

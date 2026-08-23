@@ -1,0 +1,28 @@
+{
+  "name": "reflection",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@10.33.0",
+  "engines": {
+    "node": ">=24.0.0 <25"
+  },
+  "scripts": {
+    "build": "pnpm --recursive --if-present build",
+    "format": "prettier --write \"**/*.{json,md,mjs,ts,yaml,yml}\" \"!pnpm-lock.yaml\" \"!scripts/cleanup-launch-agent.mjs\"",
+    "format:check": "prettier --check \"**/*.{json,md,mjs,ts,yaml,yml}\" \"!pnpm-lock.yaml\" \"!scripts/cleanup-launch-agent.mjs\"",
+    "start": "pnpm --filter @reflection/server build && node server/dist/main.js",
+    "test": "pnpm --recursive --if-present test",
+    "test:integration": "pnpm --filter @reflection/server test:integration",
+    "typecheck": "pnpm --recursive --if-present typecheck",
+    "verify:plugin-bundle": "pnpm --filter opencode-reflection-plugin verify:bundle",
+    "check": "pnpm format:check && pnpm typecheck && pnpm test && pnpm build && pnpm verify:plugin-bundle"
+  },
+  "devDependencies": {
+    "@types/node": "24.12.2",
+    "esbuild": "0.28.2",
+    "prettier": "3.6.2",
+    "typescript": "5.8.2",
+    "vitest": "3.2.4"
+  }
+}

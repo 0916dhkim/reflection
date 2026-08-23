@@ -12,13 +12,8 @@
     "verify:bundle": "node scripts/verify-bundle.mjs"
   },
   "dependencies": {
+    "@reflection/shared": "workspace:*",
     "@opencode-ai/plugin": "1.18.15"
   },
-  "devDependencies": {
-    "@types/node": "24.12.2",
-    "esbuild": "0.28.2",
-    "prettier": "3.6.2",
-    "typescript": "5.8.2",
-    "vitest": "3.2.4"
-  }
+  "devDependencies": {}
 }

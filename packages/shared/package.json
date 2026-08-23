@@ -1,0 +1,20 @@
+{
+  "name": "@reflection/shared",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    "./contracts": "./src/contracts.ts",
+    "./domain": "./src/domain.ts",
+    "./segmentation": "./src/segmentation.ts"
+  },
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@sinclair/typebox": "0.34.41",
+    "unicode-case-folding": "1.1.1",
+    "uuid": "11.1.0"
+  }
+}
