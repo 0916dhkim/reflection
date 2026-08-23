@@ -232,6 +232,28 @@ export function isModelVisiblePart(
   );
 }
 
+export function isCompletedAssistantMessage(
+  message: OpenCodeMessage | undefined,
+): boolean {
+  if (!message || message.info.role !== "assistant") return false;
+  const time = message.info.time;
+  if (typeof time !== "object" || time === null || Array.isArray(time)) {
+    return false;
+  }
+  return Number.isFinite((time as Record<string, unknown>).completed);
+}
+
+export function isSafeSegmentSnapshot(
+  segment: ReflectionSegment,
+  messages: readonly OpenCodeMessage[],
+): boolean {
+  if (segment.closed || segment.sourceBoundaryVersion === 1) return true;
+  if (segment.endSourceMessageId === null) return false;
+  return isCompletedAssistantMessage(
+    messages.find((message) => message.info.id === segment.endSourceMessageId),
+  );
+}
+
 export function textOf(message: OpenCodeMessage): string {
   if (isProjectionLossWarningMessage(message)) return "";
   if (!isModelVisibleMessage(message)) return "";
@@ -716,6 +738,13 @@ function resolveV2Boundaries(
     if (startOffset < 0 || endOffset < 0 || startOffset > endOffset) {
       throw new Error("V2 source boundary does not match its user turn");
     }
+    const endMessage = turn.messages[endOffset]?.message;
+    if (
+      !turn.closed &&
+      (!endMessage || !isCompletedAssistantMessage(endMessage))
+    ) {
+      return [];
+    }
     return [
       {
         boundary: current,
@@ -751,12 +780,7 @@ function reconcileV2Boundaries(
 }
 
 function isLegalActiveTurnCut(message: IndexedMessage): boolean {
-  if (message.message.info.role !== "assistant") return false;
-  const time = message.message.info.time;
-  if (typeof time !== "object" || time === null || Array.isArray(time)) {
-    return false;
-  }
-  return Number.isFinite((time as Record<string, unknown>).completed);
+  return isCompletedAssistantMessage(message.message);
 }
 
 function fragmentSourceRange(

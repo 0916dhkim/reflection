@@ -960,6 +960,73 @@ describe("Reflection plugin hooks", () => {
     });
   });
 
+  it("waits for a completed assistant before snapshotting an open V2 span", async () => {
+    const sessionId = "active-v2-sweep-session";
+    const inactiveSessionId = "inactive-open-v2-session";
+    const activeMessages = projectionMessages(sessionId);
+    const inactiveMessages: OpenCodeMessage[] = [
+      {
+        info: {
+          id: `${inactiveSessionId}-user`,
+          sessionID: inactiveSessionId,
+          role: "user",
+          model: { providerID: "provider", modelID: "model" },
+        },
+        parts: [{ type: "text", text: "x".repeat(25_000) }],
+      },
+    ];
+    const client = clientFor(activeMessages);
+    client.session.list.mockResolvedValue({
+      data: [{ id: inactiveSessionId, time: { updated: 0 } }],
+    });
+    client.session.messages.mockImplementation(async (input) => ({
+      data:
+        input?.path.id === inactiveSessionId
+          ? inactiveMessages
+          : activeMessages,
+    }));
+    const submittedBodies: Array<Record<string, unknown>> = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+        if (init?.method === "POST") {
+          submittedBodies.push(JSON.parse(String(init.body)));
+        }
+        return emptyListing(url);
+      }),
+    );
+    const hooks = await Reflection(pluginInput(client));
+    const idle = {
+      event: { type: "session.idle", properties: { sessionID: sessionId } },
+    } as never;
+
+    await hooks.event?.(idle);
+    expect(
+      submittedBodies.filter((body) => body.session_id === inactiveSessionId),
+    ).toHaveLength(0);
+
+    inactiveMessages.push({
+      info: {
+        id: `${inactiveSessionId}-assistant`,
+        sessionID: inactiveSessionId,
+        role: "assistant",
+        parentID: `${inactiveSessionId}-user`,
+        time: { created: 1, completed: 2 },
+      },
+      parts: [{ type: "text", text: "done" }],
+    });
+    await hooks.event?.(idle);
+
+    expect(
+      submittedBodies.filter((body) => body.session_id === inactiveSessionId),
+    ).toMatchObject([
+      {
+        source_boundary_version: 2,
+        end_source_message_id: `${inactiveSessionId}-assistant`,
+      },
+    ]);
+  });
+
   it("revalidates stale-list inactivity after paused message capture", async () => {
     const activeSessionId = "active-stale-list-race";
     const inactiveSessionId = "inactive-stale-list-race";

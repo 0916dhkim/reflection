@@ -28,6 +28,7 @@ import {
   sourceFingerprint,
 } from "@reflection/shared/domain";
 import {
+  isSafeSegmentSnapshot,
   segmentMessages,
   type CommittedSegmentBoundary,
   type OpenCodeMessage,
@@ -628,7 +629,9 @@ export function planSessionSegments(
   );
   let segments: ReflectionSegment[];
   try {
-    segments = segmentMessages(messages, maxSegmentChars, anchors);
+    segments = segmentMessages(messages, maxSegmentChars, anchors).filter(
+      (segment) => isSafeSegmentSnapshot(segment, messages),
+    );
   } catch (error) {
     throw new Error(
       `invalid segment manifest for ${sessionId}: ${errorText(error)}`,

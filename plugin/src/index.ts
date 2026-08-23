@@ -18,6 +18,7 @@ import {
   PROJECTION_LOSS_WARNING_METADATA,
   type CommittedSegmentBoundary,
   isNormalUserMessage,
+  isSafeSegmentSnapshot,
   readSegmentMessages,
   segmentMessages,
   submissionSourceFingerprint,
@@ -473,6 +474,7 @@ export const Reflection: Plugin = async ({ client, directory }) => {
     segments: readonly ReflectionSegment[],
     includeOpenSegment: boolean,
     processingPriority: number,
+    messages: readonly OpenCodeMessage[] | null,
     signal: AbortSignal,
   ): Promise<string[]> => {
     const fingerprints =
@@ -482,6 +484,9 @@ export const Reflection: Plugin = async ({ client, directory }) => {
     const successful: string[] = [];
     for (const segment of segments) {
       if (!segment.closed && !includeOpenSegment) continue;
+      if (!segment.closed && !isSafeSegmentSnapshot(segment, messages ?? [])) {
+        continue;
+      }
       const body = submissionBody(sessionId, segment, processingPriority);
       const segmentKey = segmentIdForRequest(body);
       const fingerprint = submissionSourceFingerprint(sessionId, segment);
@@ -823,6 +828,7 @@ export const Reflection: Plugin = async ({ client, directory }) => {
         segments,
         includeOpenSegment,
         processingPriority,
+        messages,
         controller.signal,
       );
       if (

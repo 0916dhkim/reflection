@@ -536,6 +536,31 @@ describe("strict manifest planning", () => {
     );
   });
 
+  it("does not plan a mutable open V2 span before its assistant completes", () => {
+    const messages = [user("u1", "x".repeat(25_000))];
+    expect(planSessionSegments(SESSION_ID, messages, emptyManifest())).toEqual(
+      [],
+    );
+
+    messages.push({
+      info: {
+        id: "a1",
+        role: "assistant",
+        parentID: "u1",
+        time: { created: 1, completed: 2 },
+      },
+      parts: [{ type: "text", text: "done" }],
+    });
+    expect(
+      planSessionSegments(SESSION_ID, messages, emptyManifest()),
+    ).toMatchObject([
+      {
+        sourceBoundaryVersion: 2,
+        endSourceMessageId: "a1",
+      },
+    ]);
+  });
+
   it("reconciles mixed v1 and exact v2 anchors in one canonical plan", () => {
     const messages = [
       user("u1", "1"),

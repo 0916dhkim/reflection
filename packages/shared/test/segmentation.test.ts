@@ -739,6 +739,38 @@ describe("segmentMessages", () => {
     ]);
   });
 
+  it("ignores mutable active V2 anchors without a completed assistant endpoint", () => {
+    const incomplete = assistant("a1", "u1", "working");
+    incomplete.info.time = { created: 0, completed: Number.POSITIVE_INFINITY };
+    const messages = [user("u1", "request"), incomplete];
+
+    for (const boundary of [
+      v2Boundary("u1", "u1", "u1"),
+      v2Boundary("u1", "u1", "a1"),
+    ]) {
+      expect(segmentMessages(messages, 100, [boundary])).toMatchObject([
+        {
+          sourceBoundaryVersion: 1,
+          sourceMessageIds: ["u1", "a1"],
+          closed: false,
+        },
+      ]);
+    }
+
+    const completed = assistant("a2", "u1", "done");
+    expect(
+      segmentMessages([user("u1", "request"), completed], 100, [
+        v2Boundary("u1", "u1", "a2"),
+      ]),
+    ).toMatchObject([
+      {
+        sourceBoundaryVersion: 2,
+        sourceMessageIds: ["u1", "a2"],
+        closed: true,
+      },
+    ]);
+  });
+
   it("freezes selected V1 coverage before reconciling exact V2 anchors", () => {
     const messages = [
       user("u1", "one"),
