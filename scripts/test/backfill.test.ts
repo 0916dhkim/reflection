@@ -237,6 +237,7 @@ function processingContext(
     providerPollMs: 5_000,
     jobPollMs: 10,
     priorityJobIds: options.priorityJobIds ?? [],
+    completedSnapshots: new Set(),
     acquireLock: vi.fn(),
     releaseLock: vi.fn(),
     scheduleLaunchAgentCleanup: vi.fn(),
@@ -1151,6 +1152,55 @@ describe("job completion fencing", () => {
     ).resolves.toBe("replan");
     expect(postCount).toBe(1);
     expect(context.state.segmentsFailed).toBe(0);
+    expect(context.state.sessionsVisited).toBe(0);
+  });
+
+  it("processes a ready prefix once while retaining a deferred tail", async () => {
+    const messages = [
+      user("u0", "request"),
+      assistant("a0", "u0", "done"),
+      user("u1", "x".repeat(25_000)),
+    ];
+    const local = segmentMessages(messages);
+    expect(local.map((segment) => segment.closed)).toEqual([true, false]);
+    let committed = false;
+    let targetPosts = 0;
+    const service: ReflectionService = {
+      request: vi.fn(async (path, init) => {
+        if (path.includes("/sessions/")) {
+          return committed
+            ? manifestWith([boundaryFor(SESSION_ID, local[0]!)])
+            : emptyManifest();
+        }
+        targetPosts += 1;
+        committed = true;
+        return jobFor(JSON.parse(String(init?.body)) as SegmentCreate, {
+          status: "succeeded",
+          error: null,
+          finished_at: "2026-08-22T00:00:00.000Z",
+        });
+      }),
+      getJob: vi.fn(),
+      retryJob: vi.fn(),
+      waitForJob: vi.fn(),
+    };
+    const store: SessionStore = {
+      sessions: [],
+      sessionUpdatedAt: () => 100,
+      sessionMessages: () => messages,
+    };
+    const context = processingContext(service, { store });
+    const session = { id: SESSION_ID, title: "test", timeUpdated: 100 };
+
+    await expect(processSession(context, session, messages, 100)).resolves.toBe(
+      "deferred_source",
+    );
+    await expect(processSession(context, session, messages, 100)).resolves.toBe(
+      "deferred_source",
+    );
+
+    expect(targetPosts).toBe(1);
+    expect(context.state.segmentsDiscovered).toBe(1);
     expect(context.state.sessionsVisited).toBe(0);
   });
 });

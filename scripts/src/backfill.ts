@@ -1429,6 +1429,7 @@ export interface ProcessingContext {
   providerPollMs: number;
   jobPollMs: number;
   priorityJobIds: readonly number[];
+  completedSnapshots: Set<string>;
   acquireLock(): void;
   releaseLock(): void;
   scheduleLaunchAgentCleanup(): void;
@@ -1624,19 +1625,14 @@ export async function processSession(
     context.state.status = "running";
     context.state.currentSessionId = session.id;
     context.state.currentSessionTitle = session.title;
-    const deferredSegments = segments.filter(
-      (segment) => segment.disposition === "deferred_mutable_source",
-    );
-    if (deferredSegments.length > 0) {
-      context.state.currentSegment = null;
-      context.saveState();
-      context.log("session has deferred mutable source spans", {
-        sessionId: session.id,
-        segments: deferredSegments.map(plannedSegmentDetails),
-      });
-      return "deferred_source";
-    }
+    let deferredSegment: PlannedSegment | null = null;
     for (const [segmentIndex, segment] of segments.entries()) {
+      if (segment.disposition === "deferred_mutable_source") {
+        deferredSegment = segment;
+        break;
+      }
+      const completedSnapshotKey = `${segment.segmentId}:${segment.sourceFingerprint}:${segment.submission.projection_version}`;
+      if (context.completedSnapshots.has(completedSnapshotKey)) continue;
       activeSegment = segment;
       context.state.segmentsDiscovered += 1;
       context.state.currentSegment = {
@@ -1657,6 +1653,16 @@ export async function processSession(
         ...plannedSegmentDetails(segment),
       });
       revalidateSession();
+
+      if (
+        segment.status === "eligible_committed" ||
+        segment.status === "target_succeeded"
+      ) {
+        context.state.segmentsAlreadySucceeded += 1;
+        context.completedSnapshots.add(completedSnapshotKey);
+        context.saveState();
+        continue;
+      }
 
       const submission: ServiceRequestInit = {
         method: "POST",
@@ -1708,11 +1714,21 @@ export async function processSession(
       if (completed.status === "succeeded") {
         if (wasAlreadySucceeded) context.state.segmentsAlreadySucceeded += 1;
         else context.state.segmentsSucceeded += 1;
+        context.completedSnapshots.add(completedSnapshotKey);
       } else {
         recordFailure(context, session.id, segment, completed);
       }
       context.saveState();
       revalidateSession();
+    }
+    if (deferredSegment) {
+      context.state.currentSegment = null;
+      context.saveState();
+      context.log("session has a deferred mutable source span", {
+        sessionId: session.id,
+        segment: plannedSegmentDetails(deferredSegment),
+      });
+      return "deferred_source";
     }
     context.state.sessionsVisited += 1;
     context.saveState();
@@ -1892,6 +1908,7 @@ export async function main(
     providerPollMs: options.providerPollMs,
     jobPollMs: options.jobPollMs,
     priorityJobIds: options.priorityJobIds,
+    completedSnapshots: new Set(),
     acquireLock: () => acquireLock(options.lockPath, processId),
     releaseLock: release,
     scheduleLaunchAgentCleanup: () => {
