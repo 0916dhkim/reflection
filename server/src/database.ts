@@ -2461,12 +2461,15 @@ export class Database {
       const rows = (
         await connection.query<RecallRow>(
           `
-          SELECT subject_text, subject_entity_id, predicate, confidence,
-                 object_entity_text, object_entity_id, object_value,
-                 equivalence_key, segment_id,
-                 1 - (embedding <=> $1::vector) AS similarity
-          FROM claims
-          ORDER BY embedding <=> $1::vector
+          SELECT c.subject_text, c.subject_entity_id, c.predicate, c.confidence,
+                 c.object_entity_text, c.object_entity_id, c.object_value,
+                 c.equivalence_key, c.segment_id,
+                 1 - (c.embedding <=> $1::vector) AS similarity
+          FROM claims c
+          JOIN segments s ON s.id = c.segment_id
+          LEFT JOIN segment_targets t ON t.segment_id = s.id
+          WHERE ${COMMITTED_SEGMENT_ELIGIBILITY_SQL}
+          ORDER BY c.embedding <=> $1::vector
           LIMIT $2
           `,
           [queryVector, limit],
@@ -2487,13 +2490,16 @@ export class Database {
       const rows = (
         await connection.query<RecallRow>(
           `
-          SELECT subject_text, subject_entity_id, predicate, confidence,
-                 object_entity_text, object_entity_id, object_value,
-                 equivalence_key, segment_id,
-                 1 - (embedding <=> $1::vector) AS similarity
-          FROM claims
-          WHERE subject_entity_id = $2 OR object_entity_id = $2
-          ORDER BY embedding <=> $1::vector
+          SELECT c.subject_text, c.subject_entity_id, c.predicate, c.confidence,
+                 c.object_entity_text, c.object_entity_id, c.object_value,
+                 c.equivalence_key, c.segment_id,
+                 1 - (c.embedding <=> $1::vector) AS similarity
+          FROM claims c
+          JOIN segments s ON s.id = c.segment_id
+          LEFT JOIN segment_targets t ON t.segment_id = s.id
+          WHERE ${COMMITTED_SEGMENT_ELIGIBILITY_SQL}
+            AND (c.subject_entity_id = $2 OR c.object_entity_id = $2)
+          ORDER BY c.embedding <=> $1::vector
           LIMIT $3
           `,
           [queryVector, entityId, limit],
@@ -2529,7 +2535,9 @@ export class Database {
                  count(DISTINCT s.session_id) AS session_count
           FROM claims c
           JOIN segments s ON s.id = c.segment_id
+          LEFT JOIN segment_targets t ON t.segment_id = s.id
           WHERE c.equivalence_key = ANY($1::bpchar[])
+            AND ${COMMITTED_SEGMENT_ELIGIBILITY_SQL}
           GROUP BY c.equivalence_key
           `,
           [keys],

@@ -625,10 +625,50 @@ describe.sequential("Database PostgreSQL integration", () => {
           new Set([first.segment_id, supportJob.segment_id]),
         );
 
-        await database.enqueue(
+        const emptySharedJob = await database.enqueue(
           updateRequest(firstRequest, { end_user_message_id: "end-3" }),
         );
-        const emptySharedClaim = required(
+        expect(
+          (await database.directClaims(EMBEDDING)).some(
+            (claim) => claim.segmentId === first.segment_id,
+          ),
+        ).toBe(false);
+        expect(
+          (await database.neighboringClaims(subjectId, EMBEDDING, 0.75)).some(
+            (claim) => claim.segmentId === first.segment_id,
+          ),
+        ).toBe(false);
+        const pendingSupport = required(
+          (await database.supportForEquivalenceKeys([usesKey])).get(usesKey),
+        );
+        expect(pendingSupport.supportCount).toBe(1);
+        expect(pendingSupport.segmentIds).toEqual([supportJob.segment_id]);
+
+        let emptySharedClaim = required(
+          await withClient(database, (client) =>
+            database.claimOldestJob(client),
+          ),
+        );
+        expect(
+          await database.finishFailedAttempt(
+            emptySharedClaim,
+            "terminal corrected snapshot",
+            { retryAfterSeconds: null },
+          ),
+        ).toBe(true);
+        expect(
+          (await database.directClaims(EMBEDDING)).some(
+            (claim) => claim.segmentId === first.segment_id,
+          ),
+        ).toBe(false);
+        expect(
+          required(
+            (await database.supportForEquivalenceKeys([usesKey])).get(usesKey),
+          ).supportCount,
+        ).toBe(1);
+
+        await database.retryFailedJob(emptySharedJob.id);
+        emptySharedClaim = required(
           await withClient(database, (client) =>
             database.claimOldestJob(client),
           ),
