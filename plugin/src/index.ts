@@ -15,9 +15,7 @@ import {
 import { segmentIdForRequest } from "@reflection/shared/domain";
 import {
   PROJECTION_LOSS_WARNING,
-  PROJECTION_LOSS_WARNING_METADATA,
   type CommittedSegmentBoundary,
-  isNormalUserMessage,
   isSafeSegmentSnapshot,
   readSegmentMessages,
   segmentMessages,
@@ -108,35 +106,6 @@ interface IngestionResult {
   fresh: boolean;
   successfulSegmentKeys: string[];
   observedSegmentKeys?: string[];
-}
-
-interface PendingProjectionWarning {
-  checkpointKey: string;
-  agent: string;
-  variant?: string;
-  model: {
-    providerID: string;
-    modelID: string;
-  };
-}
-
-interface RuntimePromptBody {
-  agent: string;
-  model: {
-    providerID: string;
-    modelID: string;
-  };
-  variant?: string;
-  noReply: true;
-  parts: [
-    {
-      type: "text";
-      text: string;
-      synthetic: false;
-      ignored: false;
-      metadata: typeof PROJECTION_LOSS_WARNING_METADATA;
-    },
-  ];
 }
 
 class SegmentSubmissionError extends Error {
@@ -374,8 +343,6 @@ export const Reflection: Plugin = async ({ client, directory }) => {
     Map<string, { fingerprint: string; processingPriority: number }>
   >();
   const deletedSessions = new Set<string>();
-  const pendingProjectionWarnings = new Map<string, PendingProjectionWarning>();
-  const projectionWarningsInFlight = new Map<string, Promise<void>>();
   const synchronizeSuccessfulFingerprints = (
     sessionId: string,
     listing: SegmentListing,
@@ -573,59 +540,6 @@ export const Reflection: Plugin = async ({ client, directory }) => {
         return;
       }
     }
-  };
-
-  const insertPendingProjectionWarning = (sessionId: string): Promise<void> => {
-    const pending = pendingProjectionWarnings.get(sessionId);
-    if (!pending) return Promise.resolve();
-    const existing = projectionWarningsInFlight.get(sessionId);
-    if (existing) return existing;
-
-    let insertion: Promise<void>;
-    insertion = (async () => {
-      try {
-        const body: RuntimePromptBody = {
-          agent: pending.agent,
-          model: pending.model,
-          ...(pending.variant === undefined
-            ? {}
-            : { variant: pending.variant }),
-          noReply: true,
-          parts: [
-            {
-              type: "text",
-              text: PROJECTION_LOSS_WARNING,
-              synthetic: false,
-              ignored: false,
-              metadata: {
-                reflection: {
-                  ...PROJECTION_LOSS_WARNING_METADATA.reflection,
-                },
-              },
-            },
-          ],
-        };
-        const response = await client.session.prompt({
-          path: { id: sessionId },
-          query: { directory },
-          body,
-          throwOnError: true,
-        });
-        if (
-          response.data !== undefined &&
-          !("error" in response) &&
-          pendingProjectionWarnings.get(sessionId) === pending
-        ) {
-          pendingProjectionWarnings.delete(sessionId);
-        }
-      } catch {}
-    })().finally(() => {
-      if (projectionWarningsInFlight.get(sessionId) === insertion) {
-        projectionWarningsInFlight.delete(sessionId);
-      }
-    });
-    projectionWarningsInFlight.set(sessionId, insertion);
-    return insertion;
   };
 
   const getModelLimits = async (
@@ -994,8 +908,6 @@ export const Reflection: Plugin = async ({ client, directory }) => {
         targetRevisions.delete(sessionId);
         idlePasses.delete(sessionId);
         successfulSegmentFingerprints.delete(sessionId);
-        pendingProjectionWarnings.delete(sessionId);
-        projectionWarningsInFlight.delete(sessionId);
         projectionState.delete(sessionId);
         return;
       }
@@ -1007,7 +919,6 @@ export const Reflection: Plugin = async ({ client, directory }) => {
             ? event.properties.sessionID
             : null;
       if (!sessionId) return;
-      await insertPendingProjectionWarning(sessionId);
       await runIdle(sessionId);
     },
 
@@ -1026,7 +937,6 @@ export const Reflection: Plugin = async ({ client, directory }) => {
           "Reflection context projection could not identify the active session model",
         );
       }
-      const activeUser = [...messages].reverse().find(isNormalUserMessage);
       if (deletedSessions.has(model.sessionId)) {
         throw new Error(
           `Reflection session ${model.sessionId} was deleted before context projection`,
@@ -1117,30 +1027,17 @@ export const Reflection: Plugin = async ({ client, directory }) => {
         );
         if (result.reset) {
           if (result.diagnostic?.lossy) {
-            const agent = activeUser?.info.agent;
-            const variant = activeUser?.info.model?.variant;
-            const checkpoint = result.state.checkpoint;
-            if (typeof agent === "string" && checkpoint) {
-              const checkpointKey = `${checkpoint.tailStartMessageId}:${checkpoint.createdAtMessageId}`;
-              if (
-                pendingProjectionWarnings.get(model.sessionId)
-                  ?.checkpointKey !== checkpointKey
-              ) {
-                pendingProjectionWarnings.set(model.sessionId, {
-                  checkpointKey,
-                  agent,
-                  ...(typeof variant === "string" ? { variant } : {}),
-                  model: {
-                    providerID: model.providerId,
-                    modelID: model.modelId,
-                  },
-                });
-              }
-            } else {
-              await log(
-                `projection warning not queued for ${model.sessionId}: active agent unavailable`,
-              );
-            }
+            void client.tui
+              .showToast({
+                query: { directory },
+                body: {
+                  title: "Reflection context warning",
+                  message: PROJECTION_LOSS_WARNING,
+                  variant: "warning",
+                  duration: 10_000,
+                },
+              })
+              .catch(() => {});
           }
           try {
             await client.app.log({

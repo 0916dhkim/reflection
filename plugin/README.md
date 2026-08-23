@@ -85,7 +85,7 @@ On an actual reset, the transform performs this bounded sequence:
 
 If synchronization, polling, the service, or summary coverage is incomplete at 90 seconds, projection does not mutate the retained tail or substitute a wider boundary. It emits a warned lossy prefix with explicit omission markers and preserves every exact summary that is available. Missing summaries, unsafe/inherited reasoning, unfinished tools, archived media, and summary/tool budget truncation are all marked lossy. The serialized background sync remains handled, so a later safe reset can use newly available summaries. Projection throws only when no safe message-aligned cutoff can make the request fit.
 
-The plugin queues one visible, non-synthetic warning after a lossy reset. The next idle event inserts it with `noReply: true` and an exact metadata marker before other idle work. That control message remains model-visible but is excluded from future source segmentation and hydration. The warning queue is in memory and does not survive plugin restart.
+The plugin shows a best-effort TUI toast immediately after a lossy reset. It never persists the warning as a conversational message, so warning delivery cannot reorder user turns. The synthetic projection summary itself carries the durable model-visible omission warning.
 
 ## Native and manual compaction
 

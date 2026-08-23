@@ -2426,7 +2426,7 @@ describe("Reflection plugin hooks", () => {
     );
   });
 
-  it("inserts one persisted warning before paired idle work", async () => {
+  it("shows a non-persisted toast for a lossy projection", async () => {
     const sessionId = "warning-session";
     const messages = projectionMessages(sessionId);
     const client = clientFor(messages);
@@ -2444,239 +2444,52 @@ describe("Reflection plugin hooks", () => {
       ),
     );
     const hooks = await Reflection(pluginInput(client));
+
     await hooks["experimental.chat.messages.transform"]?.({}, {
       messages: structuredClone(messages),
     } as never);
-
-    let resolveWarning: (() => void) | undefined;
-    client.session.prompt.mockImplementation(
-      async () =>
-        new Promise<{ data: Record<string, never> }>((resolve) => {
-          resolveWarning = () => resolve({ data: {} });
-        }),
-    );
-    const firstIdle = hooks.event?.({
-      event: { type: "session.idle", properties: { sessionID: sessionId } },
-    } as never);
-    const pairedIdle = hooks.event?.({
-      event: {
-        type: "session.status",
-        properties: { sessionID: sessionId, status: { type: "idle" } },
-      },
-    } as never);
-
-    expect(client.session.prompt).toHaveBeenCalledOnce();
-    expect(client.session.status).not.toHaveBeenCalled();
-    expect(client.session.messages).toHaveBeenCalledOnce();
-    expect(client.session.list).not.toHaveBeenCalled();
-    expect(client.session.prompt).toHaveBeenCalledWith({
-      path: { id: sessionId },
-      query: { directory: "/tmp" },
-      body: {
-        agent: "build",
-        model: { providerID: "provider", modelID: "model" },
-        noReply: true,
-        parts: [
-          {
-            type: "text",
-            text: PROJECTION_LOSS_WARNING,
-            synthetic: false,
-            ignored: false,
-            metadata: {
-              reflection: { type: "projection-loss-warning", version: 1 },
-            },
-          },
-        ],
-      },
-      throwOnError: true,
-    });
-    expect(client.session.prompt.mock.calls[0]?.[0]?.body).not.toHaveProperty(
-      "variant",
-    );
-
-    resolveWarning?.();
-    await Promise.all([firstIdle, pairedIdle]);
-    expect(client.session.prompt).toHaveBeenCalledOnce();
-    expect(client.tui.showToast).not.toHaveBeenCalled();
-  });
-
-  it("preserves the active model variant in persisted warning insertion", async () => {
-    const sessionId = "warning-variant-session";
-    const messages = projectionMessages(sessionId);
-    const activeUser = messages.find(
-      (message) => message.info.id === `${sessionId}-current`,
-    );
-    if (!activeUser?.info.model) throw new Error("active user model missing");
-    activeUser.info.model.variant = "xhigh";
-    const client = clientFor(messages);
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async (_url: string | URL | Request, init?: RequestInit) =>
-        init?.method === "POST"
-          ? ok()
-          : ok({
-              session_id: sessionId,
-              segments: [],
-              boundaries: [],
-              targets: [],
-            }),
-      ),
-    );
-    const hooks = await Reflection(pluginInput(client));
-    await hooks["experimental.chat.messages.transform"]?.({}, {
-      messages: structuredClone(messages),
-    } as never);
-
     await hooks.event?.({
       event: { type: "session.idle", properties: { sessionID: sessionId } },
     } as never);
 
-    expect(client.session.prompt).toHaveBeenCalledOnce();
-    expect(client.session.prompt.mock.calls[0]?.[0]?.body).toMatchObject({
-      agent: "build",
-      model: { providerID: "provider", modelID: "model" },
-      variant: "xhigh",
-      noReply: true,
-    });
-  });
-
-  it("retries failed persisted warning insertion until success", async () => {
-    const sessionId = "warning-retry-session";
-    const messages = projectionMessages(sessionId);
-    const client = clientFor(messages);
-    client.session.prompt
-      .mockResolvedValueOnce({ error: new Error("insert failed") } as never)
-      .mockRejectedValueOnce(new Error("session disconnected"))
-      .mockResolvedValue({ data: {} });
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async (_url: string | URL | Request, init?: RequestInit) =>
-        init?.method === "POST"
-          ? ok()
-          : ok({
-              session_id: sessionId,
-              segments: [],
-              boundaries: [],
-              targets: [],
-            }),
-      ),
-    );
-    const hooks = await Reflection(pluginInput(client));
-    await hooks["experimental.chat.messages.transform"]?.({}, {
-      messages: structuredClone(messages),
-    } as never);
-    const idle = {
-      event: { type: "session.idle", properties: { sessionID: sessionId } },
-    } as never;
-
-    await hooks.event?.(idle);
-    await hooks.event?.(idle);
-    await hooks.event?.(idle);
-    await hooks.event?.(idle);
-
-    expect(client.session.prompt).toHaveBeenCalledTimes(3);
-    expect(client.tui.showToast).not.toHaveBeenCalled();
-  });
-
-  it("does not recover an uninserted warning after plugin restart", async () => {
-    const sessionId = "warning-restart-session";
-    const messages = projectionMessages(sessionId);
-    const firstClient = clientFor(messages);
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async (_url: string | URL | Request, init?: RequestInit) =>
-        init?.method === "POST"
-          ? ok()
-          : ok({
-              session_id: sessionId,
-              segments: [],
-              boundaries: [],
-              targets: [],
-            }),
-      ),
-    );
-    const firstHooks = await Reflection(pluginInput(firstClient));
-    await firstHooks["experimental.chat.messages.transform"]?.({}, {
-      messages: structuredClone(messages),
-    } as never);
-
-    const secondClient = clientFor(messages);
-    const secondHooks = await Reflection(pluginInput(secondClient));
-    await secondHooks.event?.({
-      event: { type: "session.idle", properties: { sessionID: sessionId } },
-    } as never);
-
-    expect(firstClient.session.prompt).not.toHaveBeenCalled();
-    expect(secondClient.session.prompt).not.toHaveBeenCalled();
-  });
-
-  it("accepts concurrent user persistence before noReply warning completion", async () => {
-    const sessionId = "warning-overlap-session";
-    const messages = projectionMessages(sessionId);
-    const client = clientFor(messages);
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async (_url: string | URL | Request, init?: RequestInit) =>
-        init?.method === "POST"
-          ? ok()
-          : ok({
-              session_id: sessionId,
-              segments: [],
-              boundaries: [],
-              targets: [],
-            }),
-      ),
-    );
-    const hooks = await Reflection(pluginInput(client));
-    await hooks["experimental.chat.messages.transform"]?.({}, {
-      messages: structuredClone(messages),
-    } as never);
-
-    let completeWarning: (() => void) | undefined;
-    client.session.prompt.mockImplementation(
-      async () =>
-        new Promise<{ data: Record<string, never> }>((resolve) => {
-          completeWarning = () => {
-            messages.push({
-              info: { id: "warning", sessionID: sessionId, role: "user" },
-              parts: [
-                {
-                  type: "text",
-                  text: PROJECTION_LOSS_WARNING,
-                  synthetic: false,
-                  ignored: false,
-                  metadata: {
-                    reflection: {
-                      type: "projection-loss-warning",
-                      version: 1,
-                    },
-                  },
-                },
-              ],
-            });
-            resolve({ data: {} });
-          };
-        }),
-    );
-    const idle = hooks.event?.({
-      event: { type: "session.idle", properties: { sessionID: sessionId } },
-    } as never);
-    messages.push({
-      info: {
-        id: "concurrent-user",
-        sessionID: sessionId,
-        role: "user",
-        agent: "build",
-        model: { providerID: "provider", modelID: "model" },
+    expect(client.tui.showToast).toHaveBeenCalledOnce();
+    expect(client.tui.showToast).toHaveBeenCalledWith({
+      query: { directory: "/tmp" },
+      body: {
+        title: "Reflection context warning",
+        message: PROJECTION_LOSS_WARNING,
+        variant: "warning",
+        duration: 10_000,
       },
-      parts: [{ type: "text", text: "concurrent request" }],
     });
+    expect(client.session.prompt).not.toHaveBeenCalled();
+  });
 
-    completeWarning?.();
-    await idle;
+  it("does not fail projection when the warning toast is unavailable", async () => {
+    const sessionId = "warning-failure-session";
+    const messages = projectionMessages(sessionId);
+    const client = clientFor(messages);
+    client.tui.showToast.mockRejectedValue(new Error("TUI disconnected"));
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_url: string | URL | Request, init?: RequestInit) =>
+        init?.method === "POST"
+          ? ok()
+          : ok({
+              session_id: sessionId,
+              segments: [],
+              boundaries: [],
+              targets: [],
+            }),
+      ),
+    );
+    const hooks = await Reflection(pluginInput(client));
 
-    expect(messages.at(-2)?.info.id).toBe("concurrent-user");
-    expect(messages.at(-1)?.info.id).toBe("warning");
-    expect(client.session.prompt).toHaveBeenCalledOnce();
+    await expect(
+      hooks["experimental.chat.messages.transform"]?.({}, {
+        messages: structuredClone(messages),
+      } as never),
+    ).resolves.toBeUndefined();
+    expect(client.session.prompt).not.toHaveBeenCalled();
   });
 });
