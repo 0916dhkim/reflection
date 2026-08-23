@@ -771,39 +771,6 @@ export class Database {
           `,
           [exactPayload, priority, target.job_id],
         );
-        if (
-          !jobs.some(
-            (item) =>
-              item.status === "running" && !sameBigInt(item.id, target.job_id),
-          )
-        ) {
-          await connection.query(
-            `
-            UPDATE extraction_jobs
-            SET end_user_message_id = $1, source_boundary_version = $2,
-                start_source_message_id = $3, end_source_message_id = $4,
-                projection_version = $5, payload = $6::jsonb,
-                source_generation = $7, source_fingerprint = $8,
-                processing_priority = $9,
-                status = 'pending', attempts = 0, lease_id = NULL,
-                error = NULL, started_at = NULL, finished_at = NULL,
-                next_attempt_at = now()
-            WHERE id = $10 AND status <> 'running'
-            `,
-            [
-              request.end_user_message_id,
-              request.source_boundary_version,
-              request.start_source_message_id,
-              request.end_source_message_id,
-              target.projection_version,
-              exactPayload,
-              target.source_generation,
-              target.source_fingerprint,
-              priority,
-              target.job_id,
-            ],
-          );
-        }
         const row = await Database.#jobRow(connection, target.job_id);
         if (row === undefined) {
           throw new Error("target job disappeared during enqueue");

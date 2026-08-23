@@ -801,7 +801,6 @@ describe.sequential("Database PostgreSQL integration", () => {
         const retryRequest = updateRequest(firstRequest, {
           start_user_message_id: "retry-start",
           end_user_message_id: "retry-end",
-          processing_priority: 100,
         });
         const retryJob = await database.enqueue(retryRequest);
         const terminalClaim = required(
@@ -814,6 +813,15 @@ describe.sequential("Database PostgreSQL integration", () => {
             retryAfterSeconds: null,
           }),
         ).toBe(true);
+        const exactFailedReplay = await database.enqueue(
+          updateRequest(retryRequest, { processing_priority: 100 }),
+        );
+        expect(exactFailedReplay).toMatchObject({
+          id: retryJob.id,
+          status: "failed",
+          attempts: terminalClaim.attempts,
+          error: "terminal",
+        });
         const retried = required(await database.retryFailedJob(retryJob.id));
         expect(retried.attempts).toBe(0);
         const retriedClaim = required(
