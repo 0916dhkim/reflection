@@ -7,7 +7,7 @@ import {
   modelVisibleMediaTokens,
   modelVisibleToolAttachmentTokens,
   modelVisibleToolInlineDataTokens,
-  modelVisibleToolState,
+  modelVisibleToolStateSize,
   PROJECTION_LOSS_WARNING,
   textOf,
   type OpenCodeMessage,
@@ -108,13 +108,14 @@ function estimateMessageTokens(messages: readonly OpenCodeMessage[]): number {
                   };
                 }
                 if (part.type === "tool") {
+                  const stateSize = modelVisibleToolStateSize(part.state);
                   mediaTokens +=
+                    Math.ceil(stateSize.utf8Bytes / ESTIMATED_CHARS_PER_TOKEN) +
                     modelVisibleToolAttachmentTokens(part.state) +
                     modelVisibleToolInlineDataTokens(part.state);
                   return {
                     type: "tool",
                     tool: part.tool,
-                    state: modelVisibleToolState(part.state),
                   };
                 }
                 return null;

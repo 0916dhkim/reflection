@@ -346,6 +346,69 @@ describe("segmentMessages", () => {
     expect(modelVisibleCharWeightOf(compacted)).toBeLessThan(1_000);
   });
 
+  it("counts deeply nested tool state and fails closed on cycles", () => {
+    let nested: unknown = "x".repeat(500_000);
+    for (let depth = 0; depth < 12; depth += 1) nested = { nested };
+    const message = assistant("a1", "u1", "done");
+    message.parts = [
+      {
+        type: "tool",
+        tool: "custom",
+        state: { status: "completed", input: nested, output: "done" },
+      },
+    ];
+    expect(modelVisibleCharWeightOf(message)).toBeGreaterThan(500_000);
+
+    const cyclic: Record<string, unknown> = {};
+    cyclic.self = cyclic;
+    message.parts = [
+      {
+        type: "tool",
+        tool: "custom",
+        state: { status: "completed", input: cyclic, output: "done" },
+      },
+    ];
+    expect(modelVisibleCharWeightOf(message)).toBe(Number.POSITIVE_INFINITY);
+  });
+
+  it("matches host visibility for ignored files and remote tool media", () => {
+    const hidden = user("u1");
+    hidden.parts = [
+      {
+        type: "file",
+        filename: "notes.txt",
+        mime: "text/plain",
+        url: "https://example.com/notes.txt",
+      },
+    ];
+    expect(modelVisibleCharWeightOf(hidden)).toBe(0);
+    expect(textOf(hidden)).toBe("");
+
+    const remote = assistant("a1", "u1", "done");
+    remote.parts = [
+      {
+        type: "tool",
+        tool: "read",
+        state: {
+          status: "completed",
+          input: {},
+          output: "done",
+          attachments: [
+            {
+              filename: "report.pdf",
+              mime: "application/pdf",
+              url: "https://example.com/report.pdf",
+            },
+          ],
+        },
+      },
+    ];
+    expect(modelVisibleCharWeightOf(remote)).toBeGreaterThanOrEqual(32_000);
+    expect(modelVisibleCharWeightOf(remote)).toBeLessThan(
+      Number.POSITIVE_INFINITY,
+    );
+  });
+
   it("preserves maximum non-overlapping committed coverage and segments gaps", () => {
     const messages = [
       user("u1", "1"),

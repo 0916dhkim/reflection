@@ -818,7 +818,7 @@ describe("projectMessages", () => {
     );
   });
 
-  it("fails only when no safe turn-aligned tail can fit", async () => {
+  it("fails closed for malformed model-visible media", async () => {
     const messages = longSession();
     const current = messages.at(-1);
     if (current) {
@@ -826,9 +826,9 @@ describe("projectMessages", () => {
         ...current.parts,
         {
           type: "file",
-          filename: "remote.pdf",
+          filename: "malformed.pdf",
           mime: "application/pdf",
-          url: "https://example.com/remote.pdf",
+          url: "data:application/pdf;base64",
         },
       ];
     }
@@ -1398,6 +1398,33 @@ describe("projectMessages", () => {
     },
   );
 
+  it("counts deeply nested tool input toward request pressure", async () => {
+    const messages = longSession(2);
+    const latestAssistant = [...messages]
+      .reverse()
+      .find((message) => message.info.role === "assistant");
+    let nested: unknown = "x".repeat(500_000);
+    for (let depth = 0; depth < 12; depth += 1) nested = { nested };
+    if (latestAssistant) {
+      latestAssistant.parts = [
+        ...latestAssistant.parts,
+        {
+          type: "tool",
+          tool: "custom",
+          state: { status: "completed", input: nested, output: "done" },
+        },
+      ];
+    }
+
+    const result = await projectMessages({
+      messages,
+      contextLimit: CONTEXT_LIMIT,
+      loadSummaries: async () => summaries(messages),
+    });
+
+    expect(result.reset).toBe(true);
+  });
+
   it("counts multibyte model-visible text using UTF-8 pressure", async () => {
     const messages = [
       user("u0", "漢".repeat(150_000)),
@@ -1524,7 +1551,7 @@ describe("projectMessages", () => {
     );
   });
 
-  it("fails closed when non-image media size is unknown", async () => {
+  it("uses a finite reserve for remote media", async () => {
     const messages = longSession();
     const current = messages.at(-1);
     if (current) {
@@ -1539,13 +1566,14 @@ describe("projectMessages", () => {
       ];
     }
 
-    await expect(
-      projectMessages({
-        messages,
-        contextLimit: CONTEXT_LIMIT,
-        loadSummaries: async () => summaries(messages),
-      }),
-    ).rejects.toThrow("safe message-aligned projection tail");
+    const result = await projectMessages({
+      messages,
+      contextLimit: CONTEXT_LIMIT,
+      loadSummaries: async () => summaries(messages),
+    });
+
+    expect(result.reset).toBe(true);
+    expect(result.messages.at(-1)?.parts.at(-1)?.filename).toBe("remote.pdf");
   });
 
   it("fails at the hard limit for one unsplittable source message", async () => {

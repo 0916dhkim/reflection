@@ -228,7 +228,12 @@ export function isModelVisiblePart(
   // OpenCode V1 applies `ignored` only while converting user parts.
   return (
     isModelVisibleMessage(message) &&
-    (message.info.role === "assistant" || part.ignored !== true)
+    (message.info.role === "assistant" || part.ignored !== true) &&
+    !(
+      message.info.role === "user" &&
+      part.type === "file" &&
+      (part.mime === "text/plain" || part.mime === "application/x-directory")
+    )
   );
 }
 
@@ -340,26 +345,51 @@ function sanitizeModelValue(value: unknown, depth = 0): unknown {
 }
 
 export function modelVisibleToolState(value: unknown): unknown {
+  return sanitizeModelValue(modelVisibleToolStateValue(value));
+}
+
+function modelVisibleToolStateValue(value: unknown): unknown {
   if (typeof value !== "object" || value === null) {
-    return sanitizeModelValue(value);
+    return value;
   }
   const state = value as Record<string, unknown>;
   const time =
     typeof state.time === "object" && state.time !== null
       ? (state.time as Record<string, unknown>)
       : {};
-  return sanitizeModelValue(
-    typeof time.compacted === "number"
-      ? { ...state, output: "[Old tool result content cleared]" }
-      : state,
-  );
+  return typeof time.compacted === "number"
+    ? { ...state, output: "[Old tool result content cleared]" }
+    : state;
 }
 
-function serializedLength(value: unknown): number {
+export function modelVisibleToolStateSize(value: unknown): {
+  chars: number;
+  utf8Bytes: number;
+} {
+  const visible = modelVisibleToolStateValue(value);
+  const seen = new WeakSet<object>();
   try {
-    return (JSON.stringify(value) ?? "null").length;
+    const serialized =
+      JSON.stringify(visible, function (key, item: unknown) {
+        if (this === visible && key === "attachments") return undefined;
+        if (typeof item === "string" && item.startsWith("data:")) {
+          return "[data URL omitted]";
+        }
+        if (typeof item === "object" && item !== null) {
+          if (seen.has(item)) throw new Error("cyclic tool state");
+          seen.add(item);
+        }
+        return item;
+      }) ?? "null";
+    return {
+      chars: serialized.length,
+      utf8Bytes: Buffer.byteLength(serialized, "utf8"),
+    };
   } catch {
-    return "[unserializable value]".length;
+    return {
+      chars: Number.POSITIVE_INFINITY,
+      utf8Bytes: Number.POSITIVE_INFINITY,
+    };
   }
 }
 
@@ -382,9 +412,11 @@ export function modelVisibleMediaTokens(value: unknown): number {
   if (mime.startsWith("image/")) return MEDIA_TOKEN_RESERVE;
   if (typeof media.url !== "string") return Number.POSITIVE_INFINITY;
   const bytes = dataUrlBytes(media.url);
-  return bytes === null
-    ? Number.POSITIVE_INFINITY
-    : Math.max(MEDIA_TOKEN_RESERVE, Math.ceil(bytes / MEDIA_BYTES_PER_TOKEN));
+  return bytes === null && !media.url.startsWith("data:")
+    ? MEDIA_TOKEN_RESERVE
+    : bytes === null
+      ? Number.POSITIVE_INFINITY
+      : Math.max(MEDIA_TOKEN_RESERVE, Math.ceil(bytes / MEDIA_BYTES_PER_TOKEN));
 }
 
 export function modelVisibleToolAttachmentTokens(value: unknown): number {
@@ -401,36 +433,49 @@ export function modelVisibleToolAttachmentTokens(value: unknown): number {
   ) {
     return 0;
   }
-  return state.attachments.reduce(
-    (total, attachment) => total + modelVisibleMediaTokens(attachment),
-    0,
-  );
+  return state.attachments.reduce((total, attachment) => {
+    if (typeof attachment !== "object" || attachment === null) return total;
+    const item = attachment as Record<string, unknown>;
+    const mime = typeof item.mime === "string" ? item.mime : "";
+    const url = typeof item.url === "string" ? item.url : "";
+    const validDataUrl = url.startsWith("data:") && url.includes(",");
+    const hostMedia = mime.startsWith("image/") || mime === "application/pdf";
+    return (
+      total +
+      (validDataUrl || (hostMedia && url.length > 0)
+        ? modelVisibleMediaTokens(item)
+        : 0)
+    );
+  }, 0);
 }
 
-function inlineDataUrlTokens(value: unknown, depth = 0): number {
-  if (depth > 8) return 0;
-  if (typeof value === "string") {
-    if (!value.startsWith("data:")) return 0;
-    const bytes = dataUrlBytes(value);
-    return bytes === null
-      ? Number.POSITIVE_INFINITY
-      : Math.max(MEDIA_TOKEN_RESERVE, Math.ceil(bytes / MEDIA_BYTES_PER_TOKEN));
+function inlineDataUrlTokens(value: unknown): number {
+  const pending: Array<{ value: unknown; root: boolean }> = [
+    { value, root: true },
+  ];
+  const seen = new WeakSet<object>();
+  let total = 0;
+  while (pending.length > 0) {
+    const current = pending.pop()!;
+    if (typeof current.value === "string") {
+      if (!current.value.startsWith("data:")) continue;
+      const bytes = dataUrlBytes(current.value);
+      if (bytes === null) return Number.POSITIVE_INFINITY;
+      total += Math.max(
+        MEDIA_TOKEN_RESERVE,
+        Math.ceil(bytes / MEDIA_BYTES_PER_TOKEN),
+      );
+      continue;
+    }
+    if (typeof current.value !== "object" || current.value === null) continue;
+    if (seen.has(current.value)) return Number.POSITIVE_INFINITY;
+    seen.add(current.value);
+    for (const [key, item] of Object.entries(current.value)) {
+      if (current.root && key === "attachments") continue;
+      pending.push({ value: item, root: false });
+    }
   }
-  if (Array.isArray(value)) {
-    return value.reduce(
-      (total, item) => total + inlineDataUrlTokens(item, depth + 1),
-      0,
-    );
-  }
-  if (typeof value !== "object" || value === null) return 0;
-  return Object.entries(value).reduce(
-    (total, [key, item]) =>
-      total +
-      (depth === 0 && key === "attachments"
-        ? 0
-        : inlineDataUrlTokens(item, depth + 1)),
-    0,
-  );
+  return total;
 }
 
 export function modelVisibleToolInlineDataTokens(value: unknown): number {
@@ -442,11 +487,7 @@ export function modelVisibleToolInlineDataTokens(value: unknown): number {
     typeof state.time === "object" && state.time !== null
       ? (state.time as Record<string, unknown>)
       : {};
-  return inlineDataUrlTokens(
-    typeof time.compacted === "number"
-      ? { ...state, output: "[Old tool result content cleared]" }
-      : state,
-  );
+  return inlineDataUrlTokens(modelVisibleToolStateValue(value));
 }
 
 export function modelVisibleCharWeightOf(message: OpenCodeMessage): number {
@@ -459,9 +500,8 @@ export function modelVisibleCharWeightOf(message: OpenCodeMessage): number {
       continue;
     }
     if (part.type === "tool") {
-      weight +=
-        (part.tool?.length ?? 0) +
-        serializedLength(modelVisibleToolState(part.state));
+      const stateSize = modelVisibleToolStateSize(part.state);
+      weight += (part.tool?.length ?? 0) + stateSize.chars;
       weight +=
         modelVisibleToolAttachmentTokens(part.state) *
         ESTIMATED_CHARS_PER_TOKEN;
