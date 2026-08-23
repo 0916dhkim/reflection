@@ -371,7 +371,7 @@ describe("segmentMessages", () => {
     expect(modelVisibleCharWeightOf(message)).toBe(Number.POSITIVE_INFINITY);
   });
 
-  it("matches host visibility for ignored files and remote tool media", () => {
+  it("ignores hidden files and fails closed for unknown-size remote PDFs", () => {
     const hidden = user("u1");
     hidden.parts = [
       {
@@ -403,10 +403,7 @@ describe("segmentMessages", () => {
         },
       },
     ];
-    expect(modelVisibleCharWeightOf(remote)).toBeGreaterThanOrEqual(32_000);
-    expect(modelVisibleCharWeightOf(remote)).toBeLessThan(
-      Number.POSITIVE_INFINITY,
-    );
+    expect(modelVisibleCharWeightOf(remote)).toBe(Number.POSITIVE_INFINITY);
   });
 
   it("preserves maximum non-overlapping committed coverage and segments gaps", () => {
