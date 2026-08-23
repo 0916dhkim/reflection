@@ -1313,6 +1313,23 @@ describe("projectMessages", () => {
     },
   );
 
+  it("counts multibyte model-visible text using UTF-8 pressure", async () => {
+    const messages = [
+      user("u0", "漢".repeat(150_000)),
+      assistant("a0", "u0", "done"),
+      user("current", "continue"),
+    ];
+
+    const result = await projectMessages({
+      messages,
+      contextLimit: CONTEXT_LIMIT,
+      loadSummaries: async () => summaries(messages),
+    });
+
+    expect(result.reset).toBe(true);
+    expect(result.state.checkpoint?.tailStartMessageId).toBe("current");
+  });
+
   it("marks an uncovered unanswered gap after a native summary as lossy", async () => {
     const compactionUser = user("compaction-user", "");
     compactionUser.parts = [{ type: "compaction" }];

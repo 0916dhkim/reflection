@@ -433,7 +433,7 @@ function inlineDataUrlTokens(value: unknown, depth = 0): number {
   );
 }
 
-function modelVisibleToolInlineDataTokens(value: unknown): number {
+export function modelVisibleToolInlineDataTokens(value: unknown): number {
   if (typeof value !== "object" || value === null) {
     return inlineDataUrlTokens(value);
   }
