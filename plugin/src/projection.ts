@@ -238,6 +238,13 @@ function applyCheckpoint(
       providerID: model.providerID,
       modelID: model.modelID,
       time: { created, completed: created },
+      cost: 0,
+      tokens: {
+        input: 0,
+        output: 0,
+        reasoning: 0,
+        cache: { read: 0, write: 0 },
+      },
       summary: true,
       error: undefined,
     },

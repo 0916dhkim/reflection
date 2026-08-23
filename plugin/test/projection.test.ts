@@ -298,6 +298,15 @@ describe("projectMessages", () => {
       sessionID: SESSION_ID,
       messageID: result.messages[1]?.info.id,
     });
+    expect(result.messages[1]?.info).toMatchObject({
+      cost: 0,
+      tokens: {
+        input: 0,
+        output: 0,
+        reasoning: 0,
+        cache: { read: 0, write: 0 },
+      },
+    });
     expect(result.messages.at(-1)?.info.id).toBe("current");
   });
 
