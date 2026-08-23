@@ -736,11 +736,30 @@ describe("segmentMessages", () => {
     } as unknown as CommittedSegmentBoundary;
     for (const boundary of [
       missingCursor,
-      v2Boundary("u1", "missing", "a2"),
       v2Boundary("u1", "a2", "a1"),
       v2Boundary("u1", "a1", "u2"),
     ]) {
       expect(() => segmentMessages(messages, 100, [boundary])).toThrow();
+    }
+  });
+
+  it("drops exact source anchors removed by a local history rewind", () => {
+    const messages = [
+      user("u1", "request"),
+      assistant("a1", "u1", "answer"),
+      user("u2", "next"),
+    ];
+
+    for (const boundary of [
+      v2Boundary("u1", "u1", "removed-assistant"),
+      v2Boundary("removed-user", "removed-user", "removed-assistant"),
+    ]) {
+      expect(segmentMessages(messages, 100, [boundary])).toMatchObject([
+        {
+          sourceBoundaryVersion: 1,
+          sourceMessageIds: ["u1", "a1", "u2"],
+        },
+      ]);
     }
   });
 

@@ -646,12 +646,9 @@ function resolveV2Boundaries(
       endSourceMessageId: string;
     };
     const turn = turnsByUser.get(current.startUserMessageId);
-    if (!turn) throw new Error("V2 user boundary was not found");
     const startIndex = sourceIndexes.get(current.startSourceMessageId);
     const endIndex = sourceIndexes.get(current.endSourceMessageId);
-    if (startIndex === undefined || endIndex === undefined) {
-      throw new Error("V2 source boundary was not found");
-    }
+    if (!turn || startIndex === undefined || endIndex === undefined) return [];
     if (startIndex === null || endIndex === null) {
       throw new Error("V2 source boundary is ambiguous");
     }
