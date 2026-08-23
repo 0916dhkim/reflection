@@ -15,6 +15,7 @@ type WorkerDatabase = Pick<
   | "finishFailedAttempt"
 >;
 type WorkerEngine = Pick<ExtractionEngine, "extract" | "resolve">;
+type ProcessResult = "progressed" | "stale";
 type WorkerSettings = Pick<
   Settings,
   | "workerPollSeconds"
@@ -30,6 +31,7 @@ export interface WorkerLogger {
 }
 
 const defaultLogger: WorkerLogger = console;
+const STALE_WORK_MIN_BACKOFF_MS = 100;
 
 function errorText(error: unknown): string {
   if (error instanceof Error) return `${error.name}: ${error.message}`;
@@ -74,7 +76,7 @@ export class ExtractionWorker {
     this.#wakeWaiter?.();
   }
 
-  async process(job: ClaimedJob): Promise<void> {
+  async process(job: ClaimedJob): Promise<ProcessResult> {
     try {
       let extractionResult = job.extractionResult;
       if (extractionResult === null) {
@@ -83,10 +85,16 @@ export class ExtractionWorker {
           job,
           extractionResult,
         );
-        if (!published) return;
+        if (!published) return "stale";
       }
       const prepared = await this.#engine.resolve(job, extractionResult);
-      await this.#database.commitResolution(job, extractionResult, prepared);
+      return (await this.#database.commitResolution(
+        job,
+        extractionResult,
+        prepared,
+      ))
+        ? "progressed"
+        : "stale";
     } catch (error) {
       if (error instanceof TerminalExtractionValidationError) {
         this.#logger.error(
@@ -103,7 +111,7 @@ export class ExtractionWorker {
             `ignored deterministic failure from stale lease for job ${job.id}`,
           );
         }
-        return;
+        return updated ? "progressed" : "stale";
       }
 
       const shouldRetry = job.attempts < this.#settings.workerMaxAttempts;
@@ -123,6 +131,7 @@ export class ExtractionWorker {
       if (!updated) {
         this.#logger.info(`ignored failure from stale lease for job ${job.id}`);
       }
+      return updated ? "progressed" : "stale";
     }
   }
 
@@ -172,7 +181,9 @@ export class ExtractionWorker {
         await this.#waitForWork();
         continue;
       }
-      await this.process(job);
+      if ((await this.process(job)) === "stale") {
+        await this.#waitForWork(false);
+      }
     }
   }
 
@@ -184,9 +195,9 @@ export class ExtractionWorker {
     return Boolean(result.rows[0]?.acquired);
   }
 
-  async #waitForWork(): Promise<void> {
+  async #waitForWork(allowWake = true): Promise<void> {
     if (this.#stopping) return;
-    if (this.#wakeRequested) {
+    if (allowWake && this.#wakeRequested) {
       this.#wakeRequested = false;
       return;
     }
@@ -197,16 +208,22 @@ export class ExtractionWorker {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
-        if (this.#wakeWaiter === finish) this.#wakeWaiter = null;
+        if (this.#wakeWaiter === wake) this.#wakeWaiter = null;
         resolve();
+      };
+      const wake = () => {
+        if (this.#stopping || allowWake) finish();
       };
       const timer = setTimeout(
         finish,
-        Math.max(0, this.#settings.workerPollSeconds * 1000),
+        Math.max(
+          allowWake ? 0 : STALE_WORK_MIN_BACKOFF_MS,
+          this.#settings.workerPollSeconds * 1000,
+        ),
       );
       timer.unref();
-      this.#wakeWaiter = finish;
-      if (this.#stopping || this.#wakeRequested) finish();
+      this.#wakeWaiter = wake;
+      if (this.#stopping || (allowWake && this.#wakeRequested)) finish();
     });
     this.#wakeRequested = false;
   }

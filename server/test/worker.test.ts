@@ -330,6 +330,46 @@ describe("ExtractionWorker", () => {
     expect(releases).toEqual([1, 2]);
   });
 
+  test("backs off after stale work despite ordinary wake signals", async () => {
+    const claimed = job(1);
+    const firstPublish = deferred<void>();
+    const connection = {
+      query: vi.fn(async (sql: string) => ({
+        rows: sql.includes("pg_try_advisory_lock")
+          ? [{ acquired: true }]
+          : [{ unlocked: true }],
+      })),
+      release: vi.fn(),
+    };
+    const claimOldestJob = vi.fn(async () => claimed);
+    const database = workerDatabase({
+      pool: { connect: vi.fn(async () => connection) },
+      recoverRunningJobs: vi.fn(async () => 0),
+      claimOldestJob,
+      publishExtraction: vi.fn(async () => {
+        firstPublish.resolve();
+        return false;
+      }),
+    });
+    const worker = new ExtractionWorker(
+      database,
+      workerEngine({
+        extract: vi.fn(async () => extractionResult()),
+        resolve: vi.fn(),
+      }),
+      settings({ workerPollSeconds: 60 }),
+      logger,
+    );
+
+    worker.start();
+    await firstPublish.promise;
+    worker.wake();
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    expect(claimOldestJob).toHaveBeenCalledOnce();
+    await worker.stop();
+    expect(connection.release).toHaveBeenCalledOnce();
+  });
+
   test("graceful stop waits for the in-flight extraction to commit", async () => {
     const claimed = job(1);
     const resolution = deferred<PreparedSegment>();
