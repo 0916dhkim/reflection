@@ -908,6 +908,31 @@ describe("segmentMessages", () => {
     ]);
   });
 
+  it("keeps a V1 anchor open while its final turn can still grow", () => {
+    const boundary = v1Boundary("u1", "u1");
+    expect(
+      segmentMessages([user("u1", "request")], 100, [boundary])[0],
+    ).toMatchObject({ closed: false, sourceMessageIds: ["u1"] });
+    expect(
+      segmentMessages(
+        [user("u1", "request"), assistant("a1", "u1", "done")],
+        100,
+        [boundary],
+      )[0],
+    ).toMatchObject({ closed: false, sourceMessageIds: ["u1", "a1"] });
+    expect(
+      segmentMessages(
+        [
+          user("u1", "request"),
+          assistant("a1", "u1", "done"),
+          user("u2", "next"),
+        ],
+        100,
+        [boundary],
+      )[0],
+    ).toMatchObject({ closed: true, sourceMessageIds: ["u1", "a1"] });
+  });
+
   it("fails closed for malformed exact source cursors", () => {
     const messages = [
       user("u1", "request"),

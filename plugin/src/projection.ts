@@ -4,6 +4,7 @@ import {
   isModelVisibleMessage,
   isModelVisiblePart,
   isNormalUserMessage,
+  isProjectionLossWarningMessage,
   modelVisibleMediaTokens,
   modelVisibleToolAttachmentTokens,
   modelVisibleToolInlineDataTokens,
@@ -473,6 +474,27 @@ function archivedContentOmissions(
   return [...reasons];
 }
 
+function canonicalCoverageOmissions(
+  messages: readonly OpenCodeMessage[],
+  archivedSegments: readonly ReflectionSegment[],
+): string[] {
+  const firstNormalUser = messages.findIndex(isNormalUserMessage);
+  if (firstNormalUser < 0) return [];
+  const covered = new Set(
+    archivedSegments.flatMap((segment) => segment.sourceMessageIds),
+  );
+  return messages
+    .slice(firstNormalUser)
+    .some(
+      (message) =>
+        isModelVisibleMessage(message) &&
+        !isProjectionLossWarningMessage(message) &&
+        !covered.has(message.info.id),
+    )
+    ? ["unsegmented-archived-messages-omitted"]
+    : [];
+}
+
 const OMISSION_MARKERS: Record<string, string> = {
   "summary-service-unavailable":
     "[Omitted: Reflection summaries were unavailable during compaction.]",
@@ -492,6 +514,8 @@ const OMISSION_MARKERS: Record<string, string> = {
     "[Omitted: archived reasoning could not be retained safely.]",
   "archived-media-omitted":
     "[Omitted: archived media content could not be copied into projected context.]",
+  "unsegmented-archived-messages-omitted":
+    "[Omitted: model-visible archived messages outside canonical source segments could not be retained safely.]",
 };
 
 interface BuiltSummary {
@@ -915,6 +939,10 @@ export async function projectMessages(
       !coverage.complete ? "missing-segment-summaries" : "",
       inherited.reasoningOmitted ? "inherited-reasoning-omitted" : "",
       ...archivedContentOmissions(input.messages.slice(0, tailIndex)),
+      ...canonicalCoverageOmissions(
+        input.messages.slice(0, tailIndex),
+        candidate.archivedSegments,
+      ),
     ].filter(Boolean);
     const built = buildSummaryText({
       segments: coverage.segments,

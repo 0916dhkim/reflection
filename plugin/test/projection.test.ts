@@ -453,6 +453,33 @@ describe("projectMessages", () => {
     expect(result.messages.slice(2)).toEqual(messages.slice(3));
   });
 
+  it("marks an interior orphan assistant outside canonical coverage as lossy", async () => {
+    const messages = longSession();
+    messages.splice(
+      4,
+      0,
+      assistant("orphan", "missing-user", "ORPHAN_VISIBLE_TEXT"),
+    );
+
+    const result = await projectMessages({
+      messages,
+      contextLimit: CONTEXT_LIMIT,
+      loadSummaries: async () => summaries(messages),
+    });
+
+    expect(result.reset).toBe(true);
+    expect(result.diagnostic?.lossy).toBe(true);
+    expect(result.diagnostic?.omissionReasons).toContain(
+      "unsegmented-archived-messages-omitted",
+    );
+    expect(projectedContext(result.messages)).not.toContain(
+      "ORPHAN_VISIBLE_TEXT",
+    );
+    expect(projectedContext(result.messages)).toContain(
+      "outside canonical source segments",
+    );
+  });
+
   it("archives an exact user-ending anchor after later same-turn source", async () => {
     const messages = [
       user("u1", "request"),

@@ -1031,11 +1031,9 @@ export function segmentMessages(
     const v1 = selectedV1ByStart.get(turnIndex);
     if (v1) {
       flushOrdinaryTurns(true);
+      const coveredTurns = history.turns.slice(v1.startIndex, v1.endIndex + 1);
       segments.push(
-        makeV1Segment(
-          history.turns.slice(v1.startIndex, v1.endIndex + 1),
-          true,
-        ),
+        makeV1Segment(coveredTurns, coveredTurns.at(-1)?.closed ?? true),
       );
       turnIndex = v1.endIndex + 1;
       continue;
