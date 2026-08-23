@@ -52,9 +52,6 @@ function isSessionState(value: unknown): value is ProjectionSessionState {
     checkpoint.tailStartMessageId.length > 0 &&
     typeof checkpoint.archivedPrefixFingerprint === "string" &&
     /^[0-9a-f]{64}$/.test(checkpoint.archivedPrefixFingerprint) &&
-    (checkpoint.canonicalSourceFingerprint === undefined ||
-      (typeof checkpoint.canonicalSourceFingerprint === "string" &&
-        /^[0-9a-f]{64}$/.test(checkpoint.canonicalSourceFingerprint))) &&
     typeof checkpoint.summaryText === "string" &&
     checkpoint.summaryText.length > 0 &&
     typeof checkpoint.createdAtMessageId === "string" &&

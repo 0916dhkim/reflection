@@ -412,9 +412,11 @@ export function modelVisibleMediaTokens(value: unknown): number {
   if (mime.startsWith("image/")) return MEDIA_TOKEN_RESERVE;
   if (typeof media.url !== "string") return Number.POSITIVE_INFINITY;
   const bytes = dataUrlBytes(media.url);
-  return bytes === null
-    ? Number.POSITIVE_INFINITY
-    : Math.max(MEDIA_TOKEN_RESERVE, Math.ceil(bytes / MEDIA_BYTES_PER_TOKEN));
+  return bytes === null && !media.url.startsWith("data:")
+    ? MEDIA_TOKEN_RESERVE
+    : bytes === null
+      ? Number.POSITIVE_INFINITY
+      : Math.max(MEDIA_TOKEN_RESERVE, Math.ceil(bytes / MEDIA_BYTES_PER_TOKEN));
 }
 
 export function modelVisibleToolAttachmentTokens(value: unknown): number {

@@ -5,8 +5,6 @@ import { join } from "node:path";
 import { tool, type Plugin } from "@opencode-ai/plugin";
 import {
   parseSegmentResponse,
-  parseJobResponse,
-  parseSegmentCreate,
   parseSessionSegmentsResponse,
   type JobStatus,
   type SegmentCreate,
@@ -26,16 +24,10 @@ import {
   type ReflectionSegment,
 } from "@reflection/shared/segmentation";
 
-import {
-  boundedErrorText,
-  combineAbortSignals,
-  requestSignal,
-  safeErrorDetail,
-} from "./http.js";
+import { requestSignal, safeErrorDetail } from "./http.js";
 import {
   activeModel,
   projectMessages,
-  projectionSourcesFingerprint,
   type StoredSegmentSummary,
 } from "./projection.js";
 import { ProjectionStateStore } from "./projection-state.js";
@@ -52,7 +44,6 @@ const INACTIVE_MS = 10 * 60 * 1000;
 const MAX_INACTIVE_SESSIONS_PER_SWEEP = 20;
 const INACTIVE_SESSION_RECHECK_MS = 10 * 60_000;
 const SDK_REQUEST_TIMEOUT_MS = 30_000;
-const INACTIVE_SWEEP_TIMEOUT_MS = 60_000;
 const PROJECTION_REQUEST_TIMEOUT_MS = 5_000;
 const TARGET_POST_TIMEOUT_MS = 5_000;
 const TARGET_WAIT_TIMEOUT_MS = 5_000;
@@ -190,9 +181,7 @@ async function apiCall(
       headers,
       signal: request.signal,
     });
-    const body = response.ok
-      ? await response.text()
-      : await boundedErrorText(response);
+    const body = await response.text();
     let data: unknown = body;
     if (body.length > 0) {
       try {
@@ -208,17 +197,11 @@ async function apiCall(
       detail: response.ok ? "" : safeErrorDetail(body, config.apiKey),
     };
   } catch (error) {
-    if (init.signal?.aborted) {
-      throw init.signal.reason ?? error;
-    }
     return {
       ok: false,
       status: 0,
       data: null,
-      detail: safeErrorDetail(
-        String(request.signal.aborted ? request.signal.reason : error),
-        config.apiKey,
-      ),
+      detail: safeErrorDetail(String(error), config.apiKey),
     };
   } finally {
     request.dispose();
@@ -347,27 +330,6 @@ function formatApiFailure(operation: string, response: ApiResult): string {
   return `${operation} failed (${response.status})${detail}`;
 }
 
-async function waitForDelay(
-  milliseconds: number,
-  signal?: AbortSignal,
-): Promise<void> {
-  if (signal?.aborted) throw signal.reason;
-  await new Promise<void>((resolve, reject) => {
-    const cleanup = () => signal?.removeEventListener("abort", abort);
-    const abort = () => {
-      clearTimeout(timeout);
-      cleanup();
-      reject(signal?.reason);
-    };
-    const timeout = setTimeout(() => {
-      cleanup();
-      resolve();
-    }, milliseconds);
-    signal?.addEventListener("abort", abort, { once: true });
-    if (signal?.aborted) abort();
-  });
-}
-
 export const Reflection: Plugin = async ({ client, directory }) => {
   const initialConfig = loadConfig();
   const projectionEnabled = initialConfig?.contextProjection === true;
@@ -378,32 +340,6 @@ export const Reflection: Plugin = async ({ client, directory }) => {
   const targetUpdates = new Map<string, TargetUpdateState>();
   const targetRevisions = new Map<string, number>();
   const targetUpdateAborts = new Map<string, Set<AbortController>>();
-  const automaticRetries = new Map<string, Map<string, string>>();
-  const lifecycleAbort = new AbortController();
-  const activeProjections = new Set<Promise<void>>();
-  const registerSessionOperation = (
-    sessionId: string,
-    parentSignal: AbortSignal = lifecycleAbort.signal,
-  ) => {
-    const controller = new AbortController();
-    const controllers = targetUpdateAborts.get(sessionId) ?? new Set();
-    controllers.add(controller);
-    targetUpdateAborts.set(sessionId, controllers);
-    const combined = combineAbortSignals([controller.signal, parentSignal]);
-    return {
-      signal: combined.signal,
-      dispose() {
-        combined.dispose();
-        controllers.delete(controller);
-        if (
-          controllers.size === 0 &&
-          targetUpdateAborts.get(sessionId) === controllers
-        ) {
-          targetUpdateAborts.delete(sessionId);
-        }
-      },
-    };
-  };
   const idlePasses = new Map<string, IdlePassState>();
   const inactiveSessionChecks = new Map<
     string,
@@ -423,50 +359,28 @@ export const Reflection: Plugin = async ({ client, directory }) => {
   ): void => {
     const cached = successfulSegmentFingerprints.get(sessionId);
     if (!cached) return;
-    const authoritative = new Map<
-      string,
-      { fingerprint: string; terminalFailure: boolean }
-    >();
-    for (const boundary of listing.boundaries) {
-      if (boundary.id && boundary.sourceFingerprint) {
-        authoritative.set(boundary.id, {
-          fingerprint: boundary.sourceFingerprint,
-          terminalFailure: false,
-        });
-      }
-    }
-    for (const target of listing.targets) {
-      if (target.id && target.sourceFingerprint) {
-        authoritative.set(target.id, {
-          fingerprint: target.sourceFingerprint,
-          terminalFailure:
-            target.status === "failed" || target.status === "superseded",
-        });
-      }
-    }
+    const authoritative = new Map(
+      [...listing.boundaries, ...listing.targets].flatMap((boundary) =>
+        boundary.id && boundary.sourceFingerprint
+          ? [[boundary.id, boundary.sourceFingerprint] as const]
+          : [],
+      ),
+    );
     for (const [segmentId, submission] of cached) {
       const current = authoritative.get(segmentId);
-      if (
-        current !== undefined &&
-        (current.fingerprint !== submission.fingerprint ||
-          current.terminalFailure)
-      ) {
+      if (current !== undefined && current !== submission.fingerprint) {
         cached.delete(segmentId);
       }
     }
   };
   const log = async (message: string) => {
-    const request = requestSignal(
-      lifecycleAbort.signal,
-      SDK_REQUEST_TIMEOUT_MS,
-    );
+    const request = requestSignal(undefined, SDK_REQUEST_TIMEOUT_MS);
     try {
       await client.app.log({
         body: { service: "reflection", level: "warn", message },
         signal: request.signal,
       });
     } catch {
-      if (request.signal.aborted) return;
       console.error(message);
     } finally {
       request.dispose();
@@ -561,24 +475,9 @@ export const Reflection: Plugin = async ({ client, directory }) => {
       if (!segment.closed && !isSafeSegmentSnapshot(segment, messages ?? [])) {
         continue;
       }
-      const rawBody = submissionBody(sessionId, segment, processingPriority);
-      const segmentKey = segmentIdForRequest(rawBody);
+      const body = submissionBody(sessionId, segment, processingPriority);
+      const segmentKey = segmentIdForRequest(body);
       const fingerprint = submissionSourceFingerprint(sessionId, segment);
-      const fail = async (failure: string): Promise<void> => {
-        await log(failure);
-        if (segment.closed) {
-          throw new SegmentSubmissionError(failure, segmentKey);
-        }
-      };
-      let body: SegmentCreate;
-      try {
-        body = parseSegmentCreate(rawBody);
-      } catch (error) {
-        await fail(
-          `segment submission for ${sessionId} failed local validation: ${String(error)}`,
-        );
-        continue;
-      }
       const previous = fingerprints.get(segmentKey);
       if (
         previous?.fingerprint === fingerprint &&
@@ -602,67 +501,9 @@ export const Reflection: Plugin = async ({ client, directory }) => {
           `segment submission for ${sessionId}`,
           response,
         );
-        await fail(failure);
-        continue;
-      }
-      let job;
-      try {
-        job = parseJobResponse(response.data);
-      } catch (error) {
-        await fail(
-          `segment submission for ${sessionId} returned an invalid job: ${String(error)}`,
-        );
-        continue;
-      }
-      if (
-        job.segment_id !== segmentKey ||
-        job.source_fingerprint !== fingerprint
-      ) {
-        await fail(
-          `segment submission for ${sessionId} returned a mismatched job`,
-        );
-        continue;
-      }
-      if (job.status === "failed") {
-        const sessionRetries = automaticRetries.get(sessionId) ?? new Map();
-        automaticRetries.set(sessionId, sessionRetries);
-        if (sessionRetries.get(segmentKey) === fingerprint) {
-          await fail(
-            `segment submission for ${sessionId} remained failed after its automatic retry`,
-          );
-          continue;
-        }
-        sessionRetries.set(segmentKey, fingerprint);
-        const retry = await apiCall(
-          `/v1/jobs/${job.id}/retry`,
-          { method: "POST", signal },
-          TARGET_POST_TIMEOUT_MS,
-        );
-        if (!retry.ok) {
-          await fail(formatApiFailure(`segment retry for ${sessionId}`, retry));
-          continue;
-        }
-        try {
-          job = parseJobResponse(retry.data);
-        } catch (error) {
-          await fail(
-            `segment retry for ${sessionId} returned an invalid job: ${String(error)}`,
-          );
-          continue;
-        }
-      }
-      if (
-        job.segment_id !== segmentKey ||
-        job.source_fingerprint !== fingerprint
-      ) {
-        await fail(`segment retry for ${sessionId} returned a mismatched job`);
-        continue;
-      }
-      if (job.status === "failed" || job.status === "superseded") {
-        await fail(
-          `segment submission for ${sessionId} ended as ${job.status}`,
-        );
-        continue;
+        await log(failure);
+        if (!segment.closed) continue;
+        throw new SegmentSubmissionError(failure, segmentKey);
       }
       fingerprints.set(segmentKey, { fingerprint, processingPriority });
       successful.push(segmentKey);
@@ -725,12 +566,11 @@ export const Reflection: Plugin = async ({ client, directory }) => {
   const getModelLimits = async (
     providerId: string,
     modelId: string,
-    signal?: AbortSignal,
   ): Promise<ModelLimits> => {
     const key = `${providerId}/${modelId}`;
     const cached = modelLimits.get(key);
     if (cached) return cached;
-    const request = requestSignal(signal, SDK_REQUEST_TIMEOUT_MS);
+    const request = requestSignal(undefined, SDK_REQUEST_TIMEOUT_MS);
     let response;
     try {
       response = await client.provider.list({
@@ -767,12 +607,11 @@ export const Reflection: Plugin = async ({ client, directory }) => {
   const getSegmentListing = async (
     sessionId: string,
     signal?: AbortSignal,
-    timeoutMs = PROJECTION_REQUEST_TIMEOUT_MS,
   ): Promise<SegmentListing> => {
     const response = await apiCall(
       `/v1/sessions/${encodeURIComponent(sessionId)}/segments`,
       { method: "GET", signal },
-      timeoutMs,
+      PROJECTION_REQUEST_TIMEOUT_MS,
     );
     if (!response.ok) {
       throw new SegmentListingUnavailableError(
@@ -790,22 +629,11 @@ export const Reflection: Plugin = async ({ client, directory }) => {
   const getFreshSegmentListing = async (
     sessionId: string,
     deadline = Date.now() + TARGET_WAIT_TIMEOUT_MS,
-    signal?: AbortSignal,
   ): Promise<SegmentListing> => {
     while (true) {
       await waitForTargetUpdates(sessionId, deadline);
       const revision = targetRevisions.get(sessionId) ?? 0;
-      const remaining = deadline - Date.now();
-      if (remaining <= 0) {
-        throw new Error(
-          `target updates timed out after ${TARGET_WAIT_TIMEOUT_MS}ms`,
-        );
-      }
-      const listing = await getSegmentListing(
-        sessionId,
-        signal,
-        Math.min(PROJECTION_REQUEST_TIMEOUT_MS, remaining),
-      );
+      const listing = await getSegmentListing(sessionId);
       await waitForTargetUpdates(sessionId, deadline);
       if ((targetRevisions.get(sessionId) ?? 0) === revision) return listing;
       if (Date.now() >= deadline) {
@@ -845,7 +673,8 @@ export const Reflection: Plugin = async ({ client, directory }) => {
     return listing.targets.some(
       (target) =>
         target.id === segmentId &&
-        (target.status === "pending" || target.status === "running") &&
+        target.status !== "failed" &&
+        target.status !== "succeeded" &&
         target.startUserMessageId === body.start_user_message_id &&
         target.endUserMessageId === body.end_user_message_id &&
         target.sourceBoundaryVersion === body.source_boundary_version &&
@@ -859,10 +688,9 @@ export const Reflection: Plugin = async ({ client, directory }) => {
     sessionId: string,
     requiredSegments: readonly ReflectionSegment[],
     deadline = Date.now() + SUMMARY_WAIT_TIMEOUT_MS,
-    signal?: AbortSignal,
   ): Promise<readonly StoredSegmentSummary[]> => {
     while (true) {
-      const listing = await getFreshSegmentListing(sessionId, deadline, signal);
+      const listing = await getFreshSegmentListing(sessionId, deadline);
       const missing = requiredSegments.filter(
         (segment) =>
           exactSummaryForSegment(sessionId, listing.summaries, segment) ===
@@ -882,7 +710,9 @@ export const Reflection: Plugin = async ({ client, directory }) => {
           `segment summaries timed out after ${SUMMARY_WAIT_TIMEOUT_MS}ms`,
         );
       }
-      await waitForDelay(Math.min(SUMMARY_POLL_INTERVAL_MS, remaining), signal);
+      await new Promise<void>((resolve) =>
+        setTimeout(resolve, Math.min(SUMMARY_POLL_INTERVAL_MS, remaining)),
+      );
     }
   };
 
@@ -944,7 +774,6 @@ export const Reflection: Plugin = async ({ client, directory }) => {
     processingPriority: number,
     generation: number,
     messages: OpenCodeMessage[] | null,
-    parentSignal: AbortSignal = lifecycleAbort.signal,
   ): Promise<IngestionResult> => {
     if (
       deletedSessions.has(sessionId) ||
@@ -952,7 +781,10 @@ export const Reflection: Plugin = async ({ client, directory }) => {
     ) {
       return { messages: null, fresh: false, successfulSegmentKeys: [] };
     }
-    const operation = registerSessionOperation(sessionId, parentSignal);
+    const controller = new AbortController();
+    const controllers = targetUpdateAborts.get(sessionId) ?? new Set();
+    controllers.add(controller);
+    targetUpdateAborts.set(sessionId, controllers);
     try {
       const successfulSegmentKeys = await submitSegments(
         sessionId,
@@ -960,7 +792,7 @@ export const Reflection: Plugin = async ({ client, directory }) => {
         includeOpenSegment,
         processingPriority,
         messages,
-        operation.signal,
+        controller.signal,
       );
       if (
         deletedSessions.has(sessionId) ||
@@ -979,7 +811,13 @@ export const Reflection: Plugin = async ({ client, directory }) => {
         ),
       };
     } finally {
-      operation.dispose();
+      controllers.delete(controller);
+      if (
+        controllers.size === 0 &&
+        targetUpdateAborts.get(sessionId) === controllers
+      ) {
+        targetUpdateAborts.delete(sessionId);
+      }
     }
   };
 
@@ -987,30 +825,23 @@ export const Reflection: Plugin = async ({ client, directory }) => {
     sessionId: string,
     segments: readonly ReflectionSegment[],
     generation: number,
-    parentSignal: AbortSignal = lifecycleAbort.signal,
   ): Promise<IngestionResult> =>
     serializeTargetUpdate(sessionId, () =>
-      submitSegmentSnapshot(
-        sessionId,
-        segments,
-        false,
-        100,
-        generation,
-        null,
-        parentSignal,
-      ),
+      submitSegmentSnapshot(sessionId, segments, false, 100, generation, null),
     );
 
   const ingestIdleSession = async (
     sessionId: string,
     revalidateInactiveOpen = false,
-    parentSignal: AbortSignal = lifecycleAbort.signal,
   ): Promise<IngestionResult> => {
     if (deletedSessions.has(sessionId)) {
       return { messages: null, fresh: false, successfulSegmentKeys: [] };
     }
     const generation = sessionGenerations.get(sessionId) ?? 0;
-    const operation = registerSessionOperation(sessionId, parentSignal);
+    const controller = new AbortController();
+    const controllers = targetUpdateAborts.get(sessionId) ?? new Set();
+    controllers.add(controller);
+    targetUpdateAborts.set(sessionId, controllers);
     try {
       return await serializeTargetUpdate(sessionId, async () => {
         if (deletedSessions.has(sessionId)) {
@@ -1019,14 +850,17 @@ export const Reflection: Plugin = async ({ client, directory }) => {
         if ((sessionGenerations.get(sessionId) ?? 0) !== generation) {
           return { messages: null, fresh: false, successfulSegmentKeys: [] };
         }
-        const messages = await captureIdleMessages(sessionId, operation.signal);
+        const messages = await captureIdleMessages(
+          sessionId,
+          controller.signal,
+        );
         if (!messages) {
           return { messages: null, fresh: false, successfulSegmentKeys: [] };
         }
         if ((sessionGenerations.get(sessionId) ?? 0) !== generation) {
           return { messages: null, fresh: false, successfulSegmentKeys: [] };
         }
-        const listing = await getSegmentListing(sessionId, operation.signal);
+        const listing = await getSegmentListing(sessionId, controller.signal);
         const segments = segmentMessages(
           messages,
           undefined,
@@ -1034,7 +868,7 @@ export const Reflection: Plugin = async ({ client, directory }) => {
         );
         const includeOpenSegment =
           revalidateInactiveOpen &&
-          (await isStillInactive(sessionId, operation.signal));
+          (await isStillInactive(sessionId, controller.signal));
         return submitSegmentSnapshot(
           sessionId,
           segments,
@@ -1042,19 +876,21 @@ export const Reflection: Plugin = async ({ client, directory }) => {
           0,
           generation,
           messages,
-          operation.signal,
         );
       });
     } finally {
-      operation.dispose();
+      controllers.delete(controller);
+      if (
+        controllers.size === 0 &&
+        targetUpdateAborts.get(sessionId) === controllers
+      ) {
+        targetUpdateAborts.delete(sessionId);
+      }
     }
   };
 
-  const sweepInactiveSessions = async (
-    sessionId: string,
-    signal: AbortSignal,
-  ): Promise<void> => {
-    const request = requestSignal(signal, SDK_REQUEST_TIMEOUT_MS);
+  const sweepInactiveSessions = async (sessionId: string): Promise<void> => {
+    const request = requestSignal(undefined, SDK_REQUEST_TIMEOUT_MS);
     let sessions: Array<{ id: string; time: { updated: number } }> = [];
     try {
       const response = await client.session.list({
@@ -1087,7 +923,7 @@ export const Reflection: Plugin = async ({ client, directory }) => {
         continue;
       }
       try {
-        const result = await ingestIdleSession(candidate.id, true, signal);
+        const result = await ingestIdleSession(candidate.id, true);
         if (
           result.messages === null ||
           result.observedSegmentKeys?.every((key) =>
@@ -1100,7 +936,6 @@ export const Reflection: Plugin = async ({ client, directory }) => {
           });
         }
       } catch (error) {
-        if (signal.aborted) throw signal.reason ?? error;
         await log(
           `Reflection inactive-session ingestion failed for ${candidate.id}: ${error instanceof Error ? error.message : String(error)}`,
         );
@@ -1113,18 +948,11 @@ export const Reflection: Plugin = async ({ client, directory }) => {
       pendingInactiveSweepSessionId = sessionId;
       return;
     }
-    const request = requestSignal(
-      lifecycleAbort.signal,
-      INACTIVE_SWEEP_TIMEOUT_MS,
+    const sweep = sweepInactiveSessions(sessionId).catch((error) =>
+      log(
+        `Reflection inactive-session sweep failed: ${error instanceof Error ? error.message : String(error)}`,
+      ),
     );
-    const sweep = sweepInactiveSessions(sessionId, request.signal)
-      .catch((error) => {
-        if (lifecycleAbort.signal.aborted) return;
-        return log(
-          `Reflection inactive-session sweep failed: ${error instanceof Error ? error.message : String(error)}`,
-        );
-      })
-      .finally(request.dispose);
     inactiveSweep = sweep;
     void sweep.then(() => {
       if (inactiveSweep !== sweep) return;
@@ -1154,9 +982,6 @@ export const Reflection: Plugin = async ({ client, directory }) => {
           const result = await ingestIdleSession(sessionId);
           shouldFinish ||= result.messages !== null;
         } catch (error) {
-          if (lifecycleAbort.signal.aborted || deletedSessions.has(sessionId)) {
-            return;
-          }
           await log(`idle ingestion failed: ${String(error)}`);
         }
         if (state.dirty) continue;
@@ -1178,22 +1003,6 @@ export const Reflection: Plugin = async ({ client, directory }) => {
   };
 
   return {
-    dispose: async () => {
-      lifecycleAbort.abort(new Error("Reflection plugin disposed"));
-      for (const controllers of targetUpdateAborts.values()) {
-        for (const controller of controllers) {
-          controller.abort(new Error("Reflection plugin disposed"));
-        }
-      }
-      const pending = [
-        inactiveSweep,
-        ...[...idlePasses.values()].map((state) => state.promise),
-        ...[...targetUpdates.values()].map((state) => state.tail),
-        ...activeProjections,
-      ].filter((value): value is Promise<void> => value !== null);
-      await Promise.allSettled(pending);
-    },
-
     config: async (config) => {
       if (!projectionEnabled) return;
       const mutable = config as typeof config & {
@@ -1221,7 +1030,6 @@ export const Reflection: Plugin = async ({ client, directory }) => {
         targetRevisions.delete(sessionId);
         idlePasses.delete(sessionId);
         successfulSegmentFingerprints.delete(sessionId);
-        automaticRetries.delete(sessionId);
         inactiveSessionChecks.delete(sessionId);
         projectionState.delete(sessionId);
         return;
@@ -1263,34 +1071,20 @@ export const Reflection: Plugin = async ({ client, directory }) => {
         if (compactionDeadline >= Date.now()) return;
       }
       const generation = sessionGenerations.get(model.sessionId) ?? 0;
-      const operation = registerSessionOperation(model.sessionId);
-      let completeProjection!: () => void;
-      const projectionCompletion = new Promise<void>((resolve) => {
-        completeProjection = resolve;
-      });
-      activeProjections.add(projectionCompletion);
       try {
         const previous = projectionState.get(model.sessionId);
-        const limits = await getModelLimits(
-          model.providerId,
-          model.modelId,
-          operation.signal,
-        );
+        const limits = await getModelLimits(model.providerId, model.modelId);
         let initialListing: Promise<SegmentListing | null> | undefined;
         const listing = () =>
-          (initialListing ??= getSegmentListing(
-            model.sessionId,
-            operation.signal,
-          ).catch((error: unknown) => {
-            if (error instanceof SegmentListingUnavailableError) return null;
-            throw error;
-          }));
+          (initialListing ??= getSegmentListing(model.sessionId).catch(
+            (error: unknown) => {
+              if (error instanceof SegmentListingUnavailableError) return null;
+              throw error;
+            },
+          ));
         let rawSnapshot: Promise<OpenCodeMessage[]> | undefined;
         const rawMessages = () =>
-          (rawSnapshot ??= getSessionMessages(
-            model.sessionId,
-            operation.signal,
-          ));
+          (rawSnapshot ??= getSessionMessages(model.sessionId));
         let canonicalPlan: Promise<readonly ReflectionSegment[]> | undefined;
         const loadCanonicalPlan = () =>
           (canonicalPlan ??= Promise.all([rawMessages(), listing()]).then(
@@ -1306,64 +1100,6 @@ export const Reflection: Plugin = async ({ client, directory }) => {
           messages,
           ...limits,
           previous,
-          validateCheckpoint: async (checkpoint) => {
-            if (!checkpoint.canonicalSourceFingerprint) return false;
-            const current = await listing();
-            if (!current) return true;
-            const plan = await loadCanonicalPlan();
-            const tailSegmentIndex = plan.findIndex(
-              (segment) =>
-                segment.startMessageId === checkpoint.tailStartMessageId,
-            );
-            if (tailSegmentIndex < 0) return false;
-            const archivedSegments = plan.slice(0, tailSegmentIndex);
-            if (!archivedSegments.every((segment) => segment.closed)) {
-              return false;
-            }
-            const expectedSources = new Map(
-              archivedSegments.map((segment) => {
-                const body = submissionBody(model.sessionId, segment, 0);
-                return [
-                  segmentIdForRequest(body),
-                  submissionSourceFingerprint(model.sessionId, segment),
-                ] as const;
-              }),
-            );
-            for (const [segmentId, expected] of expectedSources) {
-              const target = current.targets.find(
-                (entry) => entry.id === segmentId,
-              );
-              if (target) {
-                if (
-                  target.sourceFingerprint !== expected ||
-                  target.status === "failed" ||
-                  target.status === "superseded"
-                ) {
-                  return false;
-                }
-                continue;
-              }
-              const knownBoundaries = current.boundaries.filter(
-                (entry) =>
-                  entry.id === segmentId &&
-                  entry.sourceFingerprint !== undefined,
-              );
-              if (
-                knownBoundaries.length > 0 &&
-                !knownBoundaries.some(
-                  (entry) => entry.sourceFingerprint === expected,
-                )
-              ) {
-                return false;
-              }
-            }
-            return (
-              projectionSourcesFingerprint({
-                sessionId: model.sessionId,
-                archivedSegments,
-              }) === checkpoint.canonicalSourceFingerprint
-            );
-          },
           loadCanonicalSegments: loadCanonicalPlan,
           loadSummaries: async (requiredSegments) => {
             const current = await listing();
@@ -1378,7 +1114,6 @@ export const Reflection: Plugin = async ({ client, directory }) => {
               model.sessionId,
               plan,
               generation,
-              operation.signal,
             );
             const remaining = deadline - Date.now();
             if (remaining <= 0) {
@@ -1394,12 +1129,10 @@ export const Reflection: Plugin = async ({ client, directory }) => {
               model.sessionId,
               requiredSegments,
               deadline,
-              operation.signal,
             );
           },
         });
         if (
-          operation.signal.aborted ||
           deletedSessions.has(model.sessionId) ||
           (sessionGenerations.get(model.sessionId) ?? 0) !== generation
         ) {
@@ -1430,10 +1163,7 @@ export const Reflection: Plugin = async ({ client, directory }) => {
               .catch(() => {});
           }
           try {
-            const request = requestSignal(
-              operation.signal,
-              SDK_REQUEST_TIMEOUT_MS,
-            );
+            const request = requestSignal(undefined, SDK_REQUEST_TIMEOUT_MS);
             try {
               await client.app.log({
                 body: {
@@ -1456,15 +1186,8 @@ export const Reflection: Plugin = async ({ client, directory }) => {
           } catch {}
         }
       } catch (error) {
-        if (operation.signal.aborted) {
-          throw operation.signal.reason ?? error;
-        }
         await log(`context projection failed: ${String(error)}`);
         throw error;
-      } finally {
-        operation.dispose();
-        activeProjections.delete(projectionCompletion);
-        completeProjection();
       }
     },
 
@@ -1534,7 +1257,7 @@ export const Reflection: Plugin = async ({ client, directory }) => {
                     endSourceMessageId: segment.end_source_message_id,
                   };
             const messages = readSegmentMessages(
-              await getSessionMessages(segment.session_id, context.abort),
+              await getSessionMessages(segment.session_id),
               boundary,
             );
             return formatData({
@@ -1548,9 +1271,6 @@ export const Reflection: Plugin = async ({ client, directory }) => {
               messages,
             });
           } catch (error) {
-            if (context.abort.aborted) {
-              throw context.abort.reason ?? error;
-            }
             return `memory_read_segment failed: ${String(error)}`;
           }
         },

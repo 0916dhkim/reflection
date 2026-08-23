@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import {
@@ -18,7 +18,6 @@ import {
   type OpenCodeMessage,
   type ReflectionSegment,
 } from "@reflection/shared/segmentation";
-import { parseJobResponse } from "@reflection/shared/contracts";
 import {
   segmentIdForRequest,
   sourceFingerprint,
@@ -349,45 +348,7 @@ function ok(data: unknown = {}): Response {
   });
 }
 
-function acceptedSegment(
-  init: RequestInit | undefined,
-  status = "pending",
-): Response {
-  const body = JSON.parse(String(init?.body));
-  return ok(segmentJob(body, status));
-}
-
-function segmentJob(
-  body: Parameters<typeof sourceFingerprint>[0],
-  status = "pending",
-) {
-  const job = {
-    id: 1,
-    segment_id: segmentIdForRequest(body),
-    start_user_message_id: body.start_user_message_id,
-    end_user_message_id: body.end_user_message_id,
-    source_boundary_version: body.source_boundary_version,
-    start_source_message_id: body.start_source_message_id,
-    end_source_message_id: body.end_source_message_id,
-    source_fingerprint: sourceFingerprint(body),
-    projection_version: body.projection_version,
-    status,
-    attempts: 0,
-    error: status === "failed" ? "failed" : null,
-    created_at: "2026-01-01T00:00:00.000Z",
-    started_at: null,
-    finished_at: null,
-    next_attempt_at: "2026-01-01T00:00:00.000Z",
-  };
-  parseJobResponse(job);
-  return job;
-}
-
-function emptyListing(
-  url: string | URL | Request,
-  init?: RequestInit,
-): Response {
-  if (init?.method === "POST") return acceptedSegment(init);
+function emptyListing(url: string | URL | Request): Response {
   const match = String(url).match(/\/v1\/sessions\/([^/]+)\/segments/);
   return ok({
     session_id: match ? decodeURIComponent(match[1]!) : "unknown",
@@ -560,60 +521,6 @@ describe("Reflection plugin hooks", () => {
     });
   });
 
-  it("propagates memory_read_segment cancellation into SDK hydration", async () => {
-    const sessionId = "cancelled-memory-session";
-    const messages = projectionMessages(sessionId);
-    const segment = segmentMessages(messages)[0]!;
-    const id = segmentId(sessionId, segment);
-    const client = clientFor(messages);
-    let hydrationSignal: AbortSignal | undefined;
-    client.session.messages.mockImplementation(async (input) => {
-      hydrationSignal = (input as { signal?: AbortSignal }).signal;
-      return new Promise<{ data: OpenCodeMessage[] }>((_resolve, reject) => {
-        hydrationSignal?.addEventListener(
-          "abort",
-          () => reject(hydrationSignal?.reason),
-          { once: true },
-        );
-      });
-    });
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async () =>
-        ok({
-          id,
-          session_id: sessionId,
-          start_user_message_id: segment.startUserMessageId,
-          end_user_message_id: segment.endUserMessageId,
-          ...segmentWireBoundary(segment),
-          summary: "summary",
-          claims: [],
-          created_at: "2026-08-22T00:00:00Z",
-          updated_at: "2026-08-22T00:00:00Z",
-        }),
-      ),
-    );
-    const hooks = await Reflection(pluginInput(client));
-    const reader = hooks.tool?.memory_read_segment as unknown as {
-      execute(
-        args: { segment_id: string },
-        context: { abort: AbortSignal },
-      ): Promise<string>;
-    };
-    const cancellation = new AbortController();
-    const pending = reader.execute(
-      { segment_id: id },
-      { abort: cancellation.signal },
-    );
-    await vi.waitFor(() => expect(hydrationSignal).toBeDefined());
-
-    const reason = new Error("tool cancelled");
-    cancellation.abort(reason);
-
-    await expect(pending).rejects.toBe(reason);
-    expect(hydrationSignal?.aborted).toBe(true);
-  });
-
   it("serializes target updates and waits for all pending updates before loading summaries", async () => {
     const sessionId = "serialized-session";
     const messages = projectionMessages(sessionId);
@@ -634,7 +541,7 @@ describe("Reflection plugin hooks", () => {
           maxActivePosts = Math.max(maxActivePosts, activePosts);
           await new Promise<void>((resolve) => postResolvers.push(resolve));
           activePosts -= 1;
-          return acceptedSegment(init);
+          return ok();
         }
         summaryGets += 1;
         return ok({
@@ -702,7 +609,7 @@ describe("Reflection plugin hooks", () => {
           targetPosts += 1;
           submittedBodies.push(JSON.parse(String(init.body)));
         }
-        return emptyListing(url, init);
+        return emptyListing(url);
       }),
     );
     const hooks = await Reflection(pluginInput(client));
@@ -750,35 +657,6 @@ describe("Reflection plugin hooks", () => {
     });
   });
 
-  it("quarantines an unsplittable closed span before HTTP submission", async () => {
-    const sessionId = "oversized-source-session";
-    const messages = projectionMessages(sessionId);
-    messages[0]!.parts = [{ type: "text", text: "x".repeat(1_000_001) }];
-    const client = clientFor(messages);
-    let targetPosts = 0;
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
-        if (init?.method === "POST") targetPosts += 1;
-        return emptyListing(url, init);
-      }),
-    );
-    const hooks = await Reflection(pluginInput(client));
-
-    await hooks.event?.({
-      event: { type: "session.idle", properties: { sessionID: sessionId } },
-    } as never);
-
-    expect(targetPosts).toBe(0);
-    expect(client.app.log).toHaveBeenCalledWith(
-      expect.objectContaining({
-        body: expect.objectContaining({
-          message: expect.stringContaining("failed local validation"),
-        }),
-      }),
-    );
-  });
-
   it("keeps same-user sibling caches and cross-writer invalidation independent", async () => {
     const sessionId = "sibling-cache-session";
     const messages = siblingProjectionMessages(sessionId);
@@ -798,7 +676,7 @@ describe("Reflection plugin hooks", () => {
       vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
         if (init?.method === "POST") {
           posted.push(JSON.parse(String(init.body)));
-          return acceptedSegment(init);
+          return ok();
         }
         const match = String(url).match(/\/v1\/sessions\/([^/]+)\/segments/);
         return ok({
@@ -857,9 +735,9 @@ describe("Reflection plugin hooks", () => {
       vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
         if (init?.method === "POST") {
           submittedBodies.push(JSON.parse(String(init.body)));
-          return acceptedSegment(init);
+          return ok();
         }
-        return emptyListing(url, init);
+        return emptyListing(url);
       }),
     );
     const hooks = await Reflection(pluginInput(client));
@@ -928,7 +806,7 @@ describe("Reflection plugin hooks", () => {
             failRemoved = false;
             return new Response("failed", { status: 500 });
           }
-          return acceptedSegment(init);
+          return ok();
         }
         return ok({
           session_id: sessionId,
@@ -994,9 +872,9 @@ describe("Reflection plugin hooks", () => {
       vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
         if (init?.method === "POST") {
           posted.push(JSON.parse(String(init.body)));
-          return acceptedSegment(init);
+          return ok();
         }
-        return emptyListing(url, init);
+        return emptyListing(url);
       }),
     );
     const hooks = await Reflection(pluginInput(client));
@@ -1053,7 +931,7 @@ describe("Reflection plugin hooks", () => {
         if (init?.method === "POST") {
           submittedBodies.push(JSON.parse(String(init.body)));
         }
-        return emptyListing(url, init);
+        return emptyListing(url);
       }),
     );
     const hooks = await Reflection(pluginInput(client));
@@ -1129,7 +1007,7 @@ describe("Reflection plugin hooks", () => {
         if (init?.method === "POST") {
           submittedBodies.push(JSON.parse(String(init.body)));
         }
-        return emptyListing(url, init);
+        return emptyListing(url);
       }),
     );
     const hooks = await Reflection(pluginInput(client));
@@ -1191,7 +1069,7 @@ describe("Reflection plugin hooks", () => {
         if (init?.method === "POST") {
           submittedBodies.push(JSON.parse(String(init.body)));
         }
-        return emptyListing(url, init);
+        return emptyListing(url);
       }),
     );
     const hooks = await Reflection(pluginInput(client));
@@ -1265,7 +1143,7 @@ describe("Reflection plugin hooks", () => {
               return new Response("failed", { status: 500 });
             }
           }
-          return acceptedSegment(init);
+          return ok();
         }
         summaryGets += 1;
         if (String(url).includes(encodeURIComponent(activeSessionId))) {
@@ -1353,7 +1231,7 @@ describe("Reflection plugin hooks", () => {
       vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
         if (init?.method === "POST") {
           submittedBodies.push(JSON.parse(String(init.body)));
-          return acceptedSegment(init);
+          return ok();
         }
         summaryGets += 1;
         return ok({
@@ -1411,7 +1289,7 @@ describe("Reflection plugin hooks", () => {
           if (blockPosts) {
             await new Promise<void>((resolve) => postResolvers.push(resolve));
           }
-          return acceptedSegment(init);
+          return ok();
         }
         summaryGets += 1;
         return ok({
@@ -1482,7 +1360,7 @@ describe("Reflection plugin hooks", () => {
     vi.stubGlobal(
       "fetch",
       vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
-        if (init?.method === "POST") return acceptedSegment(init);
+        if (init?.method === "POST") return ok();
         summaryGets += 1;
         if (summaryGets === 1) {
           return new Promise<Response>((resolve) => {
@@ -1544,7 +1422,7 @@ describe("Reflection plugin hooks", () => {
                 resolve(new Response("failed", { status: 500 }));
             });
           }
-          return acceptedSegment(init);
+          return ok();
         }
         summaryGets += 1;
         if (summaryGets === 1) {
@@ -1623,7 +1501,7 @@ describe("Reflection plugin hooks", () => {
         if (init?.method !== "POST") return emptyListing(url);
         submittedBodies.push(JSON.parse(String(init.body)));
         await new Promise<void>((resolve) => postResolvers.push(resolve));
-        return acceptedSegment(init);
+        return ok();
       }),
     );
     const hooks = await Reflection(pluginInput(client));
@@ -1703,38 +1581,6 @@ describe("Reflection plugin hooks", () => {
     expect(postSignal?.aborted).toBe(true);
   });
 
-  it("aborts in-flight projection SDK reads when a session is deleted", async () => {
-    const sessionId = "deleted-projection-session";
-    const messages = projectionMessages(sessionId);
-    const client = clientFor(messages);
-    let providerSignal: AbortSignal | undefined;
-    client.provider.list.mockImplementation(async (...args: unknown[]) => {
-      providerSignal = (args[0] as { signal?: AbortSignal }).signal;
-      return new Promise<never>((_resolve, reject) => {
-        providerSignal?.addEventListener(
-          "abort",
-          () => reject(providerSignal?.reason),
-          { once: true },
-        );
-      });
-    });
-    const hooks = await Reflection(pluginInput(client));
-    const projection = hooks["experimental.chat.messages.transform"]?.({}, {
-      messages: structuredClone(messages),
-    } as never);
-    await vi.waitFor(() => expect(providerSignal).toBeDefined());
-
-    await hooks.event?.({
-      event: {
-        type: "session.deleted",
-        properties: { info: { id: sessionId } },
-      },
-    } as never);
-
-    await expect(projection).rejects.toThrow("was deleted");
-    expect(providerSignal?.aborted).toBe(true);
-  });
-
   it("does not ingest a deleted session from a stale inactive-session list", async () => {
     const sessionId = "active-session";
     const deletedSessionId = "stale-deleted-session";
@@ -1763,7 +1609,7 @@ describe("Reflection plugin hooks", () => {
         if (init?.method === "POST") {
           submittedSessions.push(JSON.parse(String(init.body)).session_id);
         }
-        return emptyListing(url, init);
+        return emptyListing(url);
       }),
     );
     const hooks = await Reflection(pluginInput(client));
@@ -1808,7 +1654,7 @@ describe("Reflection plugin hooks", () => {
             postedInactiveSessions.add(sessionId);
           }
         }
-        return emptyListing(url, init);
+        return emptyListing(url);
       }),
     );
     const hooks = await Reflection(pluginInput(client));
@@ -1856,9 +1702,7 @@ describe("Reflection plugin hooks", () => {
     });
     vi.stubGlobal(
       "fetch",
-      vi.fn(async (url: string | URL | Request, init?: RequestInit) =>
-        emptyListing(url, init),
-      ),
+      vi.fn(async (url: string | URL | Request) => emptyListing(url)),
     );
     const hooks = await Reflection(pluginInput(client));
 
@@ -1878,111 +1722,6 @@ describe("Reflection plugin hooks", () => {
       },
     } as never);
     await vi.waitFor(() => expect(inactiveSignal?.aborted).toBe(true));
-  });
-
-  it("cancels detached inactive work during plugin disposal", async () => {
-    const activeSessionId = "disposed-sweep-active";
-    const inactiveSessionId = "disposed-sweep-inactive";
-    const activeMessages = projectionMessages(activeSessionId);
-    const client = clientFor(activeMessages);
-    client.session.list.mockResolvedValue({
-      data: [{ id: inactiveSessionId, time: { updated: 0 } }],
-    });
-    let inactiveSignal: AbortSignal | undefined;
-    client.session.messages.mockImplementation(async (input) => {
-      if (input?.path.id !== inactiveSessionId) return { data: activeMessages };
-      inactiveSignal = (input as { signal?: AbortSignal }).signal;
-      return new Promise<{ data: OpenCodeMessage[] }>((_resolve, reject) => {
-        inactiveSignal?.addEventListener(
-          "abort",
-          () => reject(inactiveSignal?.reason),
-          { once: true },
-        );
-      });
-    });
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async (url: string | URL | Request, init?: RequestInit) =>
-        emptyListing(url, init),
-      ),
-    );
-    const hooks = await Reflection(pluginInput(client));
-    await hooks.event?.({
-      event: {
-        type: "session.idle",
-        properties: { sessionID: activeSessionId },
-      },
-    } as never);
-    await vi.waitFor(() => expect(inactiveSignal).toBeDefined());
-
-    await hooks.dispose?.();
-
-    expect(inactiveSignal?.aborted).toBe(true);
-  });
-
-  it("drains an active projection and prevents post-disposal commits", async () => {
-    const sessionId = "disposed-active-projection";
-    const messages = projectionMessages(sessionId);
-    const client = clientFor(messages);
-    let releaseProvider!: () => void;
-    let providerSignal: AbortSignal | undefined;
-    client.provider.list.mockImplementation(async (...args: unknown[]) => {
-      providerSignal = (args[0] as { signal?: AbortSignal }).signal;
-      await new Promise<void>((resolve) => {
-        releaseProvider = resolve;
-      });
-      return {
-        data: {
-          all: [
-            {
-              id: "provider",
-              models: {
-                model: {
-                  limit: { context: 120_000, input: 120_000, output: 32_000 },
-                },
-              },
-            },
-          ],
-        },
-      };
-    });
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async (url: string | URL | Request, init?: RequestInit) =>
-        emptyListing(url, init),
-      ),
-    );
-    const hooks = await Reflection(pluginInput(client));
-    const output = { messages: structuredClone(messages) };
-    const projection = hooks["experimental.chat.messages.transform"]?.(
-      {},
-      output as never,
-    );
-    await vi.waitFor(() => expect(providerSignal).toBeDefined());
-    let disposed = false;
-    const disposal = hooks.dispose?.().then(() => {
-      disposed = true;
-    });
-    await Promise.resolve();
-
-    expect(disposed).toBe(false);
-    releaseProvider();
-    await expect(projection).rejects.toThrow("disposed");
-    await disposal;
-
-    expect(output.messages).toEqual(messages);
-    expect(
-      existsSync(
-        join(
-          paths.home,
-          ".local",
-          "state",
-          "reflection",
-          "projection",
-          `${encodeURIComponent(sessionId)}.json`,
-        ),
-      ),
-    ).toBe(false);
   });
 
   it("rejects a transform that starts after the session was deleted", async () => {
@@ -2028,11 +1767,11 @@ describe("Reflection plugin hooks", () => {
             return new Promise<Response>((resolve) => {
               releaseRestartSync = () => {
                 synced = true;
-                resolve(acceptedSegment(init));
+                resolve(ok());
               };
             });
           }
-          return acceptedSegment(init);
+          return ok();
         }
         summaryGets += 1;
         return ok({
@@ -2110,59 +1849,6 @@ describe("Reflection plugin hooks", () => {
     } as never);
     expect(targetPosts).toBe(2);
     expect(summaryGets).toBe(5);
-  });
-
-  it("invalidates a checkpoint when persisted source provenance changes", async () => {
-    const sessionId = "checkpoint-source-provenance";
-    const messages = projectionMessages(sessionId);
-    const closed = segmentMessages(messages)[0]!;
-    const client = clientFor(messages);
-    let sourceChanged = false;
-    let currentTargetPresent = false;
-    let targetPosts = 0;
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
-        if (init?.method === "POST") {
-          targetPosts += 1;
-          return acceptedSegment(init);
-        }
-        return ok({
-          session_id: sessionId,
-          segments: [segmentSummary(sessionId, closed, "Stable summary")],
-          boundaries: [
-            segmentBoundary(
-              sessionId,
-              closed,
-              sourceChanged
-                ? "f".repeat(64)
-                : submissionSourceFingerprint(sessionId, closed),
-            ),
-          ],
-          targets: currentTargetPresent
-            ? [segmentTarget(sessionId, closed)]
-            : [],
-        });
-      }),
-    );
-    const hooks = await Reflection(pluginInput(client));
-
-    await hooks["experimental.chat.messages.transform"]?.({}, {
-      messages: structuredClone(messages),
-    } as never);
-    sourceChanged = true;
-    currentTargetPresent = true;
-    await hooks["experimental.chat.messages.transform"]?.({}, {
-      messages: structuredClone(messages),
-    } as never);
-    expect(targetPosts).toBe(1);
-
-    currentTargetPresent = false;
-    await hooks["experimental.chat.messages.transform"]?.({}, {
-      messages: structuredClone(messages),
-    } as never);
-
-    expect(targetPosts).toBe(2);
   });
 
   it("makes reset lossy without GET when initial closed sync fails", async () => {
@@ -2397,7 +2083,7 @@ describe("Reflection plugin hooks", () => {
           submittedBodies.push(JSON.parse(String(init.body)));
           return submittedBodies.length === 1
             ? new Response("failed", { status: 500 })
-            : acceptedSegment(init);
+            : ok();
         }
         summaryGets += 1;
         return ok({
@@ -2452,7 +2138,7 @@ describe("Reflection plugin hooks", () => {
           submittedBodies.push(JSON.parse(String(init.body)));
           return submittedBodies.length === 1
             ? new Response("failed", { status: 500 })
-            : acceptedSegment(init);
+            : ok();
         }
         summaryGets += 1;
         return ok({
@@ -2481,49 +2167,6 @@ describe("Reflection plugin hooks", () => {
     expect(summaryGets).toBe(5);
   });
 
-  it("retries an exact failed target only once per source", async () => {
-    const sessionId = "failed-target-endpoint-session";
-    const messages = projectionMessages(sessionId);
-    const closed = segmentMessages(messages)[0]!;
-    const client = clientFor(messages);
-    let submitted: Parameters<typeof sourceFingerprint>[0] | undefined;
-    let segmentPosts = 0;
-    let retryPosts = 0;
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
-        if (String(url).endsWith("/retry")) {
-          retryPosts += 1;
-          if (!submitted) throw new Error("missing submitted source");
-          return ok(segmentJob(submitted, "pending"));
-        }
-        if (init?.method === "POST") {
-          segmentPosts += 1;
-          submitted = JSON.parse(String(init.body));
-          return ok(segmentJob(submitted!, "failed"));
-        }
-        return ok({
-          session_id: sessionId,
-          segments: [],
-          boundaries: [],
-          targets: submitted
-            ? [{ ...segmentTarget(sessionId, closed), status: "failed" }]
-            : [],
-        });
-      }),
-    );
-    const hooks = await Reflection(pluginInput(client));
-    const idle = {
-      event: { type: "session.idle", properties: { sessionID: sessionId } },
-    } as never;
-
-    await hooks.event?.(idle);
-    await hooks.event?.(idle);
-
-    expect(segmentPosts).toBe(2);
-    expect(retryPosts).toBe(1);
-  });
-
   it("clears a failed closed boundary after replacement-history rewind", async () => {
     const sessionId = "replacement-rewind-session";
     const original = projectionMessages(sessionId);
@@ -2547,7 +2190,7 @@ describe("Reflection plugin hooks", () => {
           targetPosts += 1;
           return targetPosts === 1
             ? new Response("failed", { status: 500 })
-            : acceptedSegment(init);
+            : ok();
         }
         summaryGets += 1;
         return ok({
@@ -2612,7 +2255,7 @@ describe("Reflection plugin hooks", () => {
           targetPosts += 1;
           return targetPosts === 1
             ? new Response("failed", { status: 500 })
-            : acceptedSegment(init);
+            : ok();
         }
         summaryGets += 1;
         return ok({
@@ -2668,9 +2311,7 @@ describe("Reflection plugin hooks", () => {
     client.session.list.mockRejectedValue(new Error("list failed"));
     vi.stubGlobal(
       "fetch",
-      vi.fn(async (url: string | URL | Request, init?: RequestInit) =>
-        emptyListing(url, init),
-      ),
+      vi.fn(async (url: string | URL | Request) => emptyListing(url)),
     );
     const hooks = await Reflection(pluginInput(client));
 
@@ -2712,7 +2353,7 @@ describe("Reflection plugin hooks", () => {
       vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
         if (init?.method === "POST") {
           posted.push(JSON.parse(String(init.body)));
-          return acceptedSegment(init);
+          return ok();
         }
         gets += 1;
         if (gets === 1) {
@@ -2766,38 +2407,6 @@ describe("Reflection plugin hooks", () => {
     );
   });
 
-  it("does not poll a superseded target as pending work", async () => {
-    const sessionId = "superseded-summary-target";
-    const messages = projectionMessages(sessionId);
-    const required = segmentMessages(messages)[0]!;
-    const client = clientFor(messages);
-    let summaryGets = 0;
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
-        if (init?.method === "POST") return acceptedSegment(init);
-        summaryGets += 1;
-        return ok({
-          session_id: sessionId,
-          segments: [],
-          boundaries: [],
-          targets: [
-            { ...segmentTarget(sessionId, required), status: "superseded" },
-          ],
-        });
-      }),
-    );
-    const hooks = await Reflection(pluginInput(client));
-    const output = { messages: structuredClone(messages) };
-
-    await hooks["experimental.chat.messages.transform"]?.({}, output as never);
-
-    expect(summaryGets).toBeLessThanOrEqual(2);
-    expect(output.messages[1]?.parts[0]?.text).toContain(
-      "had no exact committed Reflection summary",
-    );
-  });
-
   it("bounds summary polling and falls back to explicit lossy projection", async () => {
     vi.useFakeTimers();
     const sessionId = "summary-poll-timeout-session";
@@ -2808,7 +2417,7 @@ describe("Reflection plugin hooks", () => {
     vi.stubGlobal(
       "fetch",
       vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
-        if (init?.method === "POST") return acceptedSegment(init);
+        if (init?.method === "POST") return ok();
         gets += 1;
         return ok({
           session_id: sessionId,
@@ -2844,7 +2453,7 @@ describe("Reflection plugin hooks", () => {
     vi.stubGlobal(
       "fetch",
       vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
-        if (init?.method === "POST") return acceptedSegment(init);
+        if (init?.method === "POST") return ok();
         gets += 1;
         return gets === 1
           ? ok({
@@ -2877,7 +2486,7 @@ describe("Reflection plugin hooks", () => {
       vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
         if (init?.method === "POST") {
           posts += 1;
-          return acceptedSegment(init);
+          return ok();
         }
         return new Response("service unavailable", { status: 503 });
       }),
@@ -2889,39 +2498,6 @@ describe("Reflection plugin hooks", () => {
 
     expect(posts).toBe(0);
     expect(client.session.messages).toHaveBeenCalledOnce();
-    expect(output.messages[1]?.parts[0]?.text).toContain(
-      "Reflection summaries were unavailable",
-    );
-  });
-
-  it("treats an internal manifest timeout as service unavailability", async () => {
-    vi.useFakeTimers();
-    const sessionId = "initial-manifest-timeout";
-    const messages = projectionMessages(sessionId);
-    const client = clientFor(messages);
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(
-        async (_url: string | URL | Request, init?: RequestInit) =>
-          new Promise<Response>((_resolve, reject) => {
-            init?.signal?.addEventListener(
-              "abort",
-              () => reject(init.signal?.reason),
-              { once: true },
-            );
-          }),
-      ),
-    );
-    const hooks = await Reflection(pluginInput(client));
-    const output = { messages: structuredClone(messages) };
-    const projection = hooks["experimental.chat.messages.transform"]?.(
-      {},
-      output as never,
-    );
-
-    await vi.advanceTimersByTimeAsync(5_000);
-    await projection;
-
     expect(output.messages[1]?.parts[0]?.text).toContain(
       "Reflection summaries were unavailable",
     );
