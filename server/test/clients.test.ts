@@ -949,7 +949,7 @@ describe("EmbeddingClient", () => {
     expect(result[1]?.[0]).toBe(0.2);
   });
 
-  test("rejects wrong dimensions while preserving provider index permissiveness", async () => {
+  test("rejects wrong dimensions, indexes, and component types", async () => {
     const wrongDimensions: FetchLike = async () =>
       Response.json({ data: [{ index: 0, embedding: [0.1] }] });
     await expect(
@@ -972,7 +972,20 @@ describe("EmbeddingClient", () => {
         ["one", "two"],
         "document",
       ),
-    ).resolves.toHaveLength(2);
+    ).rejects.toThrow(/shape/u);
+
+    const coercedValue: FetchLike = async () =>
+      Response.json({
+        data: [
+          {
+            index: 0,
+            embedding: ["0.1", ...Array.from({ length: 1023 }, () => 0.1)],
+          },
+        ],
+      });
+    await expect(
+      new EmbeddingClient(settings(), coercedValue).embed(["one"], "document"),
+    ).rejects.toThrow(/invalid Voyage embedding response/u);
   });
 
   test("returns no embeddings without making an empty provider request", async () => {

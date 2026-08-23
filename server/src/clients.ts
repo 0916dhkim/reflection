@@ -829,15 +829,10 @@ export class EmbeddingClient {
           throw new TypeError("invalid embedding row");
         }
         const embedding = row.embedding.map((item) => {
-          if (
-            typeof item !== "number" &&
-            typeof item !== "boolean" &&
-            (typeof item !== "string" || item.trim() === "")
-          ) {
+          if (typeof item !== "number" || !Number.isFinite(item)) {
             throw new TypeError("invalid embedding value");
           }
-          const number = Number(item);
-          return number;
+          return item;
         });
         return { index: row.index as number, embedding };
       });
@@ -849,7 +844,9 @@ export class EmbeddingClient {
     if (
       rows.length !== texts.length ||
       rows.some(
-        (row) => row.embedding.length !== this.#settings.embeddingDimensions,
+        (row, index) =>
+          row.index !== index ||
+          row.embedding.length !== this.#settings.embeddingDimensions,
       )
     ) {
       throw new UpstreamResponseError(
