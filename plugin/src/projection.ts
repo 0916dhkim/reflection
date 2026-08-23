@@ -2,9 +2,7 @@ import {
   isModelVisibleMessage,
   isModelVisiblePart,
   isNormalUserMessage,
-  modelVisibleMediaTokens,
-  modelVisibleToolState,
-  modelVisibleToolAttachmentTokens,
+  modelVisibleCharWeightOf,
   PROJECTION_LOSS_WARNING,
   textOf,
   type OpenCodeMessage,
@@ -71,42 +69,11 @@ export function estimateTokens(value: unknown): number {
 }
 
 function estimateMessageTokens(messages: readonly OpenCodeMessage[]): number {
-  let mediaTokens = 0;
-  const visible = messages.flatMap((message) =>
-    isModelVisibleMessage(message)
-      ? [
-          {
-            role: message.info.role,
-            parts: message.parts
-              .map((part): unknown => {
-                if (!isModelVisiblePart(message, part)) return null;
-                if (part.type === "text" || part.type === "reasoning") {
-                  return { type: part.type, text: part.text ?? "" };
-                }
-                if (part.type === "file") {
-                  mediaTokens += modelVisibleMediaTokens(part);
-                  return {
-                    type: "file",
-                    filename: part.filename?.slice(0, 500),
-                    mime: part.mime?.slice(0, 200),
-                  };
-                }
-                if (part.type === "tool") {
-                  mediaTokens += modelVisibleToolAttachmentTokens(part.state);
-                  return {
-                    type: "tool",
-                    tool: part.tool,
-                    state: modelVisibleToolState(part.state),
-                  };
-                }
-                return null;
-              })
-              .filter((part) => part !== null),
-          },
-        ]
-      : [],
+  const modelVisibleChars = messages.reduce(
+    (total, message) => total + modelVisibleCharWeightOf(message),
+    0,
   );
-  return estimateTokens(visible) + mediaTokens;
+  return Math.ceil(modelVisibleChars / ESTIMATED_CHARS_PER_TOKEN);
 }
 
 function latestUserMessage(messages: readonly OpenCodeMessage[]) {

@@ -1280,6 +1280,39 @@ describe("projectMessages", () => {
     expect(result.reset).toBe(true);
   });
 
+  it.each(["input", "output"] as const)(
+    "counts inline tool data in uncompacted %s toward request pressure",
+    async (location) => {
+      const messages = longSession(2);
+      const latestAssistant = [...messages]
+        .reverse()
+        .find((message) => message.info.role === "assistant");
+      const payload = `data:application/octet-stream;base64,${"a".repeat(500_000)}`;
+      if (latestAssistant) {
+        latestAssistant.parts = [
+          ...latestAssistant.parts,
+          {
+            type: "tool",
+            tool: "custom",
+            state: {
+              status: "completed",
+              input: location === "input" ? { payload } : {},
+              output: location === "output" ? payload : "done",
+            },
+          },
+        ];
+      }
+
+      const result = await projectMessages({
+        messages,
+        contextLimit: CONTEXT_LIMIT,
+        loadSummaries: async () => summaries(messages),
+      });
+
+      expect(result.reset).toBe(true);
+    },
+  );
+
   it("marks an uncovered unanswered gap after a native summary as lossy", async () => {
     const compactionUser = user("compaction-user", "");
     compactionUser.parts = [{ type: "compaction" }];
