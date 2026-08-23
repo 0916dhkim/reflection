@@ -148,7 +148,7 @@ Start a local pgvector-enabled PostgreSQL instance, populate `.env` with local v
 pnpm start
 ```
 
-`pnpm start` rebuilds the Fastify bundle and launches `server/dist/main.js` from the repository root so the default `migrations/` path resolves correctly. The server listens on `0.0.0.0:8000`, applies checksummed migrations under an advisory lock, starts the elected extraction worker, and shuts down on `SIGINT` or `SIGTERM`.
+`pnpm start` rebuilds the Fastify bundle and launches `server/dist/main.js` from the repository root so the default `migrations/` path resolves correctly. The server listens on `0.0.0.0:8000`, applies checksummed migrations under an advisory lock, starts the elected extraction worker, and shuts down on `SIGINT` or `SIGTERM`. Compose gives the API 15 minutes to finish an in-flight extraction, resolution, and embedding sequence before forcing termination.
 
 ## Verify
 

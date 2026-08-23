@@ -20,6 +20,7 @@ services:
       target: runtime
     init: true
     restart: unless-stopped
+    stop_grace_period: 15m
     environment:
       DATABASE_URL: ${DATABASE_URL:?DATABASE_URL is required}
       REFLECTION_API_KEY: ${REFLECTION_API_KEY:?REFLECTION_API_KEY is required}
