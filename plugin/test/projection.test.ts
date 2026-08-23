@@ -1682,3 +1682,56 @@ describe("projectMessages", () => {
     ).rejects.toThrow("safe message-aligned projection cutoff");
   });
 });
+
+describe("projectMessages request estimate", () => {
+  // Every assistant turn reports the small input count it was billed for while
+  // a checkpoint was in effect. Once that checkpoint is gone the payload is the
+  // full raw history, so the reported anchor no longer describes what is sent.
+  function compactedAnchorSession(turns: number): OpenCodeMessage[] {
+    const messages: OpenCodeMessage[] = [];
+    for (let index = 0; index < turns; index += 1) {
+      const id = `u${index}`;
+      messages.push(user(id, `request ${index} ${"u".repeat(12_500)}`));
+      messages.push(
+        assistant(
+          `a${index}`,
+          id,
+          `response ${index} ${"a".repeat(12_500)}`,
+          [],
+          4_000,
+        ),
+      );
+    }
+    messages.push(user("current", "continue"));
+    return messages;
+  }
+
+  it("never reports fewer tokens than the payload it returns", async () => {
+    const messages = compactedAnchorSession(40);
+
+    const result = await projectMessages({
+      messages,
+      contextLimit: CONTEXT_LIMIT,
+      loadSummaries: async () => summaries(messages),
+    });
+
+    expect(result.estimatedTokens).toBeGreaterThanOrEqual(
+      estimateTokens(result.messages),
+    );
+    expect(result.estimatedTokens).toBeLessThan(result.thresholdTokens);
+  });
+
+  it("compacts a session whose stale anchor understates the raw history", async () => {
+    const messages = compactedAnchorSession(40);
+
+    const result = await projectMessages({
+      messages,
+      contextLimit: CONTEXT_LIMIT,
+      loadSummaries: async () => summaries(messages),
+    });
+
+    expect(result.reset).toBe(true);
+    expect(result.messages.length).toBeLessThan(messages.length);
+    expect(estimateTokens(result.messages)).toBeLessThan(CONTEXT_LIMIT);
+  });
+});

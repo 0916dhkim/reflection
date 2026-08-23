@@ -351,7 +351,13 @@ function estimateRequestTokens(
     }
     const reported = reportedInputTokens(message);
     if (reported === null) continue;
-    return reported + estimateMessageTokens(messages.slice(index)) * 2;
+    // The reported anchor only describes the prefix that was actually sent for
+    // that turn. A direct measurement of the current payload is the floor, so a
+    // stale anchor can never understate what is about to be sent.
+    return Math.max(
+      reported + estimateMessageTokens(messages.slice(index)) * 2,
+      fullEstimate,
+    );
   }
   const requestReserve = Math.min(20_000, Math.floor(contextLimit * 0.1));
   return fullEstimate * 2 + requestReserve;
