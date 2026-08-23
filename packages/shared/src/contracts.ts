@@ -45,7 +45,12 @@ function trimProperty(value: unknown, property: string): unknown {
 }
 
 function codePointLength(value: string): number {
-  return [...value].length;
+  let length = 0;
+  for (let index = 0; index < value.length; length += 1) {
+    const codePoint = value.codePointAt(index);
+    index += codePoint !== undefined && codePoint > 0xffff ? 2 : 1;
+  }
+  return length;
 }
 
 const IdentifierSchema = Type.String({ minLength: 1, maxLength: 500 });
@@ -237,6 +242,7 @@ export const JobStatusSchema = Type.Union([
   Type.Literal("running"),
   Type.Literal("succeeded"),
   Type.Literal("failed"),
+  Type.Literal("superseded"),
 ]);
 export type JobStatus = Static<typeof JobStatusSchema>;
 

@@ -45,7 +45,7 @@ A staged summary can therefore appear in the session manifest while its job is s
 
 Interrupted workers recover running jobs. Every attempt has a lease UUID, and staged extraction plus final resolution must still match the lease, generation, source fingerprint, projection version, and exact v1/v2 boundary. Stale work cannot commit after a target changes. Retryable model, network, schema, and resolution failures use the configured attempt budget. Deterministically invalid persisted input and oversized embedding input fail terminally.
 
-Extraction and source-aware resolution currently use GPT-5.6 Luna through OpenRouter's OpenAI route with native strict JSON Schema. Voyage `voyage-4-large` supplies 1,024-dimensional embeddings. Source payloads remain only while a target is pending, running, or failed; successful completion clears duplicated transcript payloads. API responses never return stored source messages.
+Extraction and source-aware resolution currently use GPT-5.6 Luna through OpenRouter's OpenAI route with native strict JSON Schema. Voyage `voyage-4-large` supplies 1,024-dimensional embeddings. Source payloads remain only while a target is pending, running, or failed; successful or superseded completion clears duplicated transcript payloads. API responses never return stored source messages.
 
 ## Manifest and API
 
@@ -224,7 +224,7 @@ An authoritative dry run reads `manifest_version: 2`, validates deterministic ID
 
 ## Production cutover
 
-Migration `006_canonical_source_spans.sql` is a forward-only writer boundary. Use a stop-first deployment; never perform a rolling Python/Node or old/new plugin rollout.
+Migration `006_canonical_source_spans.sql` is a forward-only writer boundary. Migration `007_superseded_job_status.sql` exposes discarded extraction work as `superseded` instead of reporting false success. Use a stop-first deployment; never perform a rolling Python/Node or old/new plugin rollout.
 
 1. Build and verify the Node server, `plugin/dist/reflection.js`, and `scripts/backfill.mjs` from the same revision.
 2. Stop the old backfill supervisor and confirm no backfill process remains.

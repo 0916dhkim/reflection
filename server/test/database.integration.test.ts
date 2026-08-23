@@ -926,6 +926,11 @@ describe.sequential("Database PostgreSQL integration", () => {
             emptyPrepared(secondClaim, "stale B"),
           ),
         ).toBe(false);
+        const supersededJob = required(await database.getJob(secondJob.id));
+        expect(supersededJob).toMatchObject({
+          status: "superseded",
+          error: "snapshot was superseded",
+        });
         const staleResult = required(
           await database.getSegment(firstJob.segment_id),
         );
@@ -1562,6 +1567,7 @@ describe.sequential("Database PostgreSQL integration", () => {
           "004_projection_safety.sql",
           "005_mutable_source_snapshots.sql",
           "006_canonical_source_spans.sql",
+          "007_superseded_job_status.sql",
         ]);
         expect(
           ledger.every((row) => /^[0-9a-f]{64}$/u.test(row.checksum)),

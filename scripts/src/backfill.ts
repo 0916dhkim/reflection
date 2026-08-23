@@ -68,6 +68,7 @@ export type SegmentPlanStatus =
   | "target_running"
   | "target_succeeded"
   | "target_failed"
+  | "target_superseded"
   | "conflicting"
   | "new";
 export type DryRunStatus = SegmentPlanStatus | "invalid";
@@ -1181,6 +1182,9 @@ export async function completeJob(
       }
       return current;
     }
+    if (current.status === "superseded") {
+      throw new SupersededJobError(current.id);
+    }
     if (current.status === "failed") {
       await revalidateJobContext(context, current);
       if (isProviderBalanceFailure(current)) {
@@ -1374,6 +1378,7 @@ export async function createDryRunSummary(
     target_running: 0,
     target_succeeded: 0,
     target_failed: 0,
+    target_superseded: 0,
     conflicting: 0,
     new: 0,
     invalid: 0,

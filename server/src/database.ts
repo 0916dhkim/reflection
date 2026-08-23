@@ -233,7 +233,8 @@ function asJobStatus(value: string): JobStatus {
     value === "pending" ||
     value === "running" ||
     value === "succeeded" ||
-    value === "failed"
+    value === "failed" ||
+    value === "superseded"
   ) {
     return value;
   }
@@ -1577,8 +1578,9 @@ export class Database {
     const superseded = await connection.query(
       `
       UPDATE extraction_jobs
-      SET status = 'succeeded', lease_id = NULL, payload = NULL,
-          error = NULL, started_at = NULL, finished_at = now()
+      SET status = 'superseded', lease_id = NULL, payload = NULL,
+          error = 'snapshot was superseded', started_at = NULL,
+          finished_at = now()
       WHERE id = $1 AND status = 'running' AND lease_id = $2
       `,
       [job.id, job.leaseId],

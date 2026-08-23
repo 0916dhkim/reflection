@@ -133,6 +133,9 @@ describe("response contracts", () => {
 
   it("strictly parses jobs and committed segments", () => {
     expect(parseJobResponse(job)).toEqual(job);
+    expect(parseJobResponse({ ...job, status: "superseded" })).toMatchObject({
+      status: "superseded",
+    });
     expect(() =>
       parseJobResponse({ ...job, end_user_message_id: "other" }),
     ).toThrow(ContractValidationError);

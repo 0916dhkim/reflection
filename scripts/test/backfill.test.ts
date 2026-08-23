@@ -1127,6 +1127,26 @@ describe("job completion fencing", () => {
     expect(currentState.providerStatus).toEqual({});
   });
 
+  it("treats a superseded job as a replan signal", async () => {
+    const superseded = jobFor(v1Submission(), {
+      status: "superseded",
+      error: "snapshot was superseded",
+    });
+
+    await expect(
+      completeJob(superseded, {
+        state: state(),
+        retryJob: vi.fn(),
+        waitForJob: vi.fn(),
+        saveState: vi.fn(),
+        log: vi.fn(),
+        sleep: vi.fn(async () => undefined),
+        clock: { nowMs: () => 0 },
+        providerPollMs: 5_000,
+      }),
+    ).rejects.toBeInstanceOf(SupersededJobError);
+  });
+
   it("counts a disappeared local session as visited", async () => {
     const service: ReflectionService = {
       request: vi.fn(),
