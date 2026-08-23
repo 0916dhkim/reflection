@@ -351,9 +351,10 @@ function estimateRequestTokens(
     }
     const reported = reportedInputTokens(message);
     if (reported === null) continue;
-    // The reported anchor only describes the prefix that was actually sent for
-    // that turn. A direct measurement of the current payload is the floor, so a
-    // stale anchor can never understate what is about to be sent.
+    // The reported anchor only describes the prefix sent for that turn. This
+    // floor is still approximate: token-dense text can exceed the byte-based
+    // estimate, and later system prompts, tool schemas, or PDF expansion are
+    // not visible here.
     return Math.max(
       reported + estimateMessageTokens(messages.slice(index)) * 2,
       fullEstimate,
