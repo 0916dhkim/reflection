@@ -761,6 +761,7 @@ describe.sequential("Database PostgreSQL integration", () => {
         const retryRequest = updateRequest(firstRequest, {
           start_user_message_id: "retry-start",
           end_user_message_id: "retry-end",
+          processing_priority: 100,
         });
         const retryJob = await database.enqueue(retryRequest);
         const terminalClaim = required(
@@ -803,12 +804,15 @@ describe.sequential("Database PostgreSQL integration", () => {
             retryAfterSeconds: 60,
           }),
         ).toBe(true);
-        expect(
+        const newerClaim = required(
           await withClient(database, (client) =>
             database.claimOldestJob(client),
           ),
-        ).toBeNull();
-        expect(await database.getJob(newer.id)).not.toBeNull();
+        );
+        expect(newerClaim.id).toBe(newer.id);
+        expect(required(await database.getJob(retried.id)).status).toBe(
+          "pending",
+        );
       } finally {
         await database.close();
       }

@@ -178,7 +178,6 @@ interface ClaimedJobRow extends QueryResultRow {
   source_fingerprint: string | null;
   extraction_result: unknown | null;
   processing_priority: number;
-  ready: boolean;
 }
 
 interface RecallRow extends QueryResultRow {
@@ -1284,8 +1283,7 @@ export class Database {
                       THEN targets.extraction_result
                       ELSE NULL
                   END AS extraction_result,
-                  jobs.processing_priority,
-                  jobs.next_attempt_at <= now() AS ready
+                  jobs.processing_priority
           FROM extraction_jobs AS jobs
           LEFT JOIN segment_targets AS targets
             ON targets.segment_id = jobs.segment_id
@@ -1300,6 +1298,7 @@ export class Database {
            AND targets.end_source_message_id
                IS NOT DISTINCT FROM jobs.end_source_message_id
           WHERE jobs.status = 'pending'
+            AND jobs.next_attempt_at <= now()
             AND (targets.segment_id IS NOT NULL OR jobs.source_fingerprint IS NULL)
             AND NOT EXISTS (
                 SELECT 1
@@ -1313,7 +1312,7 @@ export class Database {
           FOR UPDATE OF jobs
         `)
       ).rows[0];
-      if (pending === undefined || !pending.ready) return null;
+      if (pending === undefined) return null;
 
       if (pending.payload === null) {
         await connection.query(
