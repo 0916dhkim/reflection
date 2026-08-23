@@ -1378,6 +1378,60 @@ describe("Reflection plugin hooks", () => {
     expect(summaryGets).toBe(3);
   });
 
+  it("ignores an observed failure replaced by a successful queued update", async () => {
+    const sessionId = "superseded-target-failure-session";
+    const messages = projectionMessages(sessionId);
+    const client = clientFor(messages);
+    let releaseFirstGet: (() => void) | undefined;
+    let releaseFirstPost: (() => void) | undefined;
+    let summaryGets = 0;
+    let targetPosts = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+        if (init?.method === "POST") {
+          targetPosts += 1;
+          if (targetPosts === 1) {
+            return new Promise<Response>((resolve) => {
+              releaseFirstPost = () =>
+                resolve(new Response("failed", { status: 500 }));
+            });
+          }
+          return ok();
+        }
+        summaryGets += 1;
+        if (summaryGets === 1) {
+          return new Promise<Response>((resolve) => {
+            releaseFirstGet = () => resolve(emptyListing(_url));
+          });
+        }
+        return emptyListing(_url);
+      }),
+    );
+    const hooks = await Reflection(pluginInput(client));
+    const output = { messages: structuredClone(messages) };
+    const projection = hooks["experimental.chat.messages.transform"]?.(
+      {},
+      output as never,
+    );
+    await vi.waitFor(() => expect(summaryGets).toBe(1));
+
+    const firstIdle = hooks.event?.({
+      event: { type: "session.idle", properties: { sessionID: sessionId } },
+    } as never);
+    await vi.waitFor(() => expect(targetPosts).toBe(1));
+    const overlappingIdle = hooks.event?.({
+      event: { type: "session.idle", properties: { sessionID: sessionId } },
+    } as never);
+    releaseFirstGet?.();
+    releaseFirstPost?.();
+
+    await expect(
+      Promise.all([projection, firstIdle, overlappingIdle]),
+    ).resolves.toBeDefined();
+    expect(targetPosts).toBeGreaterThanOrEqual(2);
+  });
+
   it("coalesces duplicate idle events and abandons a snapshot that became busy", async () => {
     const sessionId = "busy-session";
     const messages = projectionMessages(sessionId);

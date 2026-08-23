@@ -563,13 +563,13 @@ export const Reflection: Plugin = async ({ client, directory }) => {
         Promise.all([observed, dirtyIdle].filter(Boolean)).then(() => {}),
         remaining,
       );
-      if (state?.failure) throw state.failure;
       if (dirtyIdle) continue;
       if (
         state &&
         targetUpdates.get(sessionId) === state &&
         observed === state.tail
       ) {
+        if (state.failure) throw state.failure;
         return;
       }
     }
