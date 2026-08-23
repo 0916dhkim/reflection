@@ -429,6 +429,30 @@ describe("projectMessages", () => {
     ).toBe(true);
   });
 
+  it("does not archive an interleaved source that survives in the raw tail", async () => {
+    const messages = [
+      user("first", "u".repeat(12_000)),
+      user("intervening", "v".repeat(20_000)),
+      assistant("late-first-answer", "first", "a".repeat(10_000), [], 100_000),
+      user("current", "continue"),
+    ];
+    const canonical = segmentMessages(messages);
+    expect(canonical[0]?.sourceMessageIds).toEqual([
+      "first",
+      "late-first-answer",
+    ]);
+
+    const result = await projectMessages({
+      messages,
+      contextLimit: CONTEXT_LIMIT,
+      loadSummaries: async () => summaries(messages),
+    });
+
+    expect(result.reset).toBe(true);
+    expect(result.state.checkpoint?.tailStartMessageId).toBe("current");
+    expect(result.messages.slice(2)).toEqual(messages.slice(3));
+  });
+
   it("retains an assistant-starting canonical tail by exact identity", async () => {
     const messages = [
       user("turn", "request"),

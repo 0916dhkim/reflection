@@ -719,6 +719,18 @@ function safeTailCandidates(input: {
     if (priorIsNonmonotonic || laterIsNonmonotonic) return;
     const archivedSegments = input.canonicalSegments.slice(0, index);
     if (!archivedSegments.every((item) => item.closed)) return;
+    const sourceIdsRespectCut = input.canonicalSegments.every(
+      (candidate, candidateIndex) =>
+        candidate.sourceMessageIds.every((sourceMessageId) => {
+          const mapped = modelIndexes.get(sourceMessageId);
+          if (mapped === undefined) return true;
+          if (mapped === null) return false;
+          return candidateIndex < index
+            ? mapped < tailIndex
+            : mapped >= tailIndex;
+        }),
+    );
+    if (!sourceIdsRespectCut) return;
     if (
       tailIndex > previousIndex &&
       tailIndex >= historyStartIndex &&
