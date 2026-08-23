@@ -30,6 +30,7 @@ describe("ProjectionStateStore", () => {
       contextLimit: 1_000_000,
       checkpoint: {
         tailStartMessageId: "assistant-10",
+        archivedPrefixFingerprint: "a".repeat(64),
         summaryText: "summary",
         createdAtMessageId: "user-20",
         lossy: true,
@@ -42,12 +43,12 @@ describe("ProjectionStateStore", () => {
     expect(
       JSON.parse(readFileSync(join(path, "session.json"), "utf8")),
     ).toMatchObject({
-      version: 2,
+      version: 3,
       state,
     });
   });
 
-  it("migrates a version 1 user-tail checkpoint in memory", () => {
+  it("discards a version 1 checkpoint while preserving its context limit", () => {
     const directory = mkdtempSync(join(tmpdir(), "reflection-projection-"));
     directories.push(directory);
     const path = join(directory, "projection");
@@ -70,12 +71,6 @@ describe("ProjectionStateStore", () => {
 
     expect(new ProjectionStateStore(path).get("session")).toEqual({
       contextLimit: 100,
-      checkpoint: {
-        tailStartMessageId: "user-1",
-        summaryText: "summary",
-        createdAtMessageId: "user-2",
-        lossy: true,
-      },
     });
     expect(
       JSON.parse(readFileSync(join(path, "session.json"), "utf8")),
@@ -94,7 +89,7 @@ describe("ProjectionStateStore", () => {
     expect(new ProjectionStateStore(path).get("session")).toBeUndefined();
   });
 
-  it("rejects a checkpoint with an invalid lossy marker", () => {
+  it("retains only context from a malformed legacy checkpoint", () => {
     const directory = mkdtempSync(join(tmpdir(), "reflection-projection-"));
     directories.push(directory);
     const path = join(directory, "projection");
@@ -116,10 +111,12 @@ describe("ProjectionStateStore", () => {
       }),
     );
 
-    expect(new ProjectionStateStore(path).get("session")).toBeUndefined();
+    expect(new ProjectionStateStore(path).get("session")).toEqual({
+      contextLimit: 100,
+    });
   });
 
-  it("rejects a version 2 envelope with a legacy checkpoint field", () => {
+  it("discards a version 2 checkpoint without prefix provenance", () => {
     const directory = mkdtempSync(join(tmpdir(), "reflection-projection-"));
     directories.push(directory);
     const path = join(directory, "projection");
@@ -139,7 +136,9 @@ describe("ProjectionStateStore", () => {
       }),
     );
 
-    expect(new ProjectionStateStore(path).get("session")).toBeUndefined();
+    expect(new ProjectionStateStore(path).get("session")).toEqual({
+      contextLimit: 100,
+    });
   });
 
   it("isolates writes from stores owned by different plugin instances", () => {

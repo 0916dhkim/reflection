@@ -1019,6 +1019,48 @@ describe("projectMessages", () => {
     expect(context).toContain("report.pdf (application/pdf)");
   });
 
+  it("invalidates a checkpoint when archived tool state is compacted", async () => {
+    const messages = longSession();
+    const firstAssistant = messages.find(
+      (message) => message.info.role === "assistant",
+    );
+    const tool = firstAssistant?.parts.find((part) => part.type === "tool");
+    if (!tool || typeof tool.state !== "object" || tool.state === null) {
+      throw new Error("expected archived tool state");
+    }
+    tool.state = {
+      ...(tool.state as Record<string, unknown>),
+      output: "CHECKPOINT_SECRET",
+    };
+    const first = await projectMessages({
+      messages,
+      contextLimit: CONTEXT_LIMIT,
+      loadSummaries: async () => summaries(messages),
+    });
+    expect(projectedContext(first.messages)).toContain("CHECKPOINT_SECRET");
+
+    tool.state = {
+      ...(tool.state as Record<string, unknown>),
+      time: { compacted: 1 },
+    };
+    const loadSummaries = vi.fn(async () => summaries(messages));
+    const second = await projectMessages({
+      messages,
+      contextLimit: CONTEXT_LIMIT,
+      previous: first.state,
+      loadSummaries,
+    });
+
+    expect(second.reset).toBe(true);
+    expect(loadSummaries).toHaveBeenCalledOnce();
+    expect(projectedContext(second.messages)).not.toContain(
+      "CHECKPOINT_SECRET",
+    );
+    expect(projectedContext(second.messages)).toContain(
+      "tool output was compacted by OpenCode",
+    );
+  });
+
   it("archives provider-visible ignored assistant tool records", async () => {
     const messages = longSession();
     const firstAssistant = messages.find(

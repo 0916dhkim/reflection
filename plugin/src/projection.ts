@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 import {
   isModelVisibleMessage,
   isModelVisiblePart,
@@ -27,6 +29,7 @@ export type StoredSegmentSummary = SegmentSummary;
 
 export interface ProjectionCheckpoint {
   tailStartMessageId: string;
+  archivedPrefixFingerprint: string;
   summaryText: string;
   createdAtMessageId: string;
   lossy?: boolean;
@@ -62,6 +65,18 @@ export class ProjectionCoverageError extends Error {
     super(message);
     this.name = "ProjectionCoverageError";
   }
+}
+
+function archivedPrefixFingerprint(
+  messages: readonly OpenCodeMessage[],
+): string {
+  const hash = createHash("sha256");
+  for (const message of messages) {
+    const serialized = JSON.stringify(message);
+    hash.update(`${Buffer.byteLength(serialized, "utf8")}:`);
+    hash.update(serialized, "utf8");
+  }
+  return hash.digest("hex");
 }
 
 export function estimateTokens(value: unknown): number {
@@ -170,6 +185,12 @@ function applyCheckpoint(
     (message) => message.info.id === checkpoint.tailStartMessageId,
   );
   if (tailIndex < 0) return null;
+  if (
+    archivedPrefixFingerprint(messages.slice(0, tailIndex)) !==
+    checkpoint.archivedPrefixFingerprint
+  ) {
+    return null;
+  }
 
   const tail = messages.slice(tailIndex);
   const first = tail[0];
@@ -903,6 +924,9 @@ export async function projectMessages(
     });
     const nextCheckpoint: ProjectionCheckpoint = {
       tailStartMessageId: tailStart.info.id,
+      archivedPrefixFingerprint: archivedPrefixFingerprint(
+        input.messages.slice(0, tailIndex),
+      ),
       createdAtMessageId: input.messages.at(-1)?.info.id ?? tailStart.info.id,
       summaryText: built.text,
       lossy: built.lossy || undefined,
