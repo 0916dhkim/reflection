@@ -639,7 +639,7 @@ export function planSessionSegments(
     );
   }
 
-  return segments.map((segment): PlannedSegment => {
+  const planned = segments.map((segment): PlannedSegment => {
     const submission = segmentSubmission(sessionId, segment);
     const segmentId = segmentIdForRequest(submission);
     const localFingerprint = sourceFingerprint(submission);
@@ -714,6 +714,27 @@ export function planSessionSegments(
         : "deferred_mutable_source",
     };
   });
+  const plannedKeys = new Set(
+    planned.map((segment) =>
+      sourceSpanKey({
+        id: segment.segmentId,
+        start_user_message_id: segment.submission.start_user_message_id,
+        end_user_message_id: segment.submission.end_user_message_id,
+        source_boundary_version: segment.submission.source_boundary_version,
+        start_source_message_id: segment.submission.start_source_message_id,
+        end_source_message_id: segment.submission.end_source_message_id,
+      }),
+    ),
+  );
+  const unmatchedTargets = manifest.targets.filter(
+    (target) => !plannedKeys.has(sourceSpanKey(canonicalBoundary(target))),
+  );
+  if (unmatchedTargets.length > 0) {
+    throw new Error(
+      `invalid segment manifest for ${sessionId}: ${unmatchedTargets.length} target(s) have no local source span`,
+    );
+  }
+  return planned;
 }
 
 export function validatedJob(value: unknown): ReflectionJob {
@@ -1430,6 +1451,7 @@ export interface ProcessingContext {
   jobPollMs: number;
   priorityJobIds: readonly number[];
   completedSnapshots: Set<string>;
+  attemptedSnapshots: Set<string>;
   acquireLock(): void;
   releaseLock(): void;
   scheduleLaunchAgentCleanup(): void;
@@ -1532,6 +1554,7 @@ export function manifestHasExpectedSnapshot(
   manifest: SegmentManifest,
   segment: PlannedSegment,
   allowCommitted: boolean,
+  committedProjectionVersion: number = segment.submission.projection_version,
 ): boolean {
   const expectedKey = sourceSpanKey({
     id: segment.segmentId,
@@ -1553,7 +1576,9 @@ export function manifestHasExpectedSnapshot(
     manifest.boundaries.some(
       (boundary) =>
         sourceSpanKey(canonicalBoundary(boundary)) === expectedKey &&
-        boundary.source_fingerprint === segment.sourceFingerprint,
+        boundary.source_fingerprint === segment.sourceFingerprint &&
+        boundary.projection_version === committedProjectionVersion &&
+        boundary.source_eligible,
     )
   );
 }
@@ -1577,7 +1602,12 @@ async function revalidateExpectedSnapshot(
   );
   await runRevalidation(revalidateSession);
   if (
-    !manifestHasExpectedSnapshot(manifest, segment, job.status === "succeeded")
+    !manifestHasExpectedSnapshot(
+      manifest,
+      segment,
+      job.status === "succeeded",
+      job.projection_version,
+    )
   ) {
     throw new SessionReplanRequiredError(
       `segment ${segment.segmentId} no longer has the expected source snapshot`,
@@ -1632,7 +1662,21 @@ export async function processSession(
         break;
       }
       const completedSnapshotKey = `${segment.segmentId}:${segment.sourceFingerprint}:${segment.submission.projection_version}`;
-      if (context.completedSnapshots.has(completedSnapshotKey)) continue;
+      if (
+        context.completedSnapshots.has(completedSnapshotKey) &&
+        (segment.status === "eligible_committed" ||
+          segment.status === "target_succeeded")
+      ) {
+        continue;
+      }
+      context.completedSnapshots.delete(completedSnapshotKey);
+      if (
+        context.attemptedSnapshots.has(completedSnapshotKey) &&
+        segment.status === "target_failed"
+      ) {
+        continue;
+      }
+      context.attemptedSnapshots.delete(completedSnapshotKey);
       activeSegment = segment;
       context.state.segmentsDiscovered += 1;
       context.state.currentSegment = {
@@ -1716,6 +1760,7 @@ export async function processSession(
         else context.state.segmentsSucceeded += 1;
         context.completedSnapshots.add(completedSnapshotKey);
       } else {
+        context.attemptedSnapshots.add(completedSnapshotKey);
         recordFailure(context, session.id, segment, completed);
       }
       context.saveState();
@@ -1909,6 +1954,7 @@ export async function main(
     jobPollMs: options.jobPollMs,
     priorityJobIds: options.priorityJobIds,
     completedSnapshots: new Set(),
+    attemptedSnapshots: new Set(),
     acquireLock: () => acquireLock(options.lockPath, processId),
     releaseLock: release,
     scheduleLaunchAgentCleanup: () => {

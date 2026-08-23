@@ -37,6 +37,7 @@ import {
   createReflectionService,
   fetchJson,
   hydrateSessionMessages,
+  manifestHasExpectedSnapshot,
   parsePriorityJobIds,
   planSessionSegments,
   processPriorityJobs,
@@ -238,6 +239,7 @@ function processingContext(
     jobPollMs: 10,
     priorityJobIds: options.priorityJobIds ?? [],
     completedSnapshots: new Set(),
+    attemptedSnapshots: new Set(),
     acquireLock: vi.fn(),
     releaseLock: vi.fn(),
     scheduleLaunchAgentCleanup: vi.fn(),
@@ -551,6 +553,15 @@ describe("strict manifest planning", () => {
     );
   });
 
+  it("rejects a manifest target whose local source span is gone", () => {
+    const local = segmentMessages([user("u1", "request")])[0]!;
+    const manifest = manifestWith([], [targetFor(SESSION_ID, local, "failed")]);
+
+    expect(() => planSessionSegments(SESSION_ID, [], manifest)).toThrow(
+      "target(s) have no local source span",
+    );
+  });
+
   it("preserves same-user v2 siblings without a whole-turn follow-up", () => {
     const messages = [
       user("u1", "1234"),
@@ -639,6 +650,34 @@ describe("strict manifest planning", () => {
         disposition: "deferred_mutable_source",
       },
     ]);
+  });
+
+  it("requires eligible version-matched committed snapshot fencing", () => {
+    const messages = [user("u1", "request")];
+    const segment = planSessionSegments(
+      SESSION_ID,
+      messages,
+      emptyManifest(),
+    )[0]!;
+    const boundary = boundaryFor(SESSION_ID, segment);
+
+    expect(
+      manifestHasExpectedSnapshot(manifestWith([boundary]), segment, true),
+    ).toBe(true);
+    expect(
+      manifestHasExpectedSnapshot(
+        manifestWith([{ ...boundary, source_eligible: false }]),
+        segment,
+        true,
+      ),
+    ).toBe(false);
+    expect(
+      manifestHasExpectedSnapshot(
+        manifestWith([{ ...boundary, projection_version: 0 }]),
+        segment,
+        true,
+      ),
+    ).toBe(false);
   });
 
   it("makes a committed user-ending anchor ready after later same-turn source", () => {
@@ -1202,6 +1241,102 @@ describe("job completion fencing", () => {
     expect(targetPosts).toBe(1);
     expect(context.state.segmentsDiscovered).toBe(1);
     expect(context.state.sessionsVisited).toBe(0);
+  });
+
+  it("lets a changed fresh target override the completion cache", async () => {
+    const messages = [user("u0", "request"), assistant("a0", "u0", "done")];
+    const local = segmentMessages(messages)[0]!;
+    const target = targetFor(SESSION_ID, local, "running");
+    const manifest = manifestWith(
+      [],
+      [{ ...target, source_fingerprint: "0".repeat(64) }],
+    );
+    let targetPosts = 0;
+    const service: ReflectionService = {
+      request: vi.fn(async (path) => {
+        if (path.includes("/sessions/")) return manifest;
+        targetPosts += 1;
+        throw new Error("posted changed target");
+      }),
+      getJob: vi.fn(),
+      retryJob: vi.fn(),
+      waitForJob: vi.fn(),
+    };
+    const store: SessionStore = {
+      sessions: [],
+      sessionUpdatedAt: () => 100,
+      sessionMessages: () => messages,
+    };
+    const context = processingContext(service, { store });
+    const planned = planSessionSegments(
+      SESSION_ID,
+      messages,
+      emptyManifest(),
+    )[0]!;
+    context.completedSnapshots.add(
+      `${planned.segmentId}:${planned.sourceFingerprint}:${planned.submission.projection_version}`,
+    );
+
+    await expect(
+      processSession(
+        context,
+        { id: SESSION_ID, title: "test", timeUpdated: 100 },
+        messages,
+        100,
+      ),
+    ).rejects.toThrow("posted changed target");
+    expect(targetPosts).toBe(1);
+  });
+
+  it("does not retry a failed ready prefix on each deferred-tail pass", async () => {
+    const messages = [
+      user("u0", "request"),
+      assistant("a0", "u0", "done"),
+      user("u1", "x".repeat(25_000)),
+    ];
+    const local = segmentMessages(messages);
+    const failedTarget = targetFor(SESSION_ID, local[0]!, "failed");
+    let targetExists = false;
+    let targetPosts = 0;
+    const failedJob = jobFor(segmentSubmission(SESSION_ID, local[0]!), {
+      status: "failed",
+      error: "terminal failure",
+      finished_at: "2026-08-22T00:00:00.000Z",
+    });
+    const service: ReflectionService = {
+      request: vi.fn(async (path) => {
+        if (path.includes("/sessions/")) {
+          return targetExists
+            ? manifestWith([], [failedTarget])
+            : emptyManifest();
+        }
+        targetPosts += 1;
+        targetExists = true;
+        return failedJob;
+      }),
+      getJob: vi.fn(),
+      retryJob: vi.fn(async () => failedJob),
+      waitForJob: vi.fn(async (current) => current),
+    };
+    const store: SessionStore = {
+      sessions: [],
+      sessionUpdatedAt: () => 100,
+      sessionMessages: () => messages,
+    };
+    const context = processingContext(service, { store });
+    const session = { id: SESSION_ID, title: "test", timeUpdated: 100 };
+
+    await expect(processSession(context, session, messages, 100)).resolves.toBe(
+      "deferred_source",
+    );
+    await expect(processSession(context, session, messages, 100)).resolves.toBe(
+      "deferred_source",
+    );
+
+    expect(targetPosts).toBe(1);
+    expect(service.retryJob).toHaveBeenCalledOnce();
+    expect(context.state.segmentsFailed).toBe(1);
+    expect(context.state.segmentsDiscovered).toBe(1);
   });
 });
 
