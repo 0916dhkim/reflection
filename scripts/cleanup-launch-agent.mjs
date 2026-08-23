@@ -2,7 +2,32 @@ import { spawnSync } from "node:child_process";
 import { unlinkSync, writeFileSync } from "node:fs";
 
 const [, , label, plistPath, statusPath] = process.argv;
-if (!label || !plistPath || !statusPath || !plistPath.startsWith("/") || !statusPath.startsWith("/")) {
+if (
+  !label ||
+  !plistPath ||
+  !statusPath ||
+  !plistPath.startsWith("/") ||
+  !statusPath.startsWith("/")
+) {
+  if (statusPath?.startsWith("/")) {
+    writeFileSync(
+      statusPath,
+      `${JSON.stringify(
+        {
+          completedAt: new Date().toISOString(),
+          label: label ?? null,
+          plistPath: plistPath ?? null,
+          plistRemoved: false,
+          unloaded: false,
+          restartRequested: false,
+          error: "invalid cleanup arguments",
+        },
+        null,
+        2,
+      )}\n`,
+      { mode: 0o600 },
+    );
+  }
   process.exit(2);
 }
 

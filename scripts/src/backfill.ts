@@ -10,7 +10,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
 import {
@@ -222,6 +222,16 @@ export function resolveBackfillOptions(
   const stateDirectory =
     environment.REFLECTION_BACKFILL_STATE_DIR ??
     join(home, ".local/state/reflection-backfill");
+  const launchdLabel = environment.REFLECTION_BACKFILL_LAUNCHD_LABEL;
+  const launchdPlist = environment.REFLECTION_BACKFILL_LAUNCHD_PLIST;
+  if ((launchdLabel === undefined) !== (launchdPlist === undefined)) {
+    throw new Error(
+      "REFLECTION_BACKFILL_LAUNCHD_LABEL and REFLECTION_BACKFILL_LAUNCHD_PLIST must be configured together",
+    );
+  }
+  if (launchdPlist !== undefined && !isAbsolute(launchdPlist)) {
+    throw new Error("REFLECTION_BACKFILL_LAUNCHD_PLIST must be absolute");
+  }
   return {
     dryRun: argv.includes("--dry-run"),
     stateDirectory,
@@ -231,8 +241,8 @@ export function resolveBackfillOptions(
       environment.OPENCODE_DATABASE_PATH ??
       join(home, ".local/share/opencode/opencode.db"),
     reflectionConfigPath: join(home, ".config/opencode/reflection.json"),
-    launchdLabel: environment.REFLECTION_BACKFILL_LAUNCHD_LABEL,
-    launchdPlist: environment.REFLECTION_BACKFILL_LAUNCHD_PLIST,
+    launchdLabel,
+    launchdPlist,
     providerPollMs: positiveIntegerEnvironment(
       "REFLECTION_PROVIDER_POLL_MS",
       environment.REFLECTION_PROVIDER_POLL_MS,
@@ -1476,7 +1486,7 @@ export interface ProcessingContext {
   maxMutableSourceDeferralMs: number;
   acquireLock(): void;
   releaseLock(): void;
-  scheduleLaunchAgentCleanup(): void;
+  scheduleLaunchAgentCleanup(): void | Promise<void>;
 }
 
 function recordFailure(
@@ -1857,8 +1867,8 @@ export async function processSession(
 
 export async function runBackfill(context: ProcessingContext): Promise<void> {
   context.acquireLock();
-  context.saveState();
   try {
+    context.saveState();
     context.state.status = "running";
     context.saveState();
     await processPriorityJobs(context);
@@ -1936,7 +1946,7 @@ export async function runBackfill(context: ProcessingContext): Promise<void> {
       segmentsAlreadySucceeded: context.state.segmentsAlreadySucceeded,
       segmentsFailed: context.state.segmentsFailed,
     });
-    context.scheduleLaunchAgentCleanup();
+    await context.scheduleLaunchAgentCleanup();
   } finally {
     context.releaseLock();
   }
@@ -1965,7 +1975,6 @@ export async function main(
   const store = createSqliteSessionStore(options.sqlitePath);
   const sessions = store.sessions;
   state.sessionsTotal = sessions.length;
-  saveState();
 
   const reflectionConfig = loadJson(
     options.reflectionConfigPath,
@@ -1991,6 +2000,7 @@ export async function main(
   }
 
   const release = () => releaseLock(options.lockPath, processId);
+  let lockWasAcquired = false;
   const processingContext: ProcessingContext = {
     state,
     sessions,
@@ -2006,9 +2016,12 @@ export async function main(
     completedSnapshots: new Set(),
     attemptedSnapshots: new Set(),
     maxMutableSourceDeferralMs: options.maxMutableSourceDeferralMs,
-    acquireLock: () => acquireLock(options.lockPath, processId),
+    acquireLock: () => {
+      acquireLock(options.lockPath, processId);
+      lockWasAcquired = true;
+    },
     releaseLock: release,
-    scheduleLaunchAgentCleanup: () => {
+    scheduleLaunchAgentCleanup: async () => {
       if (!options.launchdLabel || !options.launchdPlist) return;
       const command = cleanupLaunchAgentCommand(
         import.meta.dirname,
@@ -2020,23 +2033,29 @@ export async function main(
         detached: true,
         stdio: "ignore",
       });
-      child.on("error", (error) => {
-        logger("failed to start LaunchAgent cleanup", {
-          label: options.launchdLabel,
-          error: errorText(error),
-        });
-      });
       child.unref();
-      state.cleanup = {
-        status: "scheduled",
-        label: options.launchdLabel,
-        plist: options.launchdPlist,
-        scheduledAt: clock.nowIso(),
-      };
-      saveState();
-      logger("scheduled LaunchAgent cleanup", {
-        label: options.launchdLabel,
-        plist: options.launchdPlist,
+      await new Promise<void>((resolve) => {
+        child.once("error", (error) => {
+          logger("failed to start LaunchAgent cleanup", {
+            label: options.launchdLabel,
+            error: errorText(error),
+          });
+          resolve();
+        });
+        child.once("spawn", () => {
+          state.cleanup = {
+            status: "scheduled",
+            label: options.launchdLabel!,
+            plist: options.launchdPlist!,
+            scheduledAt: clock.nowIso(),
+          };
+          saveState();
+          logger("scheduled LaunchAgent cleanup", {
+            label: options.launchdLabel,
+            plist: options.launchdPlist,
+          });
+          resolve();
+        });
       });
     },
   };
@@ -2045,11 +2064,13 @@ export async function main(
     await runBackfill(processingContext);
     return 0;
   } catch (error) {
-    state.status = "failed";
-    state.fatalError = errorText(error);
-    saveState();
+    if (lockWasAcquired) {
+      state.status = "failed";
+      state.fatalError = errorText(error);
+      saveState();
+    }
     logger("backfill worker failed", { error: errorText(error) });
-    release();
+    if (lockWasAcquired) release();
     return 1;
   }
 }

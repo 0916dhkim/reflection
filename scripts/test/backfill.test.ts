@@ -1,3 +1,4 @@
+import { spawnSync } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -1462,6 +1463,20 @@ describe("configuration and retained recovery jobs", () => {
     ).toThrow("positive finite integer");
   });
 
+  it("validates LaunchAgent cleanup configuration before running", () => {
+    expect(() =>
+      resolveBackfillOptions([], {
+        REFLECTION_BACKFILL_LAUNCHD_LABEL: "com.reflection.backfill",
+      }),
+    ).toThrow("must be configured together");
+    expect(() =>
+      resolveBackfillOptions([], {
+        REFLECTION_BACKFILL_LAUNCHD_LABEL: "com.reflection.backfill",
+        REFLECTION_BACKFILL_LAUNCHD_PLIST: "relative.plist",
+      }),
+    ).toThrow("must be absolute");
+  });
+
   it("tolerates a configured priority job that no longer exists", async () => {
     const service = {
       request: vi.fn(),
@@ -1505,6 +1520,23 @@ describe("state, locking, and cleanup", () => {
       providerStatus: {},
     });
     expect(context.scheduleLaunchAgentCleanup).toHaveBeenCalledOnce();
+  });
+
+  it("does not save state when lock acquisition fails", async () => {
+    const service: ReflectionService = {
+      request: vi.fn(),
+      getJob: vi.fn(),
+      retryJob: vi.fn(),
+      waitForJob: vi.fn(),
+    };
+    const context = processingContext(service);
+    context.acquireLock = vi.fn(() => {
+      throw new Error("already running");
+    });
+
+    await expect(runBackfill(context)).rejects.toThrow("already running");
+    expect(context.saveState).not.toHaveBeenCalled();
+    expect(context.releaseLock).not.toHaveBeenCalled();
   });
 
   it("resets per-run state and serializes with a trailing newline", () => {
@@ -1591,5 +1623,31 @@ describe("state, locking, and cleanup", () => {
         "/tmp/state/cleanup.json",
       ],
     });
+  });
+
+  it("records invalid cleanup helper arguments", () => {
+    const directory = mkdtempSync(join(tmpdir(), "reflection-cleanup-"));
+    try {
+      const statusPath = join(directory, "cleanup.json");
+      const scriptPath = join(
+        import.meta.dirname,
+        "..",
+        "cleanup-launch-agent.mjs",
+      );
+
+      const result = spawnSync(
+        process.execPath,
+        [scriptPath, "com.reflection.backfill", "relative.plist", statusPath],
+        { encoding: "utf8" },
+      );
+
+      expect(result.status).toBe(2);
+      expect(JSON.parse(readFileSync(statusPath, "utf8"))).toMatchObject({
+        unloaded: false,
+        error: "invalid cleanup arguments",
+      });
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
   });
 });
