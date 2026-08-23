@@ -10,6 +10,7 @@ import {
   modelVisibleToolInlineDataTokens,
   modelVisibleToolStateSize,
   PROJECTION_LOSS_WARNING,
+  submissionSourceFingerprint,
   textOf,
   type OpenCodeMessage,
   type ReflectionSegment,
@@ -31,6 +32,7 @@ export type StoredSegmentSummary = SegmentSummary;
 export interface ProjectionCheckpoint {
   tailStartMessageId: string;
   archivedPrefixFingerprint: string;
+  canonicalSourceFingerprint?: string;
   summaryText: string;
   createdAtMessageId: string;
   lossy?: boolean;
@@ -127,6 +129,17 @@ function estimateMessageTokens(messages: readonly OpenCodeMessage[]): number {
       : [],
   );
   return estimateTokens(visible) + mediaTokens;
+}
+
+function contributesModelContent(
+  message: OpenCodeMessage,
+  part: OpenCodeMessage["parts"][number],
+): boolean {
+  if (!isModelVisiblePart(message, part)) return false;
+  if (part.type === "text" || part.type === "reasoning") {
+    return typeof part.text === "string" && part.text.length > 0;
+  }
+  return part.type === "file" || part.type === "tool";
 }
 
 function latestUserMessage(messages: readonly OpenCodeMessage[]) {
@@ -312,6 +325,8 @@ function estimateRequestTokens(
   contextLimit: number,
   checkpoint?: ProjectionCheckpoint,
 ): number {
+  const fullEstimate = estimateMessageTokens(messages);
+  if (!Number.isFinite(fullEstimate)) return Number.POSITIVE_INFINITY;
   const active = latestUserMessage(messages)?.info.model;
   const checkpointIndex = checkpoint
     ? messages.findIndex(
@@ -339,7 +354,7 @@ function estimateRequestTokens(
     return reported + estimateMessageTokens(messages.slice(index)) * 2;
   }
   const requestReserve = Math.min(20_000, Math.floor(contextLimit * 0.1));
-  return estimateMessageTokens(messages) * 2 + requestReserve;
+  return fullEstimate * 2 + requestReserve;
 }
 
 function boundedNewest(entries: readonly string[], maxChars: number) {
@@ -488,6 +503,7 @@ function canonicalCoverageOmissions(
     .some(
       (message) =>
         isModelVisibleMessage(message) &&
+        message.parts.some((part) => contributesModelContent(message, part)) &&
         !isProjectionLossWarningMessage(message) &&
         !covered.has(message.info.id),
     )
@@ -719,6 +735,21 @@ function summaryCoverage(input: {
   };
 }
 
+export function projectionSourcesFingerprint(input: {
+  sessionId: string;
+  archivedSegments: readonly ReflectionSegment[];
+}): string {
+  const source = {
+    segments: input.archivedSegments.map((segment) => ({
+      id: segmentIdentity(input.sessionId, segment),
+      sourceFingerprint: submissionSourceFingerprint(input.sessionId, segment),
+      sourceMessageIds: segment.sourceMessageIds,
+      closed: segment.closed,
+    })),
+  };
+  return createHash("sha256").update(JSON.stringify(source)).digest("hex");
+}
+
 interface TailCandidate {
   tailIndex: number;
   archivedSegments: ReflectionSegment[];
@@ -802,6 +833,7 @@ export interface ProjectMessagesInput {
   inputLimit?: number;
   outputLimit?: number;
   previous?: ProjectionSessionState;
+  validateCheckpoint?: (checkpoint: ProjectionCheckpoint) => Promise<boolean>;
   loadCanonicalSegments: () => Promise<readonly ReflectionSegment[]>;
   loadSummaries: (
     requiredSegments: readonly ReflectionSegment[],
@@ -816,6 +848,13 @@ export async function projectMessages(
   }
 
   let checkpoint = input.previous?.checkpoint;
+  if (
+    checkpoint &&
+    input.validateCheckpoint &&
+    !(await input.validateCheckpoint(checkpoint))
+  ) {
+    checkpoint = undefined;
+  }
   let projected = checkpoint
     ? applyCheckpoint(input.messages, checkpoint)
     : [...input.messages];
@@ -956,6 +995,10 @@ export async function projectMessages(
       archivedPrefixFingerprint: archivedPrefixFingerprint(
         input.messages.slice(0, tailIndex),
       ),
+      canonicalSourceFingerprint: projectionSourcesFingerprint({
+        sessionId,
+        archivedSegments: candidate.archivedSegments,
+      }),
       createdAtMessageId: input.messages.at(-1)?.info.id ?? tailStart.info.id,
       summaryText: built.text,
       lossy: built.lossy || undefined,

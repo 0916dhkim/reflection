@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
+  boundedErrorText,
   combineAbortSignals,
   requestSignal,
   safeErrorDetail,
@@ -83,5 +84,20 @@ describe("safeErrorDetail", () => {
     expect(detail).toContain("[REDACTED]");
     expect(detail).not.toMatch(/\s{2}/);
     expect(detail.length).toBeLessThanOrEqual(500);
+  });
+
+  it("removes terminal control characters", () => {
+    expect(safeErrorDetail("failure\u001b]52;c;payload\u0007", "secret")).toBe(
+      "failure ]52;c;payload",
+    );
+  });
+
+  it("reads only the bounded prefix of an error response", async () => {
+    const detail = await boundedErrorText(
+      new Response("x".repeat(10_000)),
+      128,
+    );
+
+    expect(detail).toHaveLength(128);
   });
 });

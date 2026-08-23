@@ -1,5 +1,6 @@
 export const DEFAULT_REQUEST_TIMEOUT_MS = 120_000;
 export const MAX_ERROR_DETAIL_CHARS = 500;
+export const MAX_ERROR_BODY_BYTES = 4_096;
 
 interface DisposableSignal {
   signal: AbortSignal;
@@ -67,5 +68,36 @@ export function safeErrorDetail(
   maxChars = MAX_ERROR_DETAIL_CHARS,
 ): string {
   const redacted = value.split(apiKey).join("[REDACTED]");
-  return redacted.replace(/\s+/g, " ").trim().slice(0, maxChars);
+  return redacted
+    .replace(/[\u0000-\u001f\u007f-\u009f]/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, maxChars);
+}
+
+export async function boundedErrorText(
+  response: Response,
+  maxBytes = MAX_ERROR_BODY_BYTES,
+): Promise<string> {
+  if (!response.body) return "";
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let remaining = maxBytes;
+  let result = "";
+  try {
+    while (remaining > 0) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const chunk = value.subarray(0, remaining);
+      result += decoder.decode(chunk, {
+        stream: chunk.length === value.length,
+      });
+      remaining -= chunk.length;
+      if (chunk.length < value.length) break;
+    }
+    result += decoder.decode();
+    return result;
+  } finally {
+    await reader.cancel().catch(() => {});
+  }
 }

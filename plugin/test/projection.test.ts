@@ -378,6 +378,34 @@ describe("projectMessages", () => {
     expect(loadSummaries).toHaveBeenCalledOnce();
   });
 
+  it("invalidates a checkpoint when canonical projection sources change", async () => {
+    const messages = longSession();
+    const first = await projectMessages({
+      messages,
+      contextLimit: CONTEXT_LIMIT,
+      loadSummaries: async () => summaries(messages),
+    });
+    const validateCheckpoint = vi.fn(async () => false);
+    const updatedSummaries = summaries(messages).map((summary) => ({
+      ...summary,
+      summary: "UPDATED CANONICAL SUMMARY",
+    }));
+
+    const result = await projectMessages({
+      messages,
+      contextLimit: CONTEXT_LIMIT,
+      previous: first.state,
+      validateCheckpoint,
+      loadSummaries: async () => updatedSummaries,
+    });
+
+    expect(validateCheckpoint).toHaveBeenCalledOnce();
+    expect(result.reset).toBe(true);
+    expect(projectedContext(result.messages)).toContain(
+      "UPDATED CANONICAL SUMMARY",
+    );
+  });
+
   it("uses tool-aware segment boundaries without modifying the retained tail", async () => {
     const messages: OpenCodeMessage[] = [];
     for (let index = 0; index < 11; index += 1) {
@@ -477,6 +505,24 @@ describe("projectMessages", () => {
     );
     expect(projectedContext(result.messages)).toContain(
       "outside canonical source segments",
+    );
+  });
+
+  it("ignores host-invisible orphan messages when reporting coverage loss", async () => {
+    const messages = longSession();
+    const invisible = assistant("orphan", "missing-user", "");
+    invisible.parts = [{ type: "step-start" }];
+    messages.splice(4, 0, invisible);
+
+    const result = await projectMessages({
+      messages,
+      contextLimit: CONTEXT_LIMIT,
+      loadSummaries: async () => summaries(messages),
+    });
+
+    expect(result.reset).toBe(true);
+    expect(result.diagnostic?.omissionReasons).not.toContain(
+      "unsegmented-archived-messages-omitted",
     );
   });
 
@@ -1578,7 +1624,7 @@ describe("projectMessages", () => {
     );
   });
 
-  it("uses a finite reserve for remote media", async () => {
+  it("uses a finite reserve for remote images", async () => {
     const messages = longSession();
     const current = messages.at(-1);
     if (current) {
@@ -1586,9 +1632,9 @@ describe("projectMessages", () => {
         ...current.parts,
         {
           type: "file",
-          filename: "remote.pdf",
-          mime: "application/pdf",
-          url: "https://example.com/remote.pdf",
+          filename: "remote.png",
+          mime: "image/png",
+          url: "https://example.com/remote.png",
         },
       ];
     }
@@ -1600,7 +1646,28 @@ describe("projectMessages", () => {
     });
 
     expect(result.reset).toBe(true);
-    expect(result.messages.at(-1)?.parts.at(-1)?.filename).toBe("remote.pdf");
+    expect(result.messages.at(-1)?.parts.at(-1)?.filename).toBe("remote.png");
+  });
+
+  it("does not let reported tokens hide unknown remote media size", async () => {
+    const messages = longSession();
+    messages[0]!.parts = [
+      ...messages[0]!.parts,
+      {
+        type: "file",
+        filename: "mutable.pdf",
+        mime: "application/pdf",
+        url: "https://example.com/mutable.pdf",
+      },
+    ];
+
+    const result = await projectMessages({
+      messages,
+      contextLimit: CONTEXT_LIMIT,
+      loadSummaries: async () => summaries(messages),
+    });
+
+    expect(result.reset).toBe(true);
   });
 
   it("fails at the hard limit for one unsplittable source message", async () => {
