@@ -14,7 +14,6 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
 import {
-  ContractValidationError,
   parseJobResponse,
   parseSessionSegmentsResponse,
   type JobResponse,
@@ -334,6 +333,7 @@ export function recordFailureInState(
     | "sourceFingerprint"
   > | null,
   job: Pick<ReflectionJob, "id" | "error"> | null,
+  error?: unknown,
 ): void {
   state.segmentsFailed += 1;
   state.failures.push({
@@ -346,7 +346,7 @@ export function recordFailureInState(
     endSourceMessageId: segment?.endSourceMessageId ?? null,
     sourceFingerprint: segment?.sourceFingerprint ?? null,
     jobId: job?.id ?? null,
-    error: String(job?.error ?? "unknown failure").slice(0, 1_000),
+    error: String(error ?? job?.error ?? "unknown failure").slice(0, 1_000),
   });
   state.failures = state.failures.slice(-100);
 }
@@ -822,6 +822,21 @@ export class SessionReplanRequiredError extends Error {
   }
 }
 
+export class SessionPlanningError extends Error {
+  readonly sessionId: string;
+
+  constructor(sessionId: string, cause: unknown) {
+    super(
+      `session ${sessionId} has an invalid segment plan: ${errorText(cause)}`,
+      {
+        cause,
+      },
+    );
+    this.name = "SessionPlanningError";
+    this.sessionId = sessionId;
+  }
+}
+
 export class SupersededJobError extends SessionReplanRequiredError {
   readonly jobId: number;
 
@@ -1260,11 +1275,15 @@ export async function segmentPlan(
     5,
     revalidate,
   );
-  return planSessionSegments(
-    sessionId,
-    messages,
-    validateSegmentManifest(response, sessionId),
-  );
+  try {
+    return planSessionSegments(
+      sessionId,
+      messages,
+      validateSegmentManifest(response, sessionId),
+    );
+  } catch (error) {
+    throw new SessionPlanningError(sessionId, error);
+  }
 }
 
 export interface DryRunPlanningFailure {
@@ -1334,12 +1353,7 @@ export async function createDryRunSummary(
         deferredSessions += 1;
         continue;
       }
-      if (
-        !(error instanceof ContractValidationError) &&
-        !errorText(error).includes("invalid segment manifest")
-      ) {
-        throw error;
-      }
+      if (!(error instanceof SessionPlanningError)) throw error;
       invalidSessions += 1;
       statuses.invalid += 1;
       planningFailures.push({
@@ -1405,8 +1419,9 @@ function recordFailure(
   sessionId: string | null,
   segment: PlannedSegment | null,
   job: Pick<ReflectionJob, "id" | "error"> | null,
+  error?: unknown,
 ): void {
-  recordFailureInState(context.state, sessionId, segment, job);
+  recordFailureInState(context.state, sessionId, segment, job, error);
   context.saveState();
 }
 
@@ -1547,7 +1562,11 @@ async function revalidateExpectedSnapshot(
   }
 }
 
-export type ProcessSessionOutcome = "completed" | "deferred" | "replan";
+export type ProcessSessionOutcome =
+  | "completed"
+  | "deferred"
+  | "replan"
+  | "failed";
 
 export async function processSession(
   context: ProcessingContext,
@@ -1684,6 +1703,16 @@ export async function processSession(
       });
       return "replan";
     }
+    if (error instanceof SessionPlanningError) {
+      context.log("session segment plan is invalid; skipping", {
+        sessionId: session.id,
+        error: errorText(error),
+      });
+      recordFailure(context, session.id, null, null, error);
+      context.state.sessionsVisited += 1;
+      context.saveState();
+      return "failed";
+    }
     throw error;
   }
 }
@@ -1714,7 +1743,7 @@ export async function runBackfill(context: ProcessingContext): Promise<void> {
           snapshot.messages,
           snapshot.observedUpdatedAt,
         );
-        if (outcome !== "completed") {
+        if (outcome === "deferred" || outcome === "replan") {
           const currentUpdatedAt = context.store.sessionUpdatedAt(session.id);
           deferred.push({
             session,

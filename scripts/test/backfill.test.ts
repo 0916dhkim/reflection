@@ -44,6 +44,7 @@ import {
   recordFailureInState,
   releaseLock,
   resolveBackfillOptions,
+  runBackfill,
   segmentSubmission,
   serializeState,
   sessionRemainsStable,
@@ -416,6 +417,43 @@ describe("stable session revisions", () => {
     expect(summary.planningFailures[0]).toMatchObject({
       sessionId: SESSION_ID,
     });
+  });
+
+  it("records an invalid session plan and continues the backfill", async () => {
+    const invalid = { id: "invalid", title: "invalid", timeUpdated: 100 };
+    const valid = { id: "valid", title: "valid", timeUpdated: 100 };
+    const store: SessionStore = {
+      sessions: [invalid, valid],
+      sessionUpdatedAt: () => 100,
+      sessionMessages: (sessionId) =>
+        sessionId === invalid.id ? [user("u1", "request")] : [],
+    };
+    const service: ReflectionService = {
+      request: vi.fn(async (path) =>
+        path.includes(invalid.id)
+          ? { ...emptyManifest(invalid.id), manifest_version: 1 }
+          : emptyManifest(valid.id),
+      ),
+      getJob: vi.fn(),
+      retryJob: vi.fn(),
+      waitForJob: vi.fn(),
+    };
+    const context = processingContext(service, { store });
+
+    await expect(runBackfill(context)).resolves.toBeUndefined();
+
+    expect(context.state).toMatchObject({
+      status: "completed_with_failures",
+      sessionsVisited: 2,
+      segmentsFailed: 1,
+    });
+    expect(context.state.failures[0]).toMatchObject({
+      sessionId: invalid.id,
+      segmentId: null,
+    });
+    expect(context.state.failures[0]?.error).toContain("invalid segment plan");
+    expect(context.scheduleLaunchAgentCleanup).toHaveBeenCalledOnce();
+    expect(context.releaseLock).toHaveBeenCalledOnce();
   });
 });
 
