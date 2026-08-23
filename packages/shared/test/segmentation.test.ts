@@ -317,6 +317,35 @@ describe("segmentMessages", () => {
     ).toBeLessThan(100);
   });
 
+  it("reserves inline data URLs outside formal tool attachments", () => {
+    const message = assistant("a1", "u1", "done");
+    message.parts = [
+      {
+        type: "tool",
+        tool: "custom",
+        state: {
+          status: "completed",
+          input: {
+            payload: `data:application/octet-stream;base64,${"x".repeat(100_000)}`,
+          },
+        },
+      },
+    ];
+
+    expect(modelVisibleCharWeightOf(message)).toBeGreaterThan(150_000);
+
+    const compacted = structuredClone(message);
+    const tool = compacted.parts[0];
+    if (tool?.type === "tool" && typeof tool.state === "object" && tool.state) {
+      tool.state = {
+        status: "completed",
+        output: `data:application/octet-stream;base64,${"x".repeat(100_000)}`,
+        time: { compacted: Date.now() },
+      };
+    }
+    expect(modelVisibleCharWeightOf(compacted)).toBeLessThan(1_000);
+  });
+
   it("preserves maximum non-overlapping committed coverage and segments gaps", () => {
     const messages = [
       user("u1", "1"),

@@ -385,6 +385,48 @@ export function modelVisibleToolAttachmentTokens(value: unknown): number {
   );
 }
 
+function inlineDataUrlTokens(value: unknown, depth = 0): number {
+  if (depth > 8) return 0;
+  if (typeof value === "string") {
+    if (!value.startsWith("data:")) return 0;
+    const bytes = dataUrlBytes(value);
+    return bytes === null
+      ? Number.POSITIVE_INFINITY
+      : Math.max(MEDIA_TOKEN_RESERVE, Math.ceil(bytes / MEDIA_BYTES_PER_TOKEN));
+  }
+  if (Array.isArray(value)) {
+    return value.reduce(
+      (total, item) => total + inlineDataUrlTokens(item, depth + 1),
+      0,
+    );
+  }
+  if (typeof value !== "object" || value === null) return 0;
+  return Object.entries(value).reduce(
+    (total, [key, item]) =>
+      total +
+      (depth === 0 && key === "attachments"
+        ? 0
+        : inlineDataUrlTokens(item, depth + 1)),
+    0,
+  );
+}
+
+function modelVisibleToolInlineDataTokens(value: unknown): number {
+  if (typeof value !== "object" || value === null) {
+    return inlineDataUrlTokens(value);
+  }
+  const state = value as Record<string, unknown>;
+  const time =
+    typeof state.time === "object" && state.time !== null
+      ? (state.time as Record<string, unknown>)
+      : {};
+  return inlineDataUrlTokens(
+    typeof time.compacted === "number"
+      ? { ...state, output: "[Old tool result content cleared]" }
+      : state,
+  );
+}
+
 export function modelVisibleCharWeightOf(message: OpenCodeMessage): number {
   if (!isModelVisibleMessage(message)) return 0;
   let weight = 0;
@@ -400,6 +442,9 @@ export function modelVisibleCharWeightOf(message: OpenCodeMessage): number {
         serializedLength(modelVisibleToolState(part.state));
       weight +=
         modelVisibleToolAttachmentTokens(part.state) *
+        ESTIMATED_CHARS_PER_TOKEN;
+      weight +=
+        modelVisibleToolInlineDataTokens(part.state) *
         ESTIMATED_CHARS_PER_TOKEN;
       continue;
     }
