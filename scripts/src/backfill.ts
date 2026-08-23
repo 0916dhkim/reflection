@@ -41,6 +41,7 @@ export const INACTIVE_MS = 10 * 60 * 1_000;
 export const DEFAULT_PROVIDER_POLL_MS = 5 * 60_000;
 export const DEFAULT_JOB_POLL_MS = 2_000;
 export const DEFAULT_REQUEST_TIMEOUT_MS = 120_000;
+export const DEFAULT_MAX_MUTABLE_SOURCE_DEFERRAL_MS = 24 * 60 * 60_000;
 export const MAX_NON_PROVIDER_JOB_ROUNDS = 2;
 
 export const SESSION_QUERY =
@@ -195,6 +196,7 @@ export interface BackfillOptions {
   providerPollMs: number;
   jobPollMs: number;
   requestTimeoutMs: number;
+  maxMutableSourceDeferralMs: number;
   priorityJobIds: number[];
 }
 
@@ -245,6 +247,11 @@ export function resolveBackfillOptions(
       "REFLECTION_REQUEST_TIMEOUT_MS",
       environment.REFLECTION_REQUEST_TIMEOUT_MS,
       DEFAULT_REQUEST_TIMEOUT_MS,
+    ),
+    maxMutableSourceDeferralMs: positiveIntegerEnvironment(
+      "REFLECTION_MAX_MUTABLE_SOURCE_DEFERRAL_MS",
+      environment.REFLECTION_MAX_MUTABLE_SOURCE_DEFERRAL_MS,
+      DEFAULT_MAX_MUTABLE_SOURCE_DEFERRAL_MS,
     ),
     priorityJobIds: parsePriorityJobIds(
       environment.REFLECTION_BACKFILL_PRIORITY_JOB_IDS,
@@ -1157,6 +1164,11 @@ export async function completeJob(
   while (true) {
     if (current.status === "succeeded") {
       await revalidateJobContext(context, current);
+      if (Object.keys(context.state.providerStatus).length > 0) {
+        context.state.providerStatus = {};
+        context.state.status = "running";
+        context.saveState();
+      }
       return current;
     }
     if (current.status === "failed") {
@@ -1186,6 +1198,7 @@ export async function completeJob(
             await waitForProvider(context, current);
           } finally {
             context.state.status = "running";
+            context.state.providerStatus = {};
             context.saveState();
           }
         }
@@ -1322,6 +1335,7 @@ export interface DryRunSummary {
   sessions: number;
   stableSessions: number;
   deferredSessions: number;
+  expiredDeferredSessions: number;
   invalidSessions: number;
   segments: number;
   messages: number;
@@ -1336,10 +1350,12 @@ export async function createDryRunSummary(
   store: SessionStore,
   service: Pick<ReflectionService, "request">,
   clock: Pick<Clock, "nowMs"> = SYSTEM_CLOCK,
+  maxMutableSourceDeferralMs = DEFAULT_MAX_MUTABLE_SOURCE_DEFERRAL_MS,
 ): Promise<DryRunSummary> {
   let segmentCount = 0;
   let messageCount = 0;
   let deferredSessions = 0;
+  let expiredDeferredSessions = 0;
   let invalidSessions = 0;
   const statuses: Record<DryRunStatus, number> = {
     eligible_committed: 0,
@@ -1412,7 +1428,11 @@ export async function createDryRunSummary(
         (segment) => segment.disposition === "deferred_mutable_source",
       )
     ) {
-      deferredSessions += 1;
+      if (clock.nowMs() - session.timeUpdated >= maxMutableSourceDeferralMs) {
+        expiredDeferredSessions += 1;
+      } else {
+        deferredSessions += 1;
+      }
     }
     for (const segment of segments) {
       statuses[segment.status] += 1;
@@ -1428,6 +1448,7 @@ export async function createDryRunSummary(
     sessions: sessions.length,
     stableSessions: sessions.length - deferredSessions,
     deferredSessions,
+    expiredDeferredSessions,
     invalidSessions,
     segments: segmentCount,
     messages: messageCount,
@@ -1452,6 +1473,7 @@ export interface ProcessingContext {
   priorityJobIds: readonly number[];
   completedSnapshots: Set<string>;
   attemptedSnapshots: Set<string>;
+  maxMutableSourceDeferralMs: number;
   acquireLock(): void;
   releaseLock(): void;
   scheduleLaunchAgentCleanup(): void;
@@ -1628,7 +1650,11 @@ export async function processSession(
   messages: readonly OpenCodeMessage[],
   observedUpdatedAt: number | undefined,
 ): Promise<ProcessSessionOutcome> {
-  if (observedUpdatedAt === undefined) return "completed";
+  if (observedUpdatedAt === undefined) {
+    context.state.sessionsVisited += 1;
+    context.saveState();
+    return "completed";
+  }
   const revalidateSession = () => {
     if (
       !sessionRemainsStable(
@@ -1767,6 +1793,22 @@ export async function processSession(
       revalidateSession();
     }
     if (deferredSegment) {
+      if (
+        context.clock.nowMs() - session.timeUpdated >=
+        context.maxMutableSourceDeferralMs
+      ) {
+        recordFailure(
+          context,
+          session.id,
+          deferredSegment,
+          null,
+          new Error("mutable source span exceeded the safe deferral window"),
+        );
+        context.state.sessionsVisited += 1;
+        context.state.currentSegment = null;
+        context.saveState();
+        return "failed";
+      }
       context.state.currentSegment = null;
       context.saveState();
       context.log("session has a deferred mutable source span", {
@@ -1885,6 +1927,8 @@ export async function runBackfill(context: ProcessingContext): Promise<void> {
     context.state.currentSessionId = null;
     context.state.currentSessionTitle = null;
     context.state.currentSegment = null;
+    context.state.deferredSessions = 0;
+    context.state.providerStatus = {};
     context.saveState();
     context.log("backfill completed", {
       sessionsVisited: context.state.sessionsVisited,
@@ -1935,7 +1979,13 @@ export async function main(
   });
 
   if (options.dryRun) {
-    const summary = await createDryRunSummary(sessions, store, service, clock);
+    const summary = await createDryRunSummary(
+      sessions,
+      store,
+      service,
+      clock,
+      options.maxMutableSourceDeferralMs,
+    );
     console.log(JSON.stringify(summary));
     return 0;
   }
@@ -1955,6 +2005,7 @@ export async function main(
     priorityJobIds: options.priorityJobIds,
     completedSnapshots: new Set(),
     attemptedSnapshots: new Set(),
+    maxMutableSourceDeferralMs: options.maxMutableSourceDeferralMs,
     acquireLock: () => acquireLock(options.lockPath, processId),
     releaseLock: release,
     scheduleLaunchAgentCleanup: () => {

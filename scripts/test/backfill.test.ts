@@ -23,6 +23,7 @@ import {
 
 import {
   DEFAULT_REQUEST_TIMEOUT_MS,
+  DEFAULT_MAX_MUTABLE_SOURCE_DEFERRAL_MS,
   MESSAGE_QUERY,
   PART_QUERY,
   SESSION_QUERY,
@@ -240,6 +241,7 @@ function processingContext(
     priorityJobIds: options.priorityJobIds ?? [],
     completedSnapshots: new Set(),
     attemptedSnapshots: new Set(),
+    maxMutableSourceDeferralMs: DEFAULT_MAX_MUTABLE_SOURCE_DEFERRAL_MS,
     acquireLock: vi.fn(),
     releaseLock: vi.fn(),
     scheduleLaunchAgentCleanup: vi.fn(),
@@ -410,9 +412,23 @@ describe("stable session revisions", () => {
     expect(summary).toMatchObject({
       stableSessions: 0,
       deferredSessions: 1,
+      expiredDeferredSessions: 0,
       segments: 1,
       statuses: { new: 1 },
       dispositions: { ready: 0, deferred_mutable_source: 1 },
+    });
+
+    const expired = await createDryRunSummary(
+      [session],
+      store,
+      { request: vi.fn(async () => emptyManifest()) },
+      { nowMs: () => 1_000_000 },
+      100,
+    );
+    expect(expired).toMatchObject({
+      stableSessions: 1,
+      deferredSessions: 0,
+      expiredDeferredSessions: 1,
     });
   });
 
@@ -512,6 +528,37 @@ describe("stable session revisions", () => {
     });
     expect(context.scheduleLaunchAgentCleanup).not.toHaveBeenCalled();
     expect(context.releaseLock).toHaveBeenCalledOnce();
+  });
+
+  it("records an expired mutable source span without submitting it", async () => {
+    const session = { id: SESSION_ID, title: "test", timeUpdated: 100 };
+    const messages = [user("u1", "x".repeat(25_000))];
+    const service: ReflectionService = {
+      request: vi.fn(async () => emptyManifest()),
+      getJob: vi.fn(),
+      retryJob: vi.fn(),
+      waitForJob: vi.fn(),
+    };
+    const store: SessionStore = {
+      sessions: [],
+      sessionUpdatedAt: () => 100,
+      sessionMessages: () => messages,
+    };
+    const context = processingContext(service, { store, nowMs: 1_000_000 });
+    context.maxMutableSourceDeferralMs = 100;
+
+    await expect(processSession(context, session, messages, 100)).resolves.toBe(
+      "failed",
+    );
+
+    expect(service.request).toHaveBeenCalledOnce();
+    expect(context.state).toMatchObject({
+      sessionsVisited: 1,
+      segmentsFailed: 1,
+    });
+    expect(context.state.failures[0]?.error).toContain(
+      "exceeded the safe deferral window",
+    );
   });
 });
 
@@ -1054,6 +1101,51 @@ describe("request retries and timeouts", () => {
 });
 
 describe("job completion fencing", () => {
+  it("clears provider wait metadata after recovery", async () => {
+    const currentState = state();
+    currentState.status = "waiting_for_provider";
+    currentState.providerStatus = { jobId: 1, error: "balance" };
+    const succeeded = jobFor(v1Submission(), {
+      status: "succeeded",
+      error: null,
+    });
+
+    await expect(
+      completeJob(succeeded, {
+        state: currentState,
+        retryJob: vi.fn(),
+        waitForJob: vi.fn(),
+        saveState: vi.fn(),
+        log: vi.fn(),
+        sleep: vi.fn(async () => undefined),
+        clock: { nowMs: () => 0 },
+        providerPollMs: 5_000,
+      }),
+    ).resolves.toEqual(succeeded);
+    expect(currentState.status).toBe("running");
+    expect(currentState.providerStatus).toEqual({});
+  });
+
+  it("counts a disappeared local session as visited", async () => {
+    const service: ReflectionService = {
+      request: vi.fn(),
+      getJob: vi.fn(),
+      retryJob: vi.fn(),
+      waitForJob: vi.fn(),
+    };
+    const context = processingContext(service);
+
+    await expect(
+      processSession(
+        context,
+        { id: SESSION_ID, title: "deleted", timeUpdated: 100 },
+        [],
+        undefined,
+      ),
+    ).resolves.toBe("completed");
+    expect(context.state.sessionsVisited).toBe(1);
+  });
+
   it("retries sibling jobs independently", async () => {
     const first = jobFor(v1Submission("u1"), { id: 1 });
     const second = jobFor(v1Submission("u2"), { id: 2 });
@@ -1345,6 +1437,9 @@ describe("configuration and retained recovery jobs", () => {
     const defaults = resolveBackfillOptions([], {}, "/home/test");
     expect(defaults.priorityJobIds).toEqual([]);
     expect(defaults.requestTimeoutMs).toBe(DEFAULT_REQUEST_TIMEOUT_MS);
+    expect(defaults.maxMutableSourceDeferralMs).toBe(
+      DEFAULT_MAX_MUTABLE_SOURCE_DEFERRAL_MS,
+    );
     expect(parsePriorityJobIds("7, 8,7")).toEqual([7, 8]);
     expect(
       resolveBackfillOptions(
@@ -1359,6 +1454,7 @@ describe("configuration and retained recovery jobs", () => {
     ["REFLECTION_PROVIDER_POLL_MS", "0"],
     ["REFLECTION_JOB_POLL_MS", "NaN"],
     ["REFLECTION_REQUEST_TIMEOUT_MS", "1.5"],
+    ["REFLECTION_MAX_MUTABLE_SOURCE_DEFERRAL_MS", "0"],
     ["REFLECTION_BACKFILL_PRIORITY_JOB_IDS", "7,nope"],
   ])("rejects invalid %s values", (name, value) => {
     expect(() =>
@@ -1389,6 +1485,28 @@ describe("configuration and retained recovery jobs", () => {
 });
 
 describe("state, locking, and cleanup", () => {
+  it("clears wait metadata on terminal completion", async () => {
+    const currentState = state();
+    currentState.deferredSessions = 3;
+    currentState.providerStatus = { jobId: 1, error: "old" };
+    const service: ReflectionService = {
+      request: vi.fn(),
+      getJob: vi.fn(),
+      retryJob: vi.fn(),
+      waitForJob: vi.fn(),
+    };
+    const context = processingContext(service, { currentState });
+
+    await runBackfill(context);
+
+    expect(context.state).toMatchObject({
+      status: "completed",
+      deferredSessions: 0,
+      providerStatus: {},
+    });
+    expect(context.scheduleLaunchAgentCleanup).toHaveBeenCalledOnce();
+  });
+
   it("resets per-run state and serializes with a trailing newline", () => {
     const timestamps = ["2026-08-22T01:00:00.000Z", "2026-08-22T01:00:00.001Z"];
     const current = createInitialState(
