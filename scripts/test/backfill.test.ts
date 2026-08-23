@@ -640,6 +640,30 @@ describe("strict manifest planning", () => {
     ]);
   });
 
+  it("makes a committed user-ending anchor ready after later same-turn source", () => {
+    const messages = [user("u1", "request"), assistant("a1", "u1", "done")];
+    const anchor: CommittedSegmentBoundary = {
+      startUserMessageId: "u1",
+      endUserMessageId: "u1",
+      sourceBoundaryVersion: 2,
+      startSourceMessageId: "u1",
+      endSourceMessageId: "u1",
+    };
+    const local = segmentMessages(messages, 100, [anchor])[0]!;
+    const manifest = manifestWith([boundaryFor(SESSION_ID, local)]);
+
+    expect(planSessionSegments(SESSION_ID, messages, manifest)).toMatchObject([
+      {
+        status: "eligible_committed",
+        disposition: "ready",
+        closed: true,
+      },
+      {
+        disposition: "ready",
+      },
+    ]);
+  });
+
   it("reconciles mixed v1 and exact v2 anchors in one canonical plan", () => {
     const messages = [
       user("u1", "1"),

@@ -453,6 +453,49 @@ describe("projectMessages", () => {
     expect(result.messages.slice(2)).toEqual(messages.slice(3));
   });
 
+  it("archives an exact user-ending anchor after later same-turn source", async () => {
+    const messages = [
+      user("u1", "request"),
+      assistant("a1", "u1", "done", [], 100_000),
+    ];
+    const canonical = segmentMessages(messages, 100, [
+      {
+        startUserMessageId: "u1",
+        endUserMessageId: "u1",
+        sourceBoundaryVersion: 2,
+        startSourceMessageId: "u1",
+        endSourceMessageId: "u1",
+      },
+    ]);
+    const archived = canonical[0]!;
+    const summary: StoredSegmentSummary = {
+      id: segmentIdForRequest({
+        session_id: SESSION_ID,
+        start_user_message_id: archived.startUserMessageId,
+        source_boundary_version: 2,
+        start_source_message_id: archived.startSourceMessageId,
+      }),
+      start_user_message_id: archived.startUserMessageId,
+      end_user_message_id: archived.endUserMessageId,
+      source_boundary_version: 2,
+      start_source_message_id: archived.startSourceMessageId!,
+      end_source_message_id: archived.endSourceMessageId!,
+      projection_version: 1,
+      summary: "User request",
+    };
+
+    const result = await projectMessages({
+      messages,
+      contextLimit: CONTEXT_LIMIT,
+      loadCanonicalSegments: async () => canonical,
+      loadSummaries: async () => [summary],
+    });
+
+    expect(canonical.map((segment) => segment.closed)).toEqual([true, false]);
+    expect(result.reset).toBe(true);
+    expect(result.state.checkpoint?.tailStartMessageId).toBe("a1");
+  });
+
   it("retains an assistant-starting canonical tail by exact identity", async () => {
     const messages = [
       user("turn", "request"),

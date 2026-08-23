@@ -881,6 +881,7 @@ function fragmentTurn(
         turn,
         sourceMessages,
         turn.closed ||
+          boundary.endOffset < turn.messages.length - 1 ||
           isCompletedAssistantMessage(sourceMessages.at(-1)?.message),
       ),
     );

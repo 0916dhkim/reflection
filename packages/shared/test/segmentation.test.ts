@@ -740,26 +740,24 @@ describe("segmentMessages", () => {
   });
 
   it("quarantines mutable active V2 anchors without losing exact cursors", () => {
-    const incomplete = assistant("a1", "u1", "working");
-    incomplete.info.time = { created: 0, completed: Number.POSITIVE_INFINITY };
-    const messages = [user("u1", "request"), incomplete];
-
+    const userOnlyMessages = [user("u1", "request")];
     const userBoundary = v2Boundary("u1", "u1", "u1");
-    expect(segmentMessages(messages, 100, [userBoundary])).toMatchObject([
+    expect(
+      segmentMessages(userOnlyMessages, 100, [userBoundary]),
+    ).toMatchObject([
       {
         sourceBoundaryVersion: 2,
         sourceMessageIds: ["u1"],
         closed: false,
       },
-      {
-        sourceBoundaryVersion: 2,
-        sourceMessageIds: ["a1"],
-        closed: false,
-      },
     ]);
-    expect(readSegmentMessages(messages, userBoundary)).toEqual([
+    expect(readSegmentMessages(userOnlyMessages, userBoundary)).toEqual([
       { role: "user", text: "request" },
     ]);
+
+    const incomplete = assistant("a1", "u1", "working");
+    incomplete.info.time = { created: 0, completed: Number.POSITIVE_INFINITY };
+    const messages = [user("u1", "request"), incomplete];
 
     const incompleteBoundary = v2Boundary("u1", "u1", "a1");
     expect(segmentMessages(messages, 100, [incompleteBoundary])).toMatchObject([
@@ -786,6 +784,27 @@ describe("segmentMessages", () => {
         closed: true,
       },
     ]);
+  });
+
+  it("closes persisted V2 anchors once later same-turn source exists", () => {
+    const incomplete = assistant("a1", "u1", "working");
+    incomplete.info.time = { created: 0, completed: Number.POSITIVE_INFINITY };
+    const messages = [
+      user("u1", "request"),
+      incomplete,
+      assistant("a2", "u1", "done"),
+    ];
+
+    for (const boundary of [
+      v2Boundary("u1", "u1", "u1"),
+      v2Boundary("u1", "u1", "a1"),
+    ]) {
+      expect(segmentMessages(messages, 100, [boundary])[0]).toMatchObject({
+        sourceBoundaryVersion: 2,
+        endSourceMessageId: boundary.endSourceMessageId,
+        closed: true,
+      });
+    }
   });
 
   it("freezes selected V1 coverage before reconciling exact V2 anchors", () => {
