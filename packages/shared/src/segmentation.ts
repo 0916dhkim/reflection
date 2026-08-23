@@ -787,12 +787,17 @@ function fragmentTurn(
   maxChars: number,
 ): ReflectionSegment[] {
   const firstSourceIndex = turn.messages[0]?.sourceIndex;
+  if (firstSourceIndex === undefined) {
+    throw new Error("Cannot fragment an empty turn");
+  }
   if (
-    firstSourceIndex === undefined ||
     turn.messages.some(
       (message, index) => message.sourceIndex !== firstSourceIndex + index,
     )
   ) {
+    // Exact cursors cannot cover a disjoint turn without crossing another
+    // turn's source, so preserve the legacy whole-turn boundary instead.
+    if (boundaries.length === 0) return [makeV1Segment([turn], turn.closed)];
     throw new Error("A fragmented turn must be contiguous in source order");
   }
   const segments: ReflectionSegment[] = [];

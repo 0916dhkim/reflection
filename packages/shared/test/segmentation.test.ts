@@ -537,6 +537,33 @@ describe("segmentMessages", () => {
     ]);
   });
 
+  it("keeps an interleaved oversized turn as one whole-turn range", () => {
+    const segments = segmentMessages(
+      [
+        user("u1", "123456"),
+        user("u2", "next"),
+        assistant("late-a1", "u1", "789012"),
+      ],
+      10,
+    );
+
+    expect(segments).toMatchObject([
+      {
+        sourceBoundaryVersion: 1,
+        startUserMessageId: "u1",
+        endUserMessageId: "u1",
+        sourceMessageIds: ["u1", "late-a1"],
+        charCount: 12,
+        closed: true,
+      },
+      {
+        sourceBoundaryVersion: 1,
+        sourceMessageIds: ["u2"],
+        closed: false,
+      },
+    ]);
+  });
+
   it("ingests unanswered normal user turns without changing user boundaries", () => {
     const messages = [
       user("u1", "first"),
