@@ -25,6 +25,7 @@ import {
 import {
   DEFAULT_REQUEST_TIMEOUT_MS,
   DEFAULT_MAX_MUTABLE_SOURCE_DEFERRAL_MS,
+  INACTIVE_MS,
   MESSAGE_QUERY,
   PART_QUERY,
   SESSION_QUERY,
@@ -243,6 +244,7 @@ function processingContext(
     completedSnapshots: new Set(),
     attemptedSnapshots: new Set(),
     maxMutableSourceDeferralMs: DEFAULT_MAX_MUTABLE_SOURCE_DEFERRAL_MS,
+    allowFailures: false,
     acquireLock: vi.fn(),
     releaseLock: vi.fn(),
     scheduleLaunchAgentCleanup: vi.fn(),
@@ -496,7 +498,7 @@ describe("stable session revisions", () => {
       segmentId: null,
     });
     expect(context.state.failures[0]?.error).toContain("invalid segment plan");
-    expect(context.scheduleLaunchAgentCleanup).toHaveBeenCalledOnce();
+    expect(context.scheduleLaunchAgentCleanup).not.toHaveBeenCalled();
     expect(context.releaseLock).toHaveBeenCalledOnce();
   });
 
@@ -523,9 +525,10 @@ describe("stable session revisions", () => {
     await expect(runBackfill(context)).rejects.toBe(stop);
 
     expect(context.state).toMatchObject({
-      status: "waiting_for_session_inactivity",
+      status: "failed",
       sessionsVisited: 0,
       deferredSessions: 1,
+      fatalError: "Error: stop after deferred wait",
     });
     expect(context.scheduleLaunchAgentCleanup).not.toHaveBeenCalled();
     expect(context.releaseLock).toHaveBeenCalledOnce();
@@ -560,6 +563,41 @@ describe("stable session revisions", () => {
     expect(context.state.failures[0]?.error).toContain(
       "exceeded the safe deferral window",
     );
+  });
+
+  it("uses the observed revision time for mutable source expiry", async () => {
+    const now = 100_000_000;
+    const observedUpdatedAt = now - INACTIVE_MS - 1;
+    const session = {
+      id: SESSION_ID,
+      title: "recently updated",
+      timeUpdated: now - DEFAULT_MAX_MUTABLE_SOURCE_DEFERRAL_MS - 1,
+    };
+    const messages = [user("u1", "x".repeat(25_000))];
+    const store: SessionStore = {
+      sessions: [session],
+      sessionUpdatedAt: () => observedUpdatedAt,
+      sessionMessages: () => messages,
+    };
+    const service: ReflectionService = {
+      request: vi.fn(async () => emptyManifest()),
+      getJob: vi.fn(),
+      retryJob: vi.fn(),
+      waitForJob: vi.fn(),
+    };
+    const context = processingContext(service, { store, nowMs: now });
+
+    await expect(
+      processSession(context, session, messages, observedUpdatedAt),
+    ).resolves.toBe("deferred_source");
+    expect(context.state.segmentsFailed).toBe(0);
+
+    await expect(
+      createDryRunSummary([session], store, service, { nowMs: () => now }),
+    ).resolves.toMatchObject({
+      deferredSessions: 1,
+      expiredDeferredSessions: 0,
+    });
   });
 });
 
@@ -607,6 +645,19 @@ describe("strict manifest planning", () => {
 
     expect(() => planSessionSegments(SESSION_ID, [], manifest)).toThrow(
       "target(s) have no local source span",
+    );
+  });
+
+  it("rejects a superseded job as the current desired target", () => {
+    const messages = [user("u1", "request")];
+    const local = segmentMessages(messages)[0]!;
+    const manifest = manifestWith(
+      [],
+      [targetFor(SESSION_ID, local, "superseded")],
+    );
+
+    expect(() => planSessionSegments(SESSION_ID, messages, manifest)).toThrow(
+      "current target",
     );
   });
 
@@ -1451,17 +1502,117 @@ describe("job completion fencing", () => {
     expect(context.state.segmentsFailed).toBe(1);
     expect(context.state.segmentsDiscovered).toBe(1);
   });
+
+  it("bounds projection upgrade replay without counting false success", async () => {
+    const messages = [user("u0", "request"), assistant("a0", "u0", "done")];
+    const local = segmentMessages(messages)[0]!;
+    let targetExists = false;
+    let targetPosts = 0;
+    const service: ReflectionService = {
+      request: vi.fn(async (path, init) => {
+        if (path.includes("/sessions/")) {
+          return targetExists
+            ? manifestWith([
+                boundaryFor(SESSION_ID, local, { projection_version: 0 }),
+              ])
+            : emptyManifest();
+        }
+        targetPosts += 1;
+        targetExists = true;
+        return jobFor(JSON.parse(String(init?.body)) as SegmentCreate, {
+          status: "succeeded",
+          error: null,
+          projection_version: 0,
+        });
+      }),
+      getJob: vi.fn(),
+      retryJob: vi.fn(),
+      waitForJob: vi.fn(),
+    };
+    const store: SessionStore = {
+      sessions: [],
+      sessionUpdatedAt: () => 100,
+      sessionMessages: () => messages,
+    };
+    const context = processingContext(service, { store });
+
+    await expect(
+      processSession(
+        context,
+        { id: SESSION_ID, title: "test", timeUpdated: 100 },
+        messages,
+        100,
+      ),
+    ).resolves.toBe("completed");
+
+    expect(targetPosts).toBe(3);
+    expect(context.state).toMatchObject({
+      segmentsSucceeded: 0,
+      segmentsAlreadySucceeded: 0,
+      segmentsFailed: 1,
+    });
+    expect(context.state.failures[0]?.error).toContain(
+      "projection upgrade did not reach version",
+    );
+  });
+
+  it("does not retry a retained failure again during session scanning", async () => {
+    const messages = [user("u0", "request"), assistant("a0", "u0", "done")];
+    const local = segmentMessages(messages)[0]!;
+    const submission = segmentSubmission(SESSION_ID, local);
+    const failedJob = jobFor(submission, {
+      id: 12,
+      status: "failed",
+      error: "terminal failure",
+    });
+    const service: ReflectionService = {
+      request: vi.fn(async () =>
+        manifestWith([], [targetFor(SESSION_ID, local, "failed")]),
+      ),
+      getJob: vi.fn(async () => failedJob),
+      retryJob: vi.fn(async () => failedJob),
+      waitForJob: vi.fn(async (current) => current),
+    };
+    const store: SessionStore = {
+      sessions: [],
+      sessionUpdatedAt: () => 100,
+      sessionMessages: () => messages,
+    };
+    const context = processingContext(service, {
+      store,
+      priorityJobIds: [12],
+    });
+
+    await processPriorityJobs(context);
+    await expect(
+      processSession(
+        context,
+        { id: SESSION_ID, title: "test", timeUpdated: 100 },
+        messages,
+        100,
+      ),
+    ).resolves.toBe("completed");
+
+    expect(service.retryJob).toHaveBeenCalledOnce();
+    expect(context.state.segmentsFailed).toBe(1);
+    expect(context.state.failures).toHaveLength(1);
+  });
 });
 
 describe("configuration and retained recovery jobs", () => {
   it("defaults to no priority jobs and parses an optional de-duplicated list", () => {
     const defaults = resolveBackfillOptions([], {}, "/home/test");
+    expect(defaults.allowFailures).toBe(false);
     expect(defaults.priorityJobIds).toEqual([]);
     expect(defaults.requestTimeoutMs).toBe(DEFAULT_REQUEST_TIMEOUT_MS);
     expect(defaults.maxMutableSourceDeferralMs).toBe(
       DEFAULT_MAX_MUTABLE_SOURCE_DEFERRAL_MS,
     );
     expect(parsePriorityJobIds("7, 8,7")).toEqual([7, 8]);
+    expect(
+      resolveBackfillOptions(["--allow-failures"], {}, "/home/test")
+        .allowFailures,
+    ).toBe(true);
     expect(
       resolveBackfillOptions(
         [],
@@ -1495,6 +1646,19 @@ describe("configuration and retained recovery jobs", () => {
         REFLECTION_BACKFILL_LAUNCHD_PLIST: "relative.plist",
       }),
     ).toThrow("must be absolute");
+    expect(() =>
+      resolveBackfillOptions([], {
+        REFLECTION_BACKFILL_LAUNCHD_LABEL: " ",
+        REFLECTION_BACKFILL_LAUNCHD_PLIST: "/tmp/backfill.plist",
+      }),
+    ).toThrow("must be nonempty");
+    expect(() =>
+      resolveBackfillOptions([], {
+        REFLECTION_BACKFILL_STATE_DIR: "relative-state",
+        REFLECTION_BACKFILL_LAUNCHD_LABEL: "com.reflection.backfill",
+        REFLECTION_BACKFILL_LAUNCHD_PLIST: "/tmp/backfill.plist",
+      }),
+    ).toThrow("STATE_DIR must be absolute");
   });
 
   it("tolerates a configured priority job that no longer exists", async () => {
@@ -1520,6 +1684,55 @@ describe("configuration and retained recovery jobs", () => {
 });
 
 describe("state, locking, and cleanup", () => {
+  it("persists fatal state before releasing the lock", async () => {
+    const events: string[] = [];
+    const service: ReflectionService = {
+      request: vi.fn(),
+      getJob: vi.fn(async () => {
+        throw new Error("priority failure");
+      }),
+      retryJob: vi.fn(),
+      waitForJob: vi.fn(),
+    };
+    const context = processingContext(service, { priorityJobIds: [1] });
+    context.saveState = vi.fn(() => events.push("save"));
+    context.releaseLock = vi.fn(() => events.push("release"));
+
+    await expect(runBackfill(context)).rejects.toThrow("priority failure");
+
+    expect(context.state).toMatchObject({
+      status: "failed",
+      fatalError: "Error: priority failure",
+    });
+    expect(events.at(-1)).toBe("release");
+    expect(events.at(-2)).toBe("save");
+  });
+
+  it("schedules cleanup for acknowledged failures only", async () => {
+    const invalid = { id: "invalid", title: "invalid", timeUpdated: 100 };
+    const store: SessionStore = {
+      sessions: [invalid],
+      sessionUpdatedAt: () => 100,
+      sessionMessages: () => [user("u1", "request")],
+    };
+    const service: ReflectionService = {
+      request: vi.fn(async () => ({
+        ...emptyManifest(invalid.id),
+        manifest_version: 1,
+      })),
+      getJob: vi.fn(),
+      retryJob: vi.fn(),
+      waitForJob: vi.fn(),
+    };
+    const context = processingContext(service, { store });
+    context.allowFailures = true;
+
+    await runBackfill(context);
+
+    expect(context.state.status).toBe("completed_with_failures");
+    expect(context.scheduleLaunchAgentCleanup).toHaveBeenCalledOnce();
+  });
+
   it("clears wait metadata on terminal completion", async () => {
     const currentState = state();
     currentState.deferredSessions = 3;

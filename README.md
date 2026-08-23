@@ -214,11 +214,14 @@ The copied bundle is self-contained and does not depend on this checkout or its 
 ```bash
 node scripts/backfill.mjs --dry-run
 node scripts/backfill.mjs
+node scripts/backfill.mjs --allow-failures
 ```
 
 The backfill reads OpenCode SQLite from `~/.local/share/opencode/opencode.db`, service credentials from `~/.config/opencode/reflection.json`, and atomically stores resumable state under `~/.local/state/reflection-backfill/`. `OPENCODE_DATABASE_PATH` and `REFLECTION_BACKFILL_STATE_DIR` override the local paths. `REFLECTION_MAX_MUTABLE_SOURCE_DEFERRAL_MS` overrides the 24-hour safe-deferral window. A mode-`0600` PID lock prevents concurrent workers.
 
-Sessions are processed newest first, but spans within a session remain chronological. The launcher waits for ten minutes of session inactivity, snapshots message and part JSON, rechecks the SQLite revision before and throughout network/job waits, and replans if either local history or the server target changes. Open v2 spans ending on a user or unfinished assistant remain deferred; after 24 hours without session activity, backfill records them as safely skipped failures without submitting them. Backfill uses priority `0`, waits for each job before submitting the next span, retries provider-balance failures conservatively, and skips exact successful fingerprints idempotently. `REFLECTION_BACKFILL_PRIORITY_JOB_IDS` can retain specific already-created foreground jobs across a supervised restart.
+Sessions are processed newest first, but spans within a session remain chronological. The launcher waits for ten minutes of session inactivity, snapshots message and part JSON, rechecks the SQLite revision before and throughout network/job waits, and replans if either local history or the server target changes. Open v2 spans ending on a user or unfinished assistant remain deferred; after 24 hours from the latest observed revision, backfill records them as safely skipped failures without submitting them. Backfill uses priority `0`, waits for each job before submitting the next span, retries provider-balance failures conservatively, and skips exact successful fingerprints idempotently. `REFLECTION_BACKFILL_PRIORITY_JOB_IDS` can retain specific already-created foreground jobs across a supervised restart.
+
+Runs with failures return nonzero and retain LaunchAgent supervision. After reviewing the recorded failures, `--allow-failures` explicitly accepts them and permits cleanup on the next run. Dry runs return nonzero when manifests are invalid or mutable-source skips have expired.
 
 An authoritative dry run reads `manifest_version: 2`, validates deterministic IDs, and reports eligible, stale, pending, conflicting, and new spans without writing local state or server targets.
 

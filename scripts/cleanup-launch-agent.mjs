@@ -61,8 +61,9 @@ if (unloaded) {
   try {
     unlinkSync(plistPath);
     plistRemoved = true;
-  } catch (error) {
-    if (error?.code === "ENOENT") plistRemoved = true;
+  } catch (unlinkError) {
+    if (unlinkError?.code === "ENOENT") plistRemoved = true;
+    else error = String(unlinkError);
   }
 }
 
@@ -84,7 +85,7 @@ writeFileSync(
       plistRemoved,
       unloaded,
       restartRequested,
-      error: unloaded ? null : error,
+      error: unloaded && plistRemoved ? null : error,
     },
     null,
     2,

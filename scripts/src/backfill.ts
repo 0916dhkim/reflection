@@ -42,6 +42,7 @@ export const DEFAULT_PROVIDER_POLL_MS = 5 * 60_000;
 export const DEFAULT_JOB_POLL_MS = 2_000;
 export const DEFAULT_REQUEST_TIMEOUT_MS = 120_000;
 export const DEFAULT_MAX_MUTABLE_SOURCE_DEFERRAL_MS = 24 * 60 * 60_000;
+const MAX_PROJECTION_UPGRADE_REPLAYS = 2;
 export const MAX_NON_PROVIDER_JOB_ROUNDS = 2;
 
 export const SESSION_QUERY =
@@ -187,6 +188,7 @@ export interface BackfillState {
 
 export interface BackfillOptions {
   dryRun: boolean;
+  allowFailures: boolean;
   stateDirectory: string;
   statePath: string;
   lockPath: string;
@@ -223,8 +225,12 @@ export function resolveBackfillOptions(
   const stateDirectory =
     environment.REFLECTION_BACKFILL_STATE_DIR ??
     join(home, ".local/state/reflection-backfill");
-  const launchdLabel = environment.REFLECTION_BACKFILL_LAUNCHD_LABEL;
+  const rawLaunchdLabel = environment.REFLECTION_BACKFILL_LAUNCHD_LABEL;
+  const launchdLabel = rawLaunchdLabel?.trim();
   const launchdPlist = environment.REFLECTION_BACKFILL_LAUNCHD_PLIST;
+  if (rawLaunchdLabel !== undefined && !launchdLabel) {
+    throw new Error("REFLECTION_BACKFILL_LAUNCHD_LABEL must be nonempty");
+  }
   if ((launchdLabel === undefined) !== (launchdPlist === undefined)) {
     throw new Error(
       "REFLECTION_BACKFILL_LAUNCHD_LABEL and REFLECTION_BACKFILL_LAUNCHD_PLIST must be configured together",
@@ -233,8 +239,14 @@ export function resolveBackfillOptions(
   if (launchdPlist !== undefined && !isAbsolute(launchdPlist)) {
     throw new Error("REFLECTION_BACKFILL_LAUNCHD_PLIST must be absolute");
   }
+  if (launchdLabel !== undefined && !isAbsolute(stateDirectory)) {
+    throw new Error(
+      "REFLECTION_BACKFILL_STATE_DIR must be absolute when LaunchAgent cleanup is configured",
+    );
+  }
   return {
     dryRun: argv.includes("--dry-run"),
+    allowFailures: argv.includes("--allow-failures"),
     stateDirectory,
     statePath: join(stateDirectory, "state.json"),
     lockPath: join(stateDirectory, "worker.lock"),
@@ -682,6 +694,11 @@ export function planSessionSegments(
 
     if (targets.length > 0) {
       const target = targets[0]!;
+      if (target.status === "superseded") {
+        throw new Error(
+          `invalid segment manifest for ${sessionId}: current target ${target.id} is superseded`,
+        );
+      }
       manifestSourceFingerprint = target.source_fingerprint;
       targetStatus = target.status;
       if (targets.length > 1) drifts.push("conflicting_manifest_entries");
@@ -1443,7 +1460,10 @@ export async function createDryRunSummary(
         (segment) => segment.disposition === "deferred_mutable_source",
       )
     ) {
-      if (clock.nowMs() - session.timeUpdated >= maxMutableSourceDeferralMs) {
+      if (
+        snapshot.observedUpdatedAt !== undefined &&
+        clock.nowMs() - snapshot.observedUpdatedAt >= maxMutableSourceDeferralMs
+      ) {
         expiredDeferredSessions += 1;
       } else {
         deferredSessions += 1;
@@ -1489,6 +1509,7 @@ export interface ProcessingContext {
   completedSnapshots: Set<string>;
   attemptedSnapshots: Set<string>;
   maxMutableSourceDeferralMs: number;
+  allowFailures: boolean;
   acquireLock(): void;
   releaseLock(): void;
   scheduleLaunchAgentCleanup(): void | Promise<void>;
@@ -1544,14 +1565,23 @@ export async function processPriorityJobs(
   for (const jobId of context.priorityJobIds) {
     try {
       const job = await context.service.getJob(jobId);
-      if (job.status === "succeeded") continue;
+      const snapshotKey = job.source_fingerprint
+        ? `${job.segment_id}:${job.source_fingerprint}:${PROJECTION_VERSION}`
+        : null;
+      if (job.status === "succeeded") {
+        if (snapshotKey) context.completedSnapshots.add(snapshotKey);
+        continue;
+      }
       context.log("processing retained priority job", {
         ...jobSourceDetails(job),
         status: job.status,
       });
       const completed = await completeJobWithContext(job, context);
       if (completed.status !== "succeeded") {
+        if (snapshotKey) context.attemptedSnapshots.add(snapshotKey);
         recordFailure(context, null, null, completed);
+      } else if (snapshotKey) {
+        context.completedSnapshots.add(snapshotKey);
       }
     } catch (error) {
       if (
@@ -1772,10 +1802,27 @@ export async function processSession(
         segment,
         revalidateSession,
       );
+      let projectionUpgradeFailed = false;
+      let projectionUpgradeReplays = 0;
       while (
         completed.status === "succeeded" &&
         completed.projection_version < PROJECTION_VERSION
       ) {
+        if (projectionUpgradeReplays >= MAX_PROJECTION_UPGRADE_REPLAYS) {
+          context.attemptedSnapshots.add(completedSnapshotKey);
+          recordFailure(
+            context,
+            session.id,
+            segment,
+            completed,
+            new Error(
+              `projection upgrade did not reach version ${PROJECTION_VERSION}`,
+            ),
+          );
+          projectionUpgradeFailed = true;
+          break;
+        }
+        projectionUpgradeReplays += 1;
         revalidateSession();
         job = validateJobForSubmission(
           validatedJob(
@@ -1796,6 +1843,11 @@ export async function processSession(
           revalidateSession,
         );
       }
+      if (projectionUpgradeFailed) {
+        context.saveState();
+        revalidateSession();
+        continue;
+      }
       if (completed.status === "succeeded") {
         if (wasAlreadySucceeded) context.state.segmentsAlreadySucceeded += 1;
         else context.state.segmentsSucceeded += 1;
@@ -1809,9 +1861,10 @@ export async function processSession(
     }
     if (deferredSegment) {
       if (
-        context.clock.nowMs() - session.timeUpdated >=
+        context.clock.nowMs() - observedUpdatedAt >=
         context.maxMutableSourceDeferralMs
       ) {
+        context.state.segmentsDiscovered += 1;
         recordFailure(
           context,
           session.id,
@@ -1951,7 +2004,14 @@ export async function runBackfill(context: ProcessingContext): Promise<void> {
       segmentsAlreadySucceeded: context.state.segmentsAlreadySucceeded,
       segmentsFailed: context.state.segmentsFailed,
     });
-    await context.scheduleLaunchAgentCleanup();
+    if (!context.state.segmentsFailed || context.allowFailures) {
+      await context.scheduleLaunchAgentCleanup();
+    }
+  } catch (error) {
+    context.state.status = "failed";
+    context.state.fatalError = errorText(error);
+    context.saveState();
+    throw error;
   } finally {
     context.releaseLock();
   }
@@ -2001,11 +2061,12 @@ export async function main(
       options.maxMutableSourceDeferralMs,
     );
     console.log(JSON.stringify(summary));
-    return 0;
+    return summary.invalidSessions > 0 || summary.expiredDeferredSessions > 0
+      ? 1
+      : 0;
   }
 
   const release = () => releaseLock(options.lockPath, processId);
-  let lockWasAcquired = false;
   const processingContext: ProcessingContext = {
     state,
     sessions,
@@ -2021,9 +2082,9 @@ export async function main(
     completedSnapshots: new Set(),
     attemptedSnapshots: new Set(),
     maxMutableSourceDeferralMs: options.maxMutableSourceDeferralMs,
+    allowFailures: options.allowFailures,
     acquireLock: () => {
       acquireLock(options.lockPath, processId);
-      lockWasAcquired = true;
     },
     releaseLock: release,
     scheduleLaunchAgentCleanup: async () => {
@@ -2067,15 +2128,9 @@ export async function main(
 
   try {
     await runBackfill(processingContext);
-    return 0;
+    return state.segmentsFailed > 0 && !options.allowFailures ? 1 : 0;
   } catch (error) {
-    if (lockWasAcquired) {
-      state.status = "failed";
-      state.fatalError = errorText(error);
-      saveState();
-    }
     logger("backfill worker failed", { error: errorText(error) });
-    if (lockWasAcquired) release();
     return 1;
   }
 }
