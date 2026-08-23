@@ -41,6 +41,9 @@ const PROJECTION_STATE_PATH = join(
   "projection",
 );
 const INACTIVE_MS = 10 * 60 * 1000;
+const MAX_INACTIVE_SESSIONS_PER_SWEEP = 20;
+const INACTIVE_SESSION_RECHECK_MS = 10 * 60_000;
+const SDK_REQUEST_TIMEOUT_MS = 30_000;
 const PROJECTION_REQUEST_TIMEOUT_MS = 5_000;
 const TARGET_POST_TIMEOUT_MS = 5_000;
 const TARGET_WAIT_TIMEOUT_MS = 5_000;
@@ -338,6 +341,13 @@ export const Reflection: Plugin = async ({ client, directory }) => {
   const targetRevisions = new Map<string, number>();
   const targetUpdateAborts = new Map<string, Set<AbortController>>();
   const idlePasses = new Map<string, IdlePassState>();
+  const inactiveSessionChecks = new Map<
+    string,
+    { revision: number; checkedAt: number }
+  >();
+  let inactiveSweepCursor = 0;
+  let inactiveSweep: Promise<void> | null = null;
+  let pendingInactiveSweepSessionId: string | null = null;
   const successfulSegmentFingerprints = new Map<
     string,
     Map<string, { fingerprint: string; processingPriority: number }>
@@ -364,27 +374,38 @@ export const Reflection: Plugin = async ({ client, directory }) => {
     }
   };
   const log = async (message: string) => {
+    const request = requestSignal(undefined, SDK_REQUEST_TIMEOUT_MS);
     try {
       await client.app.log({
         body: { service: "reflection", level: "warn", message },
+        signal: request.signal,
       });
     } catch {
       console.error(message);
+    } finally {
+      request.dispose();
     }
   };
 
   const getSessionMessages = async (
     sessionId: string,
+    signal?: AbortSignal,
   ): Promise<OpenCodeMessage[]> => {
-    const response = await client.session.messages({
-      path: { id: sessionId },
-      query: { directory },
-      throwOnError: true,
-    });
-    if (!Array.isArray(response.data)) {
-      throw new Error(`Reflection could not load messages for ${sessionId}`);
+    const request = requestSignal(signal, SDK_REQUEST_TIMEOUT_MS);
+    try {
+      const response = await client.session.messages({
+        path: { id: sessionId },
+        query: { directory },
+        signal: request.signal,
+        throwOnError: true,
+      });
+      if (!Array.isArray(response.data)) {
+        throw new Error(`Reflection could not load messages for ${sessionId}`);
+      }
+      return response.data as OpenCodeMessage[];
+    } finally {
+      request.dispose();
     }
-    return response.data as OpenCodeMessage[];
   };
 
   const serializeTargetUpdate = (
@@ -549,7 +570,17 @@ export const Reflection: Plugin = async ({ client, directory }) => {
     const key = `${providerId}/${modelId}`;
     const cached = modelLimits.get(key);
     if (cached) return cached;
-    const response = await client.provider.list({ query: { directory } });
+    const request = requestSignal(undefined, SDK_REQUEST_TIMEOUT_MS);
+    let response;
+    try {
+      response = await client.provider.list({
+        query: { directory },
+        signal: request.signal,
+        throwOnError: true,
+      });
+    } finally {
+      request.dispose();
+    }
     const data = response.data as ProviderListData | undefined;
     const limit = data?.all.find((provider) => provider.id === providerId)
       ?.models[modelId]?.limit;
@@ -575,10 +606,11 @@ export const Reflection: Plugin = async ({ client, directory }) => {
 
   const getSegmentListing = async (
     sessionId: string,
+    signal?: AbortSignal,
   ): Promise<SegmentListing> => {
     const response = await apiCall(
       `/v1/sessions/${encodeURIComponent(sessionId)}/segments`,
-      { method: "GET" },
+      { method: "GET", signal },
       PROJECTION_REQUEST_TIMEOUT_MS,
     );
     if (!response.ok) {
@@ -684,37 +716,54 @@ export const Reflection: Plugin = async ({ client, directory }) => {
     }
   };
 
-  const isSessionIdle = async (sessionId: string): Promise<boolean> => {
-    const response = await client.session.status({
-      query: { directory },
-      throwOnError: true,
-    });
-    const statuses = response.data as
-      | Record<string, { type?: string }>
-      | undefined;
-    const status = statuses?.[sessionId];
-    return status === undefined || status.type === "idle";
+  const isSessionIdle = async (
+    sessionId: string,
+    signal?: AbortSignal,
+  ): Promise<boolean> => {
+    const request = requestSignal(signal, SDK_REQUEST_TIMEOUT_MS);
+    try {
+      const response = await client.session.status({
+        query: { directory },
+        signal: request.signal,
+        throwOnError: true,
+      });
+      const statuses = response.data as
+        | Record<string, { type?: string }>
+        | undefined;
+      const status = statuses?.[sessionId];
+      return status === undefined || status.type === "idle";
+    } finally {
+      request.dispose();
+    }
   };
 
   const captureIdleMessages = async (
     sessionId: string,
+    signal?: AbortSignal,
   ): Promise<OpenCodeMessage[] | null> => {
-    if (!(await isSessionIdle(sessionId))) return null;
-    const messages = await getSessionMessages(sessionId);
-    if (!(await isSessionIdle(sessionId))) return null;
+    if (!(await isSessionIdle(sessionId, signal))) return null;
+    const messages = await getSessionMessages(sessionId, signal);
+    if (!(await isSessionIdle(sessionId, signal))) return null;
     return messages;
   };
 
-  const isStillInactive = async (sessionId: string): Promise<boolean> => {
+  const isStillInactive = async (
+    sessionId: string,
+    signal?: AbortSignal,
+  ): Promise<boolean> => {
+    const request = requestSignal(signal, SDK_REQUEST_TIMEOUT_MS);
     try {
       const response = await client.session.get({
         path: { id: sessionId },
         query: { directory },
+        signal: request.signal,
       });
       const updated = response.data?.time.updated;
       return typeof updated === "number" && updated < Date.now() - INACTIVE_MS;
     } catch {
       return false;
+    } finally {
+      request.dispose();
     }
   };
 
@@ -789,52 +838,129 @@ export const Reflection: Plugin = async ({ client, directory }) => {
       return { messages: null, fresh: false, successfulSegmentKeys: [] };
     }
     const generation = sessionGenerations.get(sessionId) ?? 0;
-    return serializeTargetUpdate(sessionId, async () => {
-      if (deletedSessions.has(sessionId)) {
-        return { messages: null, fresh: false, successfulSegmentKeys: [] };
+    const controller = new AbortController();
+    const controllers = targetUpdateAborts.get(sessionId) ?? new Set();
+    controllers.add(controller);
+    targetUpdateAborts.set(sessionId, controllers);
+    try {
+      return await serializeTargetUpdate(sessionId, async () => {
+        if (deletedSessions.has(sessionId)) {
+          return { messages: null, fresh: false, successfulSegmentKeys: [] };
+        }
+        if ((sessionGenerations.get(sessionId) ?? 0) !== generation) {
+          return { messages: null, fresh: false, successfulSegmentKeys: [] };
+        }
+        const messages = await captureIdleMessages(
+          sessionId,
+          controller.signal,
+        );
+        if (!messages) {
+          return { messages: null, fresh: false, successfulSegmentKeys: [] };
+        }
+        if ((sessionGenerations.get(sessionId) ?? 0) !== generation) {
+          return { messages: null, fresh: false, successfulSegmentKeys: [] };
+        }
+        const listing = await getSegmentListing(sessionId, controller.signal);
+        const segments = segmentMessages(
+          messages,
+          undefined,
+          segmentAnchors(listing),
+        );
+        const includeOpenSegment =
+          revalidateInactiveOpen &&
+          (await isStillInactive(sessionId, controller.signal));
+        return submitSegmentSnapshot(
+          sessionId,
+          segments,
+          includeOpenSegment,
+          0,
+          generation,
+          messages,
+        );
+      });
+    } finally {
+      controllers.delete(controller);
+      if (
+        controllers.size === 0 &&
+        targetUpdateAborts.get(sessionId) === controllers
+      ) {
+        targetUpdateAborts.delete(sessionId);
       }
-      if ((sessionGenerations.get(sessionId) ?? 0) !== generation) {
-        return { messages: null, fresh: false, successfulSegmentKeys: [] };
-      }
-      const messages = await captureIdleMessages(sessionId);
-      if (!messages) {
-        return { messages: null, fresh: false, successfulSegmentKeys: [] };
-      }
-      if ((sessionGenerations.get(sessionId) ?? 0) !== generation) {
-        return { messages: null, fresh: false, successfulSegmentKeys: [] };
-      }
-      const listing = await getSegmentListing(sessionId);
-      const segments = segmentMessages(
-        messages,
-        undefined,
-        segmentAnchors(listing),
-      );
-      const includeOpenSegment =
-        revalidateInactiveOpen && (await isStillInactive(sessionId));
-      return submitSegmentSnapshot(
-        sessionId,
-        segments,
-        includeOpenSegment,
-        0,
-        generation,
-        messages,
-      );
-    });
+    }
   };
 
-  const finishIdle = async (sessionId: string): Promise<void> => {
-    const response = await client.session.list({ query: { directory } });
+  const sweepInactiveSessions = async (sessionId: string): Promise<void> => {
+    const request = requestSignal(undefined, SDK_REQUEST_TIMEOUT_MS);
+    let sessions: Array<{ id: string; time: { updated: number } }> = [];
+    try {
+      const response = await client.session.list({
+        query: { directory },
+        signal: request.signal,
+        throwOnError: true,
+      });
+      sessions = response.data ?? [];
+    } finally {
+      request.dispose();
+    }
     const cutoff = Date.now() - INACTIVE_MS;
-    for (const session of response.data ?? []) {
+    const candidates = sessions.filter(
+      (candidate) =>
+        candidate.id !== sessionId &&
+        !deletedSessions.has(candidate.id) &&
+        candidate.time.updated < cutoff,
+    );
+    if (candidates.length === 0) return;
+    const limit = Math.min(MAX_INACTIVE_SESSIONS_PER_SWEEP, candidates.length);
+    const start = inactiveSweepCursor % candidates.length;
+    inactiveSweepCursor = (start + limit) % candidates.length;
+    for (let offset = 0; offset < limit; offset += 1) {
+      const candidate = candidates[(start + offset) % candidates.length]!;
+      const cached = inactiveSessionChecks.get(candidate.id);
       if (
-        session.id === sessionId ||
-        deletedSessions.has(session.id) ||
-        session.time.updated >= cutoff
+        cached?.revision === candidate.time.updated &&
+        Date.now() - cached.checkedAt < INACTIVE_SESSION_RECHECK_MS
       ) {
         continue;
       }
-      await ingestIdleSession(session.id, true);
+      try {
+        const result = await ingestIdleSession(candidate.id, true);
+        if (
+          result.messages === null ||
+          result.observedSegmentKeys?.every((key) =>
+            result.successfulSegmentKeys.includes(key),
+          )
+        ) {
+          inactiveSessionChecks.set(candidate.id, {
+            revision: candidate.time.updated,
+            checkedAt: Date.now(),
+          });
+        }
+      } catch (error) {
+        await log(
+          `Reflection inactive-session ingestion failed for ${candidate.id}: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
     }
+  };
+
+  const finishIdle = (sessionId: string): void => {
+    if (inactiveSweep) {
+      pendingInactiveSweepSessionId = sessionId;
+      return;
+    }
+    const sweep = sweepInactiveSessions(sessionId).catch((error) =>
+      log(
+        `Reflection inactive-session sweep failed: ${error instanceof Error ? error.message : String(error)}`,
+      ),
+    );
+    inactiveSweep = sweep;
+    void sweep.then(() => {
+      if (inactiveSweep !== sweep) return;
+      inactiveSweep = null;
+      const pending = pendingInactiveSweepSessionId;
+      pendingInactiveSweepSessionId = null;
+      if (pending) finishIdle(pending);
+    });
   };
 
   const runIdle = (sessionId: string): Promise<void> => {
@@ -861,11 +987,7 @@ export const Reflection: Plugin = async ({ client, directory }) => {
         if (state.dirty) continue;
         if (shouldFinish) {
           shouldFinish = false;
-          try {
-            await finishIdle(sessionId);
-          } catch (error) {
-            await log(`idle hook failed: ${String(error)}`);
-          }
+          finishIdle(sessionId);
         }
       } while (state.dirty && !deletedSessions.has(sessionId));
       if (idlePasses.get(sessionId) === state) idlePasses.delete(sessionId);
@@ -908,6 +1030,7 @@ export const Reflection: Plugin = async ({ client, directory }) => {
         targetRevisions.delete(sessionId);
         idlePasses.delete(sessionId);
         successfulSegmentFingerprints.delete(sessionId);
+        inactiveSessionChecks.delete(sessionId);
         projectionState.delete(sessionId);
         return;
       }
@@ -1040,20 +1163,26 @@ export const Reflection: Plugin = async ({ client, directory }) => {
               .catch(() => {});
           }
           try {
-            await client.app.log({
-              body: {
-                service: "reflection",
-                level: "info",
-                message: "context projection reset",
-                extra: {
-                  ...result.diagnostic,
-                  estimatedTokens: result.estimatedTokens,
-                  thresholdTokens: result.thresholdTokens,
-                  hardLimitTokens: result.hardLimitTokens,
-                  contextLimit: limits.contextLimit,
+            const request = requestSignal(undefined, SDK_REQUEST_TIMEOUT_MS);
+            try {
+              await client.app.log({
+                body: {
+                  service: "reflection",
+                  level: "info",
+                  message: "context projection reset",
+                  extra: {
+                    ...result.diagnostic,
+                    estimatedTokens: result.estimatedTokens,
+                    thresholdTokens: result.thresholdTokens,
+                    hardLimitTokens: result.hardLimitTokens,
+                    contextLimit: limits.contextLimit,
+                  },
                 },
-              },
-            });
+                signal: request.signal,
+              });
+            } finally {
+              request.dispose();
+            }
           } catch {}
         }
       } catch (error) {

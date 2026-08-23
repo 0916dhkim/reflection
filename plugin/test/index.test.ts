@@ -914,9 +914,10 @@ describe("Reflection plugin hooks", () => {
       },
     ];
     const client = clientFor(activeMessages);
-    client.session.list.mockResolvedValue({
-      data: [{ id: inactiveSessionId, time: { updated: 0 } }],
-    });
+    let listedRevision = 0;
+    client.session.list.mockImplementation(async () => ({
+      data: [{ id: inactiveSessionId, time: { updated: listedRevision } }],
+    }));
     client.session.messages.mockImplementation(async (input) => ({
       data:
         input?.path.id === inactiveSessionId
@@ -939,7 +940,15 @@ describe("Reflection plugin hooks", () => {
     } as never;
 
     await hooks.event?.(idle);
+    await vi.waitFor(() =>
+      expect(
+        submittedBodies.filter((body) => body.session_id === inactiveSessionId),
+      ).toHaveLength(1),
+    );
     await hooks.event?.(idle);
+    await vi.waitFor(() =>
+      expect(client.session.list).toHaveBeenCalledTimes(2),
+    );
     expect(
       submittedBodies.filter((body) => body.session_id === inactiveSessionId),
     ).toHaveLength(1);
@@ -950,7 +959,13 @@ describe("Reflection plugin hooks", () => {
         { type: "text", text: " updated" },
       ];
     }
+    listedRevision = 1;
     await hooks.event?.(idle);
+    await vi.waitFor(() =>
+      expect(
+        submittedBodies.filter((body) => body.session_id === inactiveSessionId),
+      ).toHaveLength(2),
+    );
     const inactiveBodies = submittedBodies.filter(
       (body) => body.session_id === inactiveSessionId,
     );
@@ -1069,6 +1084,11 @@ describe("Reflection plugin hooks", () => {
     currentUpdated = Date.now();
     releaseInactiveMessages?.();
     await idle;
+    await vi.waitFor(() =>
+      expect(
+        submittedBodies.filter((body) => body.session_id === inactiveSessionId),
+      ).toHaveLength(1),
+    );
 
     const inactiveBodies = submittedBodies.filter(
       (body) => body.session_id === inactiveSessionId,
@@ -1083,10 +1103,13 @@ describe("Reflection plugin hooks", () => {
       }),
     );
     expect(client.session.status).toHaveBeenCalledTimes(4);
-    expect(client.session.get).toHaveBeenCalledWith({
-      path: { id: inactiveSessionId },
-      query: { directory: "/tmp" },
-    });
+    expect(client.session.get).toHaveBeenCalledWith(
+      expect.objectContaining({
+        path: { id: inactiveSessionId },
+        query: { directory: "/tmp" },
+        signal: expect.any(AbortSignal),
+      }),
+    );
   });
 
   it("retries an inactive open failure without blocking closed projection", async () => {
@@ -1167,12 +1190,14 @@ describe("Reflection plugin hooks", () => {
         properties: { sessionID: activeSessionId },
       },
     } as never);
+    await vi.waitFor(() => expect(openAttempts).toBe(1));
     await hooks.event?.({
       event: {
         type: "session.idle",
         properties: { sessionID: activeSessionId },
       },
     } as never);
+    await vi.waitFor(() => expect(openAttempts).toBe(2));
     const output = { messages: structuredClone(inactiveMessages) };
 
     await hooks["experimental.chat.messages.transform"]?.({}, output as never);
@@ -1604,6 +1629,101 @@ describe("Reflection plugin hooks", () => {
     expect(submittedSessions).not.toContain(deletedSessionId);
   });
 
+  it("bounds each inactive sweep instead of scanning every unchanged session", async () => {
+    const activeSessionId = "bounded-sweep-active";
+    const inactiveIds = Array.from(
+      { length: 100 },
+      (_, index) => `bounded-sweep-${index}`,
+    );
+    const activeMessages = projectionMessages(activeSessionId);
+    const client = clientFor(activeMessages);
+    client.session.list.mockResolvedValue({
+      data: inactiveIds.map((id) => ({ id, time: { updated: 0 } })),
+    });
+    client.session.messages.mockImplementation(async (input) => {
+      const id = input?.path.id ?? activeSessionId;
+      return { data: projectionMessages(id) };
+    });
+    const postedInactiveSessions = new Set<string>();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+        if (init?.method === "POST") {
+          const sessionId = JSON.parse(String(init.body)).session_id as string;
+          if (sessionId !== activeSessionId) {
+            postedInactiveSessions.add(sessionId);
+          }
+        }
+        return emptyListing(url);
+      }),
+    );
+    const hooks = await Reflection(pluginInput(client));
+    const idle = {
+      event: {
+        type: "session.idle",
+        properties: { sessionID: activeSessionId },
+      },
+    } as never;
+
+    await hooks.event?.(idle);
+    await vi.waitFor(() => expect(postedInactiveSessions.size).toBe(20));
+    await hooks.event?.(idle);
+    await vi.waitFor(() => expect(postedInactiveSessions.size).toBe(40));
+
+    const loadedInactiveSessions = new Set(
+      client.session.messages.mock.calls
+        .map(([input]) => input?.path.id)
+        .filter((id): id is string => Boolean(id && id !== activeSessionId)),
+    );
+    expect(loadedInactiveSessions.size).toBe(40);
+  });
+
+  it("detaches and cancels a blocked inactive history read", async () => {
+    const activeSessionId = "detached-sweep-active";
+    const inactiveSessionId = "detached-sweep-inactive";
+    const activeMessages = projectionMessages(activeSessionId);
+    const client = clientFor(activeMessages);
+    client.session.list.mockResolvedValue({
+      data: [{ id: inactiveSessionId, time: { updated: 0 } }],
+    });
+    let inactiveSignal: AbortSignal | undefined;
+    client.session.messages.mockImplementation(async (input) => {
+      if (input?.path.id !== inactiveSessionId) {
+        return { data: activeMessages };
+      }
+      inactiveSignal = (input as { signal?: AbortSignal }).signal;
+      return new Promise<{ data: OpenCodeMessage[] }>((_resolve, reject) => {
+        inactiveSignal?.addEventListener(
+          "abort",
+          () => reject(inactiveSignal?.reason),
+          { once: true },
+        );
+      });
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string | URL | Request) => emptyListing(url)),
+    );
+    const hooks = await Reflection(pluginInput(client));
+
+    const idle = hooks.event?.({
+      event: {
+        type: "session.idle",
+        properties: { sessionID: activeSessionId },
+      },
+    } as never);
+    await vi.waitFor(() => expect(inactiveSignal).toBeDefined());
+    await expect(idle).resolves.toBeUndefined();
+
+    await hooks.event?.({
+      event: {
+        type: "session.deleted",
+        properties: { info: { id: inactiveSessionId } },
+      },
+    } as never);
+    await vi.waitFor(() => expect(inactiveSignal?.aborted).toBe(true));
+  });
+
   it("rejects a transform that starts after the session was deleted", async () => {
     const sessionId = "deleted-transform-session";
     const messages = projectionMessages(sessionId);
@@ -1928,11 +2048,14 @@ describe("Reflection plugin hooks", () => {
 
     expect(targetPosts).toBe(1);
     expect(summaryGets).toBe(2);
-    expect(client.session.messages).toHaveBeenCalledWith({
-      path: { id: sessionId },
-      query: { directory: "/tmp" },
-      throwOnError: true,
-    });
+    expect(client.session.messages).toHaveBeenCalledWith(
+      expect.objectContaining({
+        path: { id: sessionId },
+        query: { directory: "/tmp" },
+        signal: expect.any(AbortSignal),
+        throwOnError: true,
+      }),
+    );
   });
 
   it("does not transfer a failure to unrelated history reusing a user ID", async () => {
@@ -2210,9 +2333,10 @@ describe("Reflection plugin hooks", () => {
         service: "reflection",
         level: "warn",
         message: expect.stringContaining(
-          "idle hook failed: Error: list failed",
+          "inactive-session sweep failed: list failed",
         ),
       },
+      signal: expect.any(AbortSignal),
     });
   });
 

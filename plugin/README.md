@@ -53,7 +53,7 @@ Tool calls and reasoning do not appear in hydrated/extracted text, but their com
 
 ## Canonical ingestion
 
-The plugin reacts to `session.idle` and idle `session.status` events. It serializes target updates per session, checks idle status before and after capture, and coalesces event bursts. Active sessions submit closed spans only. A sweep may snapshot another session's open span after ten minutes of inactivity, but it rechecks current session metadata before doing so. An open v2 span is eligible only when its exact endpoint is a finite-completed assistant; a user or unfinished-assistant endpoint remains mutable and raw.
+The plugin reacts to `session.idle` and idle `session.status` events. It serializes target updates per session, checks idle status before and after capture, and coalesces event bursts. Active sessions submit closed spans only. A detached sweep may snapshot open spans from at most 20 other sessions after ten minutes of inactivity; unchanged revisions are cached for ten minutes, and current session metadata is rechecked before submission. SDK reads use cancellation signals and 30-second deadlines. An open v2 span is eligible only when its exact endpoint is a finite-completed assistant; a user or unfinished-assistant endpoint remains mutable and raw.
 
 A canonical turn is one normal user message plus every model-visible assistant message whose `parentID` names that user message. Unanswered users and intermediate assistants remain source. Native compaction markers and exact Reflection projection-loss control messages are excluded as boundaries. Warning-like ordinary user messages without the exact marker remain source.
 
