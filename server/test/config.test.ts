@@ -84,22 +84,26 @@ describe("loadSettings", () => {
     });
   });
 
-  test("matches Pydantic's case-insensitive environment and special numeric values", () => {
+  test("supports case-insensitive environment and PostgreSQL-sized lock IDs", () => {
     const settings = loadSettings(
       requiredEnv({
         reflection_api_key: "lowercase-key",
-        worker_poll_seconds: "NaN",
-        request_timeout_seconds: "inf",
-        model_call_timeout_seconds: "-Infinity",
         worker_lock_id: "90071992547409930",
       }),
     );
 
     expect(settings.reflectionApiKey).toBe("lowercase-key");
-    expect(Number.isNaN(settings.workerPollSeconds)).toBe(true);
-    expect(settings.requestTimeoutSeconds).toBe(Number.POSITIVE_INFINITY);
-    expect(settings.modelCallTimeoutSeconds).toBe(Number.NEGATIVE_INFINITY);
     expect(settings.workerLockId).toBe("90071992547409930");
+  });
+
+  test.each([
+    ["WORKER_POLL_SECONDS", "NaN"],
+    ["REQUEST_TIMEOUT_SECONDS", "inf"],
+    ["MODEL_CALL_TIMEOUT_SECONDS", "-Infinity"],
+  ])("rejects non-finite %s", (name, value) => {
+    expect(() => loadSettings(requiredEnv({ [name]: value }))).toThrow(
+      `${name} must be a finite number`,
+    );
   });
 
   test.each([
@@ -147,6 +151,26 @@ describe("loadSettings", () => {
     [
       { WORKER_RETRY_BACKOFF_SECONDS: "-0.1" },
       "worker_retry_backoff_seconds cannot be negative",
+    ],
+    [
+      { DATABASE_POOL_MIN_SIZE: "-1" },
+      "database_pool_min_size must be between 0 and database_pool_max_size",
+    ],
+    [
+      { DATABASE_POOL_MIN_SIZE: "9", DATABASE_POOL_MAX_SIZE: "8" },
+      "database_pool_min_size must be between 0 and database_pool_max_size",
+    ],
+    [
+      { WORKER_POLL_SECONDS: "0" },
+      "worker_poll_seconds must be greater than 0",
+    ],
+    [
+      { REQUEST_TIMEOUT_SECONDS: "2147483.648" },
+      "request_timeout_seconds must be greater than 0",
+    ],
+    [
+      { MODEL_CALL_TIMEOUT_SECONDS: "-1" },
+      "model_call_timeout_seconds must be greater than 0",
     ],
     [
       { EXTRACTION_REASONING_EFFORT: "extreme" },

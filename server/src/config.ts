@@ -46,6 +46,7 @@ const REASONING_EFFORTS = new Set<ReasoningEffort>([
   "high",
   "xhigh",
 ]);
+const MAX_TIMER_SECONDS = 2_147_483_647 / 1000;
 
 function loadLocalEnvFile(): void {
   try {
@@ -127,25 +128,19 @@ function decimal(
   if (raw.trim().length === 0) {
     throw new SettingsValidationError(`${name} must be a number`);
   }
-  const normalized = raw.trim().toLowerCase();
-  const special: Readonly<Record<string, number>> = {
-    nan: Number.NaN,
-    "+nan": Number.NaN,
-    "-nan": Number.NaN,
-    inf: Number.POSITIVE_INFINITY,
-    "+inf": Number.POSITIVE_INFINITY,
-    infinity: Number.POSITIVE_INFINITY,
-    "+infinity": Number.POSITIVE_INFINITY,
-    "-inf": Number.NEGATIVE_INFINITY,
-    "-infinity": Number.NEGATIVE_INFINITY,
-  };
-  const value = special[normalized] ?? Number(raw);
-  if (Number.isNaN(value)) {
-    if (!(normalized in special)) {
-      throw new SettingsValidationError(`${name} must be a number`);
-    }
+  const value = Number(raw);
+  if (!Number.isFinite(value)) {
+    throw new SettingsValidationError(`${name} must be a finite number`);
   }
   return value;
+}
+
+function validateTimerSeconds(name: string, value: number): void {
+  if (value <= 0 || value > MAX_TIMER_SECONDS) {
+    throw new SettingsValidationError(
+      `${name} must be greater than 0 and at most ${MAX_TIMER_SECONDS}`,
+    );
+  }
 }
 
 function boolean(
@@ -222,17 +217,30 @@ export function loadSettings(env: NodeJS.ProcessEnv = process.env): Settings {
   const resolutionProvider = env.RESOLUTION_PROVIDER ?? "openai";
   const resolutionNativeSchema = boolean(env, "RESOLUTION_NATIVE_SCHEMA", true);
   const embeddingDimensions = integer(env, "EMBEDDING_DIMENSIONS", 1024);
+  const databasePoolMinSize = integer(env, "DATABASE_POOL_MIN_SIZE", 1);
   const databasePoolMaxSize = integer(env, "DATABASE_POOL_MAX_SIZE", 8);
+  const workerPollSeconds = decimal(env, "WORKER_POLL_SECONDS", 1);
   const workerMaxAttempts = integer(env, "WORKER_MAX_ATTEMPTS", 3);
   const workerRetryBackoffSeconds = decimal(
     env,
     "WORKER_RETRY_BACKOFF_SECONDS",
     2,
   );
+  const requestTimeoutSeconds = decimal(env, "REQUEST_TIMEOUT_SECONDS", 120);
+  const modelCallTimeoutSeconds = decimal(
+    env,
+    "MODEL_CALL_TIMEOUT_SECONDS",
+    180,
+  );
 
   if (databasePoolMaxSize < 2) {
     throw new SettingsValidationError(
       "database_pool_max_size must be at least 2",
+    );
+  }
+  if (databasePoolMinSize < 0 || databasePoolMinSize > databasePoolMaxSize) {
+    throw new SettingsValidationError(
+      "database_pool_min_size must be between 0 and database_pool_max_size",
     );
   }
   if (embeddingDimensions !== 1024) {
@@ -248,6 +256,9 @@ export function loadSettings(env: NodeJS.ProcessEnv = process.env): Settings {
       "worker_retry_backoff_seconds cannot be negative",
     );
   }
+  validateTimerSeconds("worker_poll_seconds", workerPollSeconds);
+  validateTimerSeconds("request_timeout_seconds", requestTimeoutSeconds);
+  validateTimerSeconds("model_call_timeout_seconds", modelCallTimeoutSeconds);
 
   validateModelRoute(
     "extraction",
@@ -289,9 +300,9 @@ export function loadSettings(env: NodeJS.ProcessEnv = process.env): Settings {
     resolutionNativeSchema,
     embeddingModel: env.EMBEDDING_MODEL ?? "voyage-4-large",
     embeddingDimensions,
-    databasePoolMinSize: integer(env, "DATABASE_POOL_MIN_SIZE", 1),
+    databasePoolMinSize,
     databasePoolMaxSize,
-    workerPollSeconds: decimal(env, "WORKER_POLL_SECONDS", 1),
+    workerPollSeconds,
     workerMaxAttempts,
     workerRetryBackoffSeconds,
     workerLockId: postgresBigInt(env, "WORKER_LOCK_ID", 7_320_260_818_001),
@@ -300,8 +311,8 @@ export function loadSettings(env: NodeJS.ProcessEnv = process.env): Settings {
       "MIGRATION_LOCK_ID",
       7_320_260_818_002,
     ),
-    requestTimeoutSeconds: decimal(env, "REQUEST_TIMEOUT_SECONDS", 120),
-    modelCallTimeoutSeconds: decimal(env, "MODEL_CALL_TIMEOUT_SECONDS", 180),
+    requestTimeoutSeconds,
+    modelCallTimeoutSeconds,
     migrationsDir: env.MIGRATIONS_DIR ?? "migrations",
     logLevel: env.LOG_LEVEL ?? "INFO",
   };
