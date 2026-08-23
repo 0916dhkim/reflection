@@ -183,6 +183,20 @@ function codePointLength(value: string): number {
   return [...value].length;
 }
 
+function parseRequestContract<T>(
+  parser: (value: unknown) => T,
+  value: unknown,
+): T {
+  try {
+    return parser(value);
+  } catch (error) {
+    if (error instanceof ContractValidationError) {
+      throw new RequestValidationError(contractIssues(error));
+    }
+    throw error;
+  }
+}
+
 function parseSegmentBody(value: unknown): SegmentCreate {
   if (typeof value === "object" && value !== null && "messages" in value) {
     const messages = (value as { messages?: unknown }).messages;
@@ -211,7 +225,7 @@ function parseSegmentBody(value: unknown): SegmentCreate {
       }
     }
   }
-  return parseSegmentCreate(value);
+  return parseRequestContract(parseSegmentCreate, value);
 }
 
 function jsonPointerPath(value: string): ValidationLocation[] {
@@ -444,7 +458,10 @@ function registerRoutes(
             response: { 200: SearchResponseSchema },
           },
           preValidation: async (request) => {
-            request.body = parseSearchRequest(request.body);
+            request.body = parseRequestContract(
+              parseSearchRequest,
+              request.body,
+            );
           },
         },
         async (request) => {
@@ -465,11 +482,6 @@ function registerErrorHandling(app: FastifyInstance): void {
     }
     if (error instanceof RequestValidationError) {
       return reply.code(422).send(validationBody(error.context, error.issues));
-    }
-    if (error instanceof ContractValidationError) {
-      return reply
-        .code(422)
-        .send(validationBody("body", contractIssues(error)));
     }
     if (error.validation !== undefined) {
       const context = error.validationContext === "params" ? "path" : "body";

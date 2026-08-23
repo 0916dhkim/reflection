@@ -1,9 +1,10 @@
 import { randomUUID } from "node:crypto";
 
-import type {
-  JobResponse,
-  SegmentResponse,
-  SegmentSummary,
+import {
+  parseSegmentResponse,
+  type JobResponse,
+  type SegmentResponse,
+  type SegmentSummary,
 } from "@reflection/shared/contracts";
 import { afterEach, describe, expect, test, vi } from "vitest";
 
@@ -484,6 +485,23 @@ describe("jobs and committed segments", () => {
     expect(found.json()).toEqual(segment);
     expect(missing.json()).toEqual({ detail: "segment not found" });
     expect(invalid.statusCode).toBe(422);
+  });
+
+  test("reports invalid persisted response data as an internal error", async () => {
+    const segmentId = randomUUID();
+    const getSegment = vi.fn<AppDatabase["getSegment"]>(async () =>
+      parseSegmentResponse({}),
+    );
+    const { app } = appWith(dependencies({ database: { getSegment } }));
+
+    const response = await app.inject({
+      method: "GET",
+      url: `/v1/segments/${segmentId}`,
+      headers: API_HEADERS,
+    });
+
+    expect(response.statusCode).toBe(500);
+    expect(response.body).toBe("Internal Server Error");
   });
 
   test("returns ordered session summary metadata", async () => {
