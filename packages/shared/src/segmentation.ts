@@ -738,13 +738,6 @@ function resolveV2Boundaries(
     if (startOffset < 0 || endOffset < 0 || startOffset > endOffset) {
       throw new Error("V2 source boundary does not match its user turn");
     }
-    const endMessage = turn.messages[endOffset]?.message;
-    if (
-      !turn.closed &&
-      (!endMessage || !isCompletedAssistantMessage(endMessage))
-    ) {
-      return [];
-    }
     return [
       {
         boundary: current,
@@ -879,11 +872,16 @@ function fragmentTurn(
       true,
       segments,
     );
+    const sourceMessages = turn.messages.slice(
+      boundary.startOffset,
+      boundary.endOffset + 1,
+    );
     segments.push(
       makeV2Segment(
         turn,
-        turn.messages.slice(boundary.startOffset, boundary.endOffset + 1),
-        true,
+        sourceMessages,
+        turn.closed ||
+          isCompletedAssistantMessage(sourceMessages.at(-1)?.message),
       ),
     );
     cursor = boundary.endOffset + 1;

@@ -739,23 +739,40 @@ describe("segmentMessages", () => {
     ]);
   });
 
-  it("ignores mutable active V2 anchors without a completed assistant endpoint", () => {
+  it("quarantines mutable active V2 anchors without losing exact cursors", () => {
     const incomplete = assistant("a1", "u1", "working");
     incomplete.info.time = { created: 0, completed: Number.POSITIVE_INFINITY };
     const messages = [user("u1", "request"), incomplete];
 
-    for (const boundary of [
-      v2Boundary("u1", "u1", "u1"),
-      v2Boundary("u1", "u1", "a1"),
-    ]) {
-      expect(segmentMessages(messages, 100, [boundary])).toMatchObject([
-        {
-          sourceBoundaryVersion: 1,
-          sourceMessageIds: ["u1", "a1"],
-          closed: false,
-        },
-      ]);
-    }
+    const userBoundary = v2Boundary("u1", "u1", "u1");
+    expect(segmentMessages(messages, 100, [userBoundary])).toMatchObject([
+      {
+        sourceBoundaryVersion: 2,
+        sourceMessageIds: ["u1"],
+        closed: false,
+      },
+      {
+        sourceBoundaryVersion: 2,
+        sourceMessageIds: ["a1"],
+        closed: false,
+      },
+    ]);
+    expect(readSegmentMessages(messages, userBoundary)).toEqual([
+      { role: "user", text: "request" },
+    ]);
+
+    const incompleteBoundary = v2Boundary("u1", "u1", "a1");
+    expect(segmentMessages(messages, 100, [incompleteBoundary])).toMatchObject([
+      {
+        sourceBoundaryVersion: 2,
+        sourceMessageIds: ["u1", "a1"],
+        closed: false,
+      },
+    ]);
+    expect(readSegmentMessages(messages, incompleteBoundary)).toEqual([
+      { role: "user", text: "request" },
+      { role: "assistant", text: "working" },
+    ]);
 
     const completed = assistant("a2", "u1", "done");
     expect(
