@@ -399,10 +399,12 @@ function sanitizeModelValue(value: unknown, depth = 0): unknown {
   }
   if (typeof value !== "object" || value === null) return value;
   return Object.fromEntries(
-    Object.entries(value).map(([key, item], index) => [
-      containsDataUrl(key) ? `[data URL key omitted ${index}]` : key,
-      sanitizeModelValue(item, depth + 1),
-    ]),
+    Object.entries(value)
+      .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
+      .map(([key, item], index) => [
+        containsDataUrl(key) ? `[data URL key omitted ${index}]` : key,
+        sanitizeModelValue(item, depth + 1),
+      ]),
   );
 }
 

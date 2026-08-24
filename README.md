@@ -36,7 +36,7 @@ Segment UUIDs use fixed UUIDv5 namespaces. Source fingerprints use SHA-256 over 
 
 `POST /v1/segments` validates and stores a canonical request, updates the latest desired target for that exact source span, and returns a durable job with `202`. Reposting an unchanged source fingerprint is idempotent. A changed source snapshot advances its generation and fences stale work.
 
-A PostgreSQL advisory lock elects one worker across all API replicas. Jobs are selected by `processing_priority` descending and then oldest desired target. Normal plugin ingestion and backfill use priority `0`; context projection foreground work uses priority `100`. Reposting the same exact source at a higher priority raises the retained target priority without changing its identity.
+A PostgreSQL advisory lock elects one worker across all API replicas. Jobs are selected by `processing_priority` descending and then oldest desired target. Backfill and inactive-session sweeps use priority `0`, active-session idle ingestion uses priority `50`, and blocking context projection uses priority `100`. Reposting the same exact source at a higher priority raises the retained target priority without changing its identity.
 
 The worker has two durable phases:
 
@@ -233,7 +233,7 @@ An authoritative dry run reads `manifest_version: 2`, validates deterministic ID
 
 The stop-first Node cutover and production canary are complete. The checklist remains the authoritative procedure for recreating or auditing that boundary; it is not a pending rollout plan.
 
-Migration `006_canonical_source_spans.sql` is a forward-only writer boundary. Migration `007_superseded_job_status.sql` exposes discarded extraction work as `superseded` instead of reporting false success. Use a stop-first deployment; never perform a rolling Python/Node or old/new plugin rollout.
+Migration `006_canonical_source_spans.sql` is a forward-only writer boundary. Migration `007_superseded_job_status.sql` exposes discarded extraction work as `superseded` instead of reporting false success. Use a stop-first deployment; never perform a rolling Python/Node or old/new plugin rollout. Any change to submitted source rendering or fingerprint framing is also a stop-first writer boundary even when its projection version is unchanged: stop backfill and every plugin writer, build both writers from the same revision, install them together, and only then resume. Mixed source renderers can otherwise alternate fingerprints and target generations for the same span.
 
 1. Build and verify the Node server, `plugin/dist/reflection.js`, and `scripts/backfill.mjs` from the same revision.
 2. Stop the old backfill supervisor and confirm no backfill process remains.

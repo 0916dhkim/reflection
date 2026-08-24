@@ -674,7 +674,7 @@ describe("Reflection plugin hooks", () => {
     await Promise.all([firstIdle, secondIdle, projection]);
     expect(maxActivePosts).toBe(1);
     expect(submittedBodies.map((body) => body.processing_priority)).toEqual([
-      0, 100,
+      50, 100,
     ]);
     expect(summaryGets).toBe(4);
     expect(client.session.messages).toHaveBeenCalledTimes(3);
@@ -719,7 +719,7 @@ describe("Reflection plugin hooks", () => {
       source_boundary_version: 2,
       start_source_message_id: `${sessionId}-old-user`,
       end_source_message_id: `${sessionId}-old-assistant`,
-      processing_priority: 0,
+      processing_priority: 50,
     });
     expect(submittedBodies).not.toContainEqual(
       expect.objectContaining({
@@ -746,7 +746,7 @@ describe("Reflection plugin hooks", () => {
       source_boundary_version: 2,
       start_source_message_id: `${sessionId}-current`,
       end_source_message_id: `${sessionId}-current-assistant`,
-      processing_priority: 0,
+      processing_priority: 50,
     });
   });
 
@@ -888,7 +888,7 @@ describe("Reflection plugin hooks", () => {
     await hooks.event?.(idle);
     await hooks.event?.(idle);
     expect(posted).toHaveLength(2);
-    expect(posted.map((body) => body.processing_priority)).toEqual([0, 0]);
+    expect(posted.map((body) => body.processing_priority)).toEqual([50, 50]);
     expect(
       posted.map((body) =>
         segmentIdForRequest(body as Parameters<typeof segmentIdForRequest>[0]),
@@ -918,7 +918,7 @@ describe("Reflection plugin hooks", () => {
     ).toBe(segmentId(sessionId, siblings[1]!));
   });
 
-  it("promotes an idle submission once for foreground processing", async () => {
+  it("promotes an active-idle submission once for foreground processing", async () => {
     const sessionId = "priority-promotion-session";
     const messages = projectionMessages(sessionId);
     const client = clientFor(messages);
@@ -943,7 +943,7 @@ describe("Reflection plugin hooks", () => {
       messages: structuredClone(messages),
     } as never);
     expect(submittedBodies.map((body) => body.processing_priority)).toEqual([
-      0, 100,
+      50, 100,
     ]);
 
     rmSync(
@@ -962,7 +962,7 @@ describe("Reflection plugin hooks", () => {
     } as never);
 
     expect(submittedBodies.map((body) => body.processing_priority)).toEqual([
-      0, 100,
+      50, 100,
     ]);
   });
 
@@ -1036,7 +1036,7 @@ describe("Reflection plugin hooks", () => {
       segmentId(sessionId, removed),
       segmentId(sessionId, retained),
     ]);
-    expect(postedPriorities).toEqual([0, 0, 100]);
+    expect(postedPriorities).toEqual([50, 50, 100]);
     expect(output.messages[1]?.parts[0]?.text).toContain("Retained summary");
     expect(output.messages[1]?.parts[0]?.text).not.toContain(
       "Reflection summaries were unavailable",
@@ -1454,7 +1454,7 @@ describe("Reflection plugin hooks", () => {
     releaseMessages?.();
     await Promise.all([idle, projection]);
     expect(submittedBodies.map((body) => body.processing_priority)).toEqual([
-      0, 100,
+      50, 100,
     ]);
     expect(summaryGets).toBe(3);
   });
@@ -1533,7 +1533,7 @@ describe("Reflection plugin hooks", () => {
     await Promise.all([firstIdle, overlappingIdle, projection]);
     expect(client.session.messages).toHaveBeenCalledTimes(3);
     expect(submittedBodies.map((body) => body.processing_priority)).toEqual([
-      0, 0, 100, 100,
+      50, 50, 100, 100,
     ]);
     expect(submittedBodies.map((body) => body.start_user_message_id)).toEqual([
       `${sessionId}-old-user`,
@@ -1869,15 +1869,13 @@ describe("Reflection plugin hooks", () => {
       const id = input?.path.id ?? activeSessionId;
       return { data: projectionMessages(id) };
     });
-    const postedInactiveSessions = new Set<string>();
+    const postedPriorities = new Map<string, number>();
     vi.stubGlobal(
       "fetch",
       vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
         if (init?.method === "POST") {
-          const sessionId = JSON.parse(String(init.body)).session_id as string;
-          if (sessionId !== activeSessionId) {
-            postedInactiveSessions.add(sessionId);
-          }
+          const body = JSON.parse(String(init.body));
+          postedPriorities.set(body.session_id, body.processing_priority);
         }
         return emptyListing(url, init);
       }),
@@ -1891,9 +1889,15 @@ describe("Reflection plugin hooks", () => {
     } as never;
 
     await hooks.event?.(idle);
-    await vi.waitFor(() => expect(postedInactiveSessions.size).toBe(20));
+    await vi.waitFor(() => expect(postedPriorities.size).toBe(21));
+    expect(postedPriorities.get(activeSessionId)).toBe(50);
+    expect(
+      [...postedPriorities]
+        .filter(([sessionId]) => sessionId !== activeSessionId)
+        .every(([, priority]) => priority === 0),
+    ).toBe(true);
     await hooks.event?.(idle);
-    await vi.waitFor(() => expect(postedInactiveSessions.size).toBe(40));
+    await vi.waitFor(() => expect(postedPriorities.size).toBe(41));
 
     const loadedInactiveSessions = new Set(
       client.session.messages.mock.calls
@@ -2494,7 +2498,7 @@ describe("Reflection plugin hooks", () => {
     await hooks["experimental.chat.messages.transform"]?.({}, output as never);
 
     expect(submittedBodies.map((body) => body.processing_priority)).toEqual([
-      0, 0, 100,
+      50, 50, 100,
     ]);
     expect(submittedBodies.map((body) => body.start_user_message_id)).toEqual([
       failedSegmentKey,
@@ -2547,7 +2551,7 @@ describe("Reflection plugin hooks", () => {
     } as never);
 
     expect(submittedBodies.map((body) => body.processing_priority)).toEqual([
-      0, 0, 100,
+      50, 50, 100,
     ]);
     expect(summaryGets).toBe(5);
   });

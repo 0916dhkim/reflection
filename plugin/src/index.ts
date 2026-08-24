@@ -60,6 +60,9 @@ const SUMMARY_WAIT_TIMEOUT_MS = 90_000;
 const SUMMARY_POLL_INTERVAL_MS = 1_000;
 const PROJECTION_VERSION = 1;
 const DEFAULT_OUTPUT_TOKEN_MAX = 32_000;
+const BACKGROUND_PROCESSING_PRIORITY = 0;
+const ACTIVE_IDLE_PROCESSING_PRIORITY = 50;
+const FOREGROUND_PROCESSING_PRIORITY = 100;
 
 interface ReflectionConfig {
   url: string;
@@ -996,7 +999,7 @@ export const Reflection: Plugin = async ({ client, directory }) => {
         sessionId,
         segments,
         false,
-        100,
+        FOREGROUND_PROCESSING_PRIORITY,
         generation,
         null,
         parentSignal,
@@ -1005,6 +1008,7 @@ export const Reflection: Plugin = async ({ client, directory }) => {
 
   const ingestIdleSession = async (
     sessionId: string,
+    processingPriority: number,
     revalidateInactiveOpen = false,
     parentSignal: AbortSignal = lifecycleAbort.signal,
   ): Promise<IngestionResult> => {
@@ -1041,7 +1045,7 @@ export const Reflection: Plugin = async ({ client, directory }) => {
           sessionId,
           segments,
           includeOpenSegment,
-          0,
+          processingPriority,
           generation,
           messages,
           operation.signal,
@@ -1089,7 +1093,12 @@ export const Reflection: Plugin = async ({ client, directory }) => {
         continue;
       }
       try {
-        const result = await ingestIdleSession(candidate.id, true, signal);
+        const result = await ingestIdleSession(
+          candidate.id,
+          BACKGROUND_PROCESSING_PRIORITY,
+          true,
+          signal,
+        );
         if (
           result.messages === null ||
           result.observedSegmentKeys?.every((key) =>
@@ -1153,7 +1162,10 @@ export const Reflection: Plugin = async ({ client, directory }) => {
       do {
         state.dirty = false;
         try {
-          const result = await ingestIdleSession(sessionId);
+          const result = await ingestIdleSession(
+            sessionId,
+            ACTIVE_IDLE_PROCESSING_PRIORITY,
+          );
           shouldFinish ||= result.messages !== null;
         } catch (error) {
           if (lifecycleAbort.signal.aborted || deletedSessions.has(sessionId)) {

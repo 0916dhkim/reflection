@@ -160,6 +160,42 @@ describe("textOf", () => {
     );
   });
 
+  it("canonicalizes tool state object keys before fingerprinting", () => {
+    const segmentForState = (state: Record<string, unknown>) => {
+      const toolStep = assistant("a1", "u1");
+      toolStep.info.finish = "tool-calls";
+      toolStep.parts = [{ type: "tool", tool: "read", state }];
+      const segment = segmentMessages(
+        [user("u1", "inspect"), toolStep],
+        20_000,
+        [v2Boundary("u1", "a1", "a1")],
+      ).find((candidate) => candidate.startSourceMessageId === "a1");
+      if (!segment) throw new Error("missing tool-only segment");
+      return segment;
+    };
+    const persisted = segmentForState({
+      status: "completed",
+      input: { zeta: true, alpha: true },
+      output: "x".repeat(25_000),
+      metadata: { zeta: true, alpha: true },
+      title: "Read",
+      time: { completed: 2, started: 1 },
+    });
+    const decoded = segmentForState({
+      status: "completed",
+      input: { alpha: true, zeta: true },
+      output: "x".repeat(25_000),
+      title: "Read",
+      metadata: { alpha: true, zeta: true },
+      time: { started: 1, completed: 2 },
+    });
+
+    expect(persisted.messages).toEqual(decoded.messages);
+    expect(submissionSourceFingerprint("session", persisted)).toBe(
+      submissionSourceFingerprint("session", decoded),
+    );
+  });
+
   it("preserves text-only extraction payloads for mixed source messages", () => {
     const mixed = assistant("a1", "u1", "visible answer");
     mixed.parts = [
