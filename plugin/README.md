@@ -73,6 +73,8 @@ The server stages extraction output before entity resolution. Once the exact tar
 
 When enabled, the plugin sets OpenCode `compaction.auto` to `false`. It starts considering projection near 75% of usable model input, accounting for the active model's output reservation, and chooses a whole canonical span boundary that leaves a raw tail near 25% of context. It may reset again near the 90% hard input boundary during a long assistant/tool loop or after switching to a smaller model.
 
+The request estimate covers the message payload visible to the transform plus a conservative reserve. The hook runs before OpenCode assembles final instruction files, MCP content, tool schemas, later plugin transforms, and provider-specific rewrites, so the estimate is not an absolute bound on the final provider request. A hard bound requires an OpenCode seam that exposes the assembled request before dispatch.
+
 Projection replaces only the archived prefix with a synthetic compaction user/assistant pair. The retained raw tail is immutable. Its first message ID and generated summary are persisted as a mode-`0600` checkpoint under `~/.local/state/reflection/projection/` and reused across ordinary loops for provider-cache stability. A checkpoint is discarded only when its referenced local messages no longer match or a later safe reset replaces more of the prefix.
 
 On an actual reset, the transform performs this bounded sequence:

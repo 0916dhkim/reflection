@@ -2,7 +2,7 @@
 
 Reflection is an authenticated memory service that turns bounded OpenCode conversation ranges into durable, entity-resolved claims and recalls those claims with vector and graph search. The active implementation is a Node.js 24 pnpm monorepo with a Fastify server, PostgreSQL 17, and pgvector.
 
-> Migration status: production still runs the Python revision `aa83637`. The Python package, tests, and packaging files remain in this repository only as a temporary rollback baseline until the Node production canary passes. Do not delete them yet, and do not run the Python server or any old plugin/backfill writer against a database after v2 source-span rows have been written.
+> Production runs the Node.js/Fastify implementation. The TypeScript cutover and canary are complete, and production was healthy at revision `697b42a` on 2026-08-24. The Python package, tests, and packaging files remain only as a rollback baseline pending an explicit deletion decision. Never run the old Python server or old plugin/backfill writers against a database containing v2 source-span rows.
 
 ## Monorepo layout
 
@@ -18,6 +18,8 @@ Reflection is an authenticated memory service that turns bounded OpenCode conver
 ## Source-span contracts
 
 `source_boundary_version` describes source coverage. It is separate from `projection_version`, which describes summary projection safety.
+
+`projection_version: 1` is the ordinary text projection contract. Version `2` identifies the bounded sanitized tool fallback used when a span has no ordinary text; it is an application compatibility fence stored in the existing integer column, not a new source-boundary or SQL migration version. Once a span has a persisted version-2 anchor, rebuilt snapshots remain version 2 even if ordinary text later appears.
 
 | Contract | Identity and coverage                                                                                                                                                                                                                                                                         |
 | -------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -38,7 +40,7 @@ A PostgreSQL advisory lock elects one worker across all API replicas. Jobs are s
 
 The worker has two durable phases:
 
-1. Extraction produces a bounded summary and proposed claims. The result and a projection commit fingerprint are staged on the exact desired target.
+1. Extraction produces a trimmed, nonempty summary of at most 1,000 characters and proposed claims. The result and a projection commit fingerprint are staged on the exact desired target. Legacy empty committed summaries remain readable so backfill can replace them safely.
 2. Source-aware claim triage, entity resolution, and embeddings complete. One transaction commits the segment, resolved claims, entities, aliases, successful job state, and payload cleanup.
 
 A staged summary can therefore appear in the session manifest while its job is still `running`. This is intentional so a foreground context transform can use the exact summary without waiting for entity resolution. A staged summary does not mean claims are available or the job succeeded. Use `GET /v1/jobs/{id}` for full job state; `GET /v1/segments/{id}` exposes only fully committed summaries and resolved claims.
@@ -99,6 +101,8 @@ Recall embeds the query, ranks direct claim matches, expands through resolved su
 Context projection is disabled by default. When enabled, the plugin disables OpenCode native automatic compaction and replaces only an old model-visible prefix with a synthetic summary pair. OpenCode SQLite history is never rewritten. The retained raw tail is immutable: a checkpoint records its starting message and is reused without editing or regenerating that tail during ordinary assistant/tool loops.
 
 Projection begins near 75% of usable model input and targets a raw tail near 25% of model context. Before a reset, the transform computes the canonical local spans, submits all required closed spans at foreground priority `100`, and waits up to 90 seconds for exact summaries. Extraction staging lets summaries become eligible before claim resolution finishes. If synchronization, polling, or summary coverage is still incomplete at the deadline, the transform keeps every available exact summary and produces an explicitly marked lossy fallback. Missing summaries never authorize a mismatched boundary. Projection fails only when no safe message-aligned retained tail can fit.
+
+Request-pressure accounting is necessarily approximate. OpenCode's message-transform hook runs before OpenCode adds final instruction files, MCP content, resolved tool schemas, later plugin transforms, and provider-specific rewrites. Reflection measures the message payload available at the hook and reserves additional capacity, but it cannot enforce an absolute final-request bound without a new OpenCode seam that exposes the assembled provider request.
 
 Manual `/compact` remains available and bypasses the Reflection transform. If a native/manual compaction already exists, its summary is inherited as prior context; native compaction markers are not ingested as user boundaries, and compacted tool output is not resurrected.
 
@@ -205,7 +209,7 @@ install -d ~/.config/opencode/plugins
 install -m 0644 plugin/dist/reflection.js ~/.config/opencode/plugins/reflection.js
 ```
 
-The copied bundle is self-contained and does not depend on this checkout or its `node_modules`. Restart OpenCode after replacing it. During the production cutover, do not start OpenCode with this bundle until the v2-capable server is healthy.
+The copied bundle is self-contained and does not depend on this checkout or its `node_modules`. Restart OpenCode after replacing it. Before installing a writer from a newer contract revision, require the server to advertise support for that revision and remain healthy.
 
 ## Backfill
 
@@ -225,7 +229,9 @@ Runs with failures return nonzero and retain LaunchAgent supervision. After revi
 
 An authoritative dry run reads `manifest_version: 2`, validates deterministic IDs, and reports eligible, stale, pending, conflicting, and new spans without writing local state or server targets.
 
-## Production cutover
+## Production cutover and rollback
+
+The stop-first Node cutover and production canary are complete. The checklist remains the authoritative procedure for recreating or auditing that boundary; it is not a pending rollout plan.
 
 Migration `006_canonical_source_spans.sql` is a forward-only writer boundary. Migration `007_superseded_job_status.sql` exposes discarded extraction work as `superseded` instead of reporting false success. Use a stop-first deployment; never perform a rolling Python/Node or old/new plugin rollout.
 
@@ -249,4 +255,4 @@ cmp /tmp/reflection-dry-run-1.json /tmp/reflection-dry-run-2.json
 
 Once any v2 row exists, old Python, plugin, and backfill binaries cannot safely write to that database. If the Node deployment fails after migration, keep all writers stopped and either fix forward with v2-capable code or restore the pre-migration backup as a coordinated full rollback before starting `aa83637`. Starting only the old binary against the migrated database is not a rollback.
 
-After the Node production canary passes and the rollback window closes, remove the Python rollback files in a separate change. Until then, their presence is intentional.
+The Node production canary has passed. Removing the Python rollback files remains a separate explicit decision; until then, their presence is intentional.
