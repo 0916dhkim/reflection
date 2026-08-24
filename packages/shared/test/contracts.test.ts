@@ -49,6 +49,7 @@ describe("public contracts", () => {
         source_boundary_version: 2,
         start_source_message_id: " user ",
         end_source_message_id: " assistant ",
+        projection_version: 2,
         processing_priority: 100,
         messages: [{ role: "user", text: "source" }],
       }),
@@ -59,6 +60,7 @@ describe("public contracts", () => {
       source_boundary_version: 2,
       start_source_message_id: "user",
       end_source_message_id: "assistant",
+      projection_version: 2,
       processing_priority: 100,
     });
 
@@ -96,6 +98,7 @@ describe("public contracts", () => {
       { ...base, processing_priority: -1 },
       { ...base, processing_priority: 101 },
       { ...base, processing_priority: 1.5 },
+      { ...base, projection_version: 3 },
     ]) {
       expect(() => parseSegmentCreate(malformed)).toThrow(
         ContractValidationError,
@@ -191,6 +194,7 @@ describe("response contracts", () => {
       updated_at: "updated",
     } as const;
     expect(parseSegmentResponse(segment)).toEqual(segment);
+    expect(parseSegmentResponse({ ...segment, summary: "" }).summary).toBe("");
     expect(() =>
       parseSegmentResponse({
         ...segment,
@@ -291,6 +295,7 @@ describe("model contracts", () => {
       ],
     } as const;
     expect(parseExtractionResult(result)).toEqual(result);
+    expect(parseExtractionResult({ summary: "", claims: [] }).summary).toBe("");
     for (const malformedClaim of [
       { ...result.claims[0], object_value: "also literal" },
       { ...result.claims[0], object_entity: null },
@@ -341,6 +346,11 @@ describe("model contracts", () => {
         },
       ],
     });
+    for (const summary of ["", " \n "]) {
+      expect(() => parseExtractionWireResult({ summary, claims: [] })).toThrow(
+        ContractValidationError,
+      );
+    }
   });
 
   it("enforces claim action and reason agreement", () => {

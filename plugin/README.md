@@ -49,7 +49,7 @@ Every request sends `apiKey` as `X-Api-Key`. Context projection is experimental 
 
 Hydration is local and fails closed if the session history no longer exists. A v1 segment hydrates complete turns between its inclusive user boundaries. A v2 segment resolves its inclusive `start_source_message_id` and `end_source_message_id` within one user turn and returns exactly that intra-turn span. Missing, duplicate, reordered, or cross-turn v2 cursors are errors rather than a reason to widen the read to a whole turn.
 
-Tool calls and reasoning do not appear in hydrated/extracted text, but their complete model-visible representation contributes to segmentation weight. File parts become bounded filename and MIME markers. Empty model-visible messages remain in the submitted source with an empty `text` value.
+Tool calls normally do not appear in hydrated/extracted text, but their complete model-visible representation contributes to segmentation weight. When every ordinary source message in a segment is blank, extraction receives up to 20,000 characters of sanitized tool names and state instead. This fallback omits reasoning, inline `data:` values, and compacted tool output. File parts become bounded filename and MIME markers. Empty model-visible messages remain in the submitted source with an empty `text` value.
 
 ## Canonical ingestion
 
@@ -61,7 +61,7 @@ The shared segmenter targets 20,000 model-visible weighted characters. Weight in
 
 Before segmenting uncovered history, the plugin validates `manifest_version: 2`, deterministic IDs, exact cursors, and fingerprints, then selects a deterministic maximum-coverage non-overlapping set from committed boundaries and current targets. Any turn containing a valid v2 anchor remains fragmented into v2 siblings; uncovered source before or after that anchor cannot become a whole-turn v1 follow-up.
 
-Every submission includes an explicit source boundary, `projection_version: 1`, a deterministic versioned source fingerprint, and a processing priority. Normal idle ingestion uses priority `0`. A successful in-process fingerprint cache suppresses unchanged replays, but authoritative manifest fingerprints invalidate that cache if another writer changes a target. Service idempotency makes a process-restart replay safe.
+Every submission includes an explicit source boundary, a deterministic versioned source fingerprint, and a processing priority. Ordinary text defaults to `projection_version: 1`; tool-fallback sources use version `2`, which prevents an older writer from replacing the sanitized payload after rollout. A persisted version-2 anchor remains version 2 when rebuilt, even if its current source includes ordinary text. Normal idle ingestion uses priority `0`. A successful in-process fingerprint cache suppresses unchanged replays, but authoritative manifest fingerprints invalidate that cache if another writer changes a target. Service idempotency makes a process-restart replay safe.
 
 ## Staged summaries and foreground priority
 

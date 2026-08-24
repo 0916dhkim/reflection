@@ -580,14 +580,14 @@ describe.sequential("Database PostgreSQL integration", () => {
         });
         const pendingLegacy = await database.enqueue(pendingUpgradeRequest);
         const pendingSafe = await database.enqueue(
-          updateRequest(pendingUpgradeRequest, { projection_version: 1 }),
+          updateRequest(pendingUpgradeRequest, { projection_version: 2 }),
         );
         expect(pendingSafe.id).toBe(pendingLegacy.id);
-        expect(pendingSafe.projection_version).toBe(1);
+        expect(pendingSafe.projection_version).toBe(2);
         const pendingDowngrade = await database.enqueue(
           updateRequest(pendingUpgradeRequest, {
             end_user_message_id: "pending-downgrade",
-            projection_version: 0,
+            projection_version: 1,
           }),
         );
         expect(pendingDowngrade.status).toBe("superseded");
@@ -597,7 +597,7 @@ describe.sequential("Database PostgreSQL integration", () => {
           ),
         );
         expect(pendingSafeClaim.id).toBe(pendingSafe.id);
-        expect(pendingSafeClaim.request.projection_version).toBe(1);
+        expect(pendingSafeClaim.request.projection_version).toBe(2);
         await completeResolution(
           database,
           pendingSafeClaim,

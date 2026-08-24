@@ -898,6 +898,36 @@ describe("strict manifest planning", () => {
 });
 
 describe("strict jobs and exact submissions", () => {
+  it("fences tool-only fallback payloads with projection version 2", () => {
+    const toolStep = assistant("a1", "u1", "");
+    toolStep.parts = [
+      {
+        type: "tool",
+        tool: "read",
+        state: { status: "completed", output: "result" },
+      },
+    ];
+    const segment = segmentMessages(
+      [user("u1", "request"), toolStep],
+      undefined,
+      [
+        {
+          startUserMessageId: "u1",
+          endUserMessageId: "u1",
+          sourceBoundaryVersion: 2,
+          startSourceMessageId: "a1",
+          endSourceMessageId: "a1",
+        },
+      ],
+    ).find((candidate) => candidate.startSourceMessageId === "a1");
+
+    expect(segment).toBeDefined();
+    expect(segmentSubmission(SESSION_ID, segment!)).toMatchObject({
+      projection_version: 2,
+      messages: [{ role: "assistant" }],
+    });
+  });
+
   it("uses the shared strict job parser", () => {
     const valid = jobFor(v1Submission());
     expect(validatedJob(valid)).toEqual(valid);

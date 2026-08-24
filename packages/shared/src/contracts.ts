@@ -106,7 +106,7 @@ const SegmentCreateInputProperties = {
   start_user_message_id: IdentifierSchema,
   end_user_message_id: IdentifierSchema,
   projection_version: Type.Optional(
-    Type.Union([Type.Literal(0), Type.Literal(1)]),
+    Type.Union([Type.Literal(0), Type.Literal(1), Type.Literal(2)]),
   ),
   processing_priority: Type.Optional(
     Type.Integer({ minimum: 0, maximum: 100 }),
@@ -132,7 +132,11 @@ const CanonicalSegmentCreateProperties = {
   session_id: IdentifierSchema,
   start_user_message_id: IdentifierSchema,
   end_user_message_id: IdentifierSchema,
-  projection_version: Type.Union([Type.Literal(0), Type.Literal(1)]),
+  projection_version: Type.Union([
+    Type.Literal(0),
+    Type.Literal(1),
+    Type.Literal(2),
+  ]),
   processing_priority: Type.Integer({ minimum: 0, maximum: 100 }),
   messages: Type.Array(SourceMessageSchema, {
     minItems: 1,
@@ -558,7 +562,7 @@ export type ExtractionWireClaim = Static<typeof ExtractionWireClaimSchema>;
 
 export const ExtractionWireResultSchema = Type.Object(
   {
-    summary: Type.String({ maxLength: 1000 }),
+    summary: Type.String({ minLength: 1, maxLength: 1000 }),
     claims: Type.Array(ExtractionWireClaimSchema, { maxItems: 25 }),
   },
   { additionalProperties: false },

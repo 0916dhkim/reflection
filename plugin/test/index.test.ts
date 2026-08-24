@@ -71,7 +71,7 @@ function segmentSummary(
     start_user_message_id: segment.startUserMessageId,
     end_user_message_id: segment.endUserMessageId,
     ...segmentWireBoundary(segment),
-    projection_version: 1,
+    projection_version: segment.projectionVersion ?? 1,
     summary,
   };
 }
@@ -86,7 +86,7 @@ function segmentBoundary(
     start_user_message_id: segment.startUserMessageId,
     end_user_message_id: segment.endUserMessageId,
     ...segmentWireBoundary(segment),
-    projection_version: 1,
+    projection_version: segment.projectionVersion ?? 1,
     source_eligible: true,
     source_fingerprint: sourceFingerprint,
   };
@@ -98,7 +98,7 @@ function segmentTarget(sessionId: string, segment: ReflectionSegment) {
     start_user_message_id: segment.startUserMessageId,
     end_user_message_id: segment.endUserMessageId,
     ...segmentWireBoundary(segment),
-    projection_version: 1,
+    projection_version: segment.projectionVersion ?? 1,
     status: "running",
     source_fingerprint: submissionSourceFingerprint(sessionId, segment),
   };
@@ -748,6 +748,77 @@ describe("Reflection plugin hooks", () => {
       end_source_message_id: `${sessionId}-current-assistant`,
       processing_priority: 0,
     });
+  });
+
+  it("submits tool-only fallback sources at projection version 2", async () => {
+    const sessionId = "tool-only-source-session";
+    const messages: OpenCodeMessage[] = [
+      {
+        info: { id: "u1", sessionID: sessionId, role: "user" },
+        parts: [{ type: "text", text: "x".repeat(19_990) }],
+      },
+      {
+        info: {
+          id: "a0",
+          sessionID: sessionId,
+          role: "assistant",
+          parentID: "u1",
+          time: { created: 0, completed: 1 },
+          finish: "tool-calls",
+        },
+        parts: [{ type: "text", text: "first boundary" }],
+      },
+      {
+        info: {
+          id: "a1",
+          sessionID: sessionId,
+          role: "assistant",
+          parentID: "u1",
+          time: { created: 2, completed: 3 },
+          finish: "tool-calls",
+        },
+        parts: [
+          {
+            type: "tool",
+            tool: "read",
+            state: { status: "completed", output: "x".repeat(25_000) },
+          },
+        ],
+      },
+      {
+        info: { id: "u2", sessionID: sessionId, role: "user" },
+        parts: [{ type: "text", text: "continue" }],
+      },
+    ];
+    const client = clientFor(messages);
+    const submittedBodies: Array<Record<string, unknown>> = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+        if (init?.method === "POST") {
+          submittedBodies.push(JSON.parse(String(init.body)));
+        }
+        return emptyListing(url, init);
+      }),
+    );
+    const hooks = await Reflection(pluginInput(client));
+
+    await hooks.event?.({
+      event: { type: "session.idle", properties: { sessionID: sessionId } },
+    } as never);
+
+    const toolSubmission = submittedBodies.find(
+      (body) => body.start_source_message_id === "a1",
+    );
+    expect(toolSubmission).toMatchObject({
+      projection_version: 2,
+      source_boundary_version: 2,
+      start_source_message_id: "a1",
+      end_source_message_id: "a1",
+    });
+    expect(
+      (toolSubmission?.messages as Array<{ text: string }>)[0]?.text,
+    ).toContain('[Tool "read"]');
   });
 
   it("quarantines an unsplittable closed span before HTTP submission", async () => {

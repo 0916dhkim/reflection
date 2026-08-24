@@ -242,7 +242,9 @@ function submissionBody(
     session_id: sessionId,
     start_user_message_id: segment.startUserMessageId,
     end_user_message_id: segment.endUserMessageId,
-    projection_version: PROJECTION_VERSION as 1,
+    projection_version: (segment.projectionVersion ?? PROJECTION_VERSION) as
+      | 1
+      | 2,
     processing_priority: processingPriority,
     messages: segment.messages,
   };

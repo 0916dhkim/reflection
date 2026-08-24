@@ -4,6 +4,8 @@ export const DEFAULT_MAX_SEGMENT_CHARS = 20_000;
 const MEDIA_TOKEN_RESERVE = 8_000;
 const MEDIA_BYTES_PER_TOKEN = 2;
 const ESTIMATED_CHARS_PER_TOKEN = 4;
+const TOOL_SOURCE_CHAR_LIMIT = DEFAULT_MAX_SEGMENT_CHARS;
+const TOOL_SOURCE_TRUNCATION = "\n[Tool activity truncated]";
 export const PROJECTION_LOSS_WARNING =
   "Reflection compacted older context with omissions. Some archived details are unavailable in this prompt; use memory_search and memory_read_segment when exact history matters.";
 export const PROJECTION_LOSS_WARNING_METADATA = {
@@ -53,6 +55,7 @@ export interface ReflectionSegment {
   charCount: number;
   closed: boolean;
   messages: ReflectionMessage[];
+  projectionVersion?: 2;
 }
 
 interface CommittedSegmentBoundaryBase {
@@ -278,6 +281,62 @@ export function textOf(message: OpenCodeMessage): string {
     .join("");
 }
 
+function containsDataUrl(value: string): boolean {
+  return /(?:^|[^a-z0-9+.-])data:/iu.test(value);
+}
+
+function toolSourceText(part: OpenCodeMessage["parts"][number]): string {
+  let state: string;
+  try {
+    state = JSON.stringify(modelVisibleToolState(part.state)) ?? "null";
+  } catch {
+    state = '"[tool state unavailable]"';
+  }
+  let rawName = "unknown";
+  try {
+    if (typeof part.tool === "string") rawName = part.tool;
+  } catch {}
+  const sanitizedName = containsDataUrl(rawName)
+    ? "[data URL omitted]"
+    : rawName;
+  const name = JSON.stringify(sanitizedName.slice(0, 500));
+  return `\n[Tool ${name}]\n${state}\n[/Tool]\n`;
+}
+
+interface ToolSourceBudget {
+  remainingChars: number;
+  truncated: boolean;
+}
+
+function reflectionTextOf(
+  message: OpenCodeMessage,
+  toolBudget: ToolSourceBudget,
+): string {
+  if (isProjectionLossWarningMessage(message)) return "";
+  if (!isModelVisibleMessage(message)) return "";
+  return message.parts
+    .flatMap((part) => {
+      if (!isModelVisiblePart(message, part)) return [];
+      if (part.type === "text") return [];
+      if (part.type === "file") {
+        const name = part.filename ? ` ${part.filename.slice(0, 500)}` : "";
+        const mime = part.mime ? ` (${part.mime.slice(0, 200)})` : "";
+        return [`[Attachment${name}${mime}]`];
+      }
+      if (part.type !== "tool" || toolBudget.truncated) return [];
+      const rendered = toolSourceText(part);
+      if (rendered.length <= toolBudget.remainingChars) {
+        toolBudget.remainingChars -= rendered.length;
+        return [rendered];
+      }
+      toolBudget.truncated = true;
+      const prefix = rendered.slice(0, toolBudget.remainingChars);
+      toolBudget.remainingChars = 0;
+      return [prefix, TOOL_SOURCE_TRUNCATION];
+    })
+    .join("");
+}
+
 function canonicalHistory(
   messages: readonly OpenCodeMessage[],
 ): CanonicalHistory {
@@ -330,15 +389,18 @@ function canonicalHistory(
 function sanitizeModelValue(value: unknown, depth = 0): unknown {
   if (depth > 8) return "[nested value omitted]";
   if (typeof value === "string") {
-    return value.startsWith("data:") ? "[data URL omitted]" : value;
+    return containsDataUrl(value) ? "[data URL omitted]" : value;
   }
   if (Array.isArray(value)) {
     return value.map((item) => sanitizeModelValue(item, depth + 1));
   }
+  if (typeof value === "function" || typeof value === "symbol") {
+    return "[non-JSON value omitted]";
+  }
   if (typeof value !== "object" || value === null) return value;
   return Object.fromEntries(
-    Object.entries(value).map(([key, item]) => [
-      key,
+    Object.entries(value).map(([key, item], index) => [
+      containsDataUrl(key) ? `[data URL key omitted ${index}]` : key,
       sanitizeModelValue(item, depth + 1),
     ]),
   );
@@ -366,9 +428,9 @@ export function modelVisibleToolStateSize(value: unknown): {
   chars: number;
   utf8Bytes: number;
 } {
-  const visible = modelVisibleToolStateValue(value);
-  const seen = new WeakSet<object>();
   try {
+    const visible = modelVisibleToolStateValue(value);
+    const seen = new WeakSet<object>();
     const serialized =
       JSON.stringify(visible, function (key, item: unknown) {
         if (this === visible && key === "attachments") return undefined;
@@ -417,7 +479,7 @@ export function modelVisibleMediaTokens(value: unknown): number {
     : Math.max(MEDIA_TOKEN_RESERVE, Math.ceil(bytes / MEDIA_BYTES_PER_TOKEN));
 }
 
-export function modelVisibleToolAttachmentTokens(value: unknown): number {
+function toolAttachmentTokens(value: unknown): number {
   if (typeof value !== "object" || value === null) return 0;
   const state = value as Record<string, unknown>;
   const time =
@@ -445,6 +507,14 @@ export function modelVisibleToolAttachmentTokens(value: unknown): number {
         : 0)
     );
   }, 0);
+}
+
+export function modelVisibleToolAttachmentTokens(value: unknown): number {
+  try {
+    return toolAttachmentTokens(value);
+  } catch {
+    return Number.POSITIVE_INFINITY;
+  }
 }
 
 function inlineDataUrlTokens(value: unknown): number {
@@ -477,15 +547,14 @@ function inlineDataUrlTokens(value: unknown): number {
 }
 
 export function modelVisibleToolInlineDataTokens(value: unknown): number {
-  if (typeof value !== "object" || value === null) {
-    return inlineDataUrlTokens(value);
+  try {
+    if (typeof value !== "object" || value === null) {
+      return inlineDataUrlTokens(value);
+    }
+    return inlineDataUrlTokens(modelVisibleToolStateValue(value));
+  } catch {
+    return Number.POSITIVE_INFINITY;
   }
-  const state = value as Record<string, unknown>;
-  const time =
-    typeof state.time === "object" && state.time !== null
-      ? (state.time as Record<string, unknown>)
-      : {};
-  return inlineDataUrlTokens(modelVisibleToolStateValue(value));
 }
 
 export function modelVisibleCharWeightOf(message: OpenCodeMessage): number {
@@ -498,14 +567,22 @@ export function modelVisibleCharWeightOf(message: OpenCodeMessage): number {
       continue;
     }
     if (part.type === "tool") {
-      const stateSize = modelVisibleToolStateSize(part.state);
-      weight += (part.tool?.length ?? 0) + stateSize.chars;
+      let toolName: unknown;
+      let state: unknown;
+      try {
+        toolName = part.tool;
+        state = part.state;
+      } catch {
+        weight = Number.POSITIVE_INFINITY;
+        continue;
+      }
+      const stateSize = modelVisibleToolStateSize(state);
       weight +=
-        modelVisibleToolAttachmentTokens(part.state) *
-        ESTIMATED_CHARS_PER_TOKEN;
+        (typeof toolName === "string" ? toolName.length : 0) + stateSize.chars;
       weight +=
-        modelVisibleToolInlineDataTokens(part.state) *
-        ESTIMATED_CHARS_PER_TOKEN;
+        modelVisibleToolAttachmentTokens(state) * ESTIMATED_CHARS_PER_TOKEN;
+      weight +=
+        modelVisibleToolInlineDataTokens(state) * ESTIMATED_CHARS_PER_TOKEN;
       continue;
     }
     if (part.type === "file") {
@@ -523,13 +600,39 @@ function orderedSourceMessages(
   );
 }
 
-function reflectionMessages(
+function reflectionMessagesWithMetadata(
   sourceMessages: readonly IndexedMessage[],
-): ReflectionMessage[] {
-  return orderedSourceMessages(sourceMessages).map(({ message }) => ({
+): { messages: ReflectionMessage[]; usedToolFallback: boolean } {
+  const ordered = orderedSourceMessages(sourceMessages);
+  const textMessages = ordered.map(({ message }) => ({
     role: message.info.role,
     text: textOf(message),
   }));
+  if (textMessages.some((message) => message.text.trim().length > 0)) {
+    return { messages: textMessages, usedToolFallback: false };
+  }
+  // Existing mixed-content fingerprints intentionally exclude tools. Render
+  // tool activity only when the extraction payload would otherwise be blank.
+  const toolBudget: ToolSourceBudget = {
+    remainingChars: TOOL_SOURCE_CHAR_LIMIT - TOOL_SOURCE_TRUNCATION.length,
+    truncated: false,
+  };
+  const messages = ordered.map(({ message }) => ({
+    role: message.info.role,
+    text: reflectionTextOf(message, toolBudget),
+  }));
+  return {
+    messages,
+    usedToolFallback: messages.some(
+      (message) => message.text.trim().length > 0,
+    ),
+  };
+}
+
+function reflectionMessages(
+  sourceMessages: readonly IndexedMessage[],
+): ReflectionMessage[] {
+  return reflectionMessagesWithMetadata(sourceMessages).messages;
 }
 
 function sourceEndpoints(sourceMessages: readonly IndexedMessage[]): {
@@ -547,6 +650,7 @@ function sourceEndpoints(sourceMessages: readonly IndexedMessage[]): {
 function makeV1Segment(
   completeTurns: readonly CompleteTurn[],
   closed: boolean,
+  projectionVersion?: number,
 ): ReflectionSegment {
   const firstTurn = completeTurns[0];
   const lastTurn = completeTurns.at(-1);
@@ -555,6 +659,9 @@ function makeV1Segment(
   const { ordered, first, last } = sourceEndpoints(
     completeTurns.flatMap((turn) => turn.messages),
   );
+  const reflected = reflectionMessagesWithMetadata(ordered);
+  const upgradedProjection =
+    (projectionVersion ?? 1) >= 2 || reflected.usedToolFallback;
   return {
     startUserMessageId: firstTurn.userMessageId,
     endUserMessageId: lastTurn.userMessageId,
@@ -566,7 +673,8 @@ function makeV1Segment(
     sourceMessageIds: ordered.map(({ message }) => message.info.id),
     charCount: completeTurns.reduce((total, turn) => total + turn.charCount, 0),
     closed,
-    messages: reflectionMessages(ordered),
+    messages: reflected.messages,
+    ...(upgradedProjection ? { projectionVersion: 2 as const } : {}),
   };
 }
 
@@ -574,8 +682,12 @@ function makeV2Segment(
   turn: CompleteTurn,
   sourceMessages: readonly IndexedMessage[],
   closed: boolean,
+  projectionVersion?: number,
 ): ReflectionSegment {
   const { ordered, first, last } = sourceEndpoints(sourceMessages);
+  const reflected = reflectionMessagesWithMetadata(ordered);
+  const upgradedProjection =
+    (projectionVersion ?? 1) >= 2 || reflected.usedToolFallback;
   return {
     startUserMessageId: turn.userMessageId,
     endUserMessageId: turn.userMessageId,
@@ -590,7 +702,8 @@ function makeV2Segment(
       0,
     ),
     closed,
-    messages: reflectionMessages(ordered),
+    messages: reflected.messages,
+    ...(upgradedProjection ? { projectionVersion: 2 as const } : {}),
   };
 }
 
@@ -921,6 +1034,7 @@ function fragmentTurn(
         turn.closed ||
           boundary.endOffset < turn.messages.length - 1 ||
           isCompletedAssistantMessage(sourceMessages.at(-1)?.message),
+        boundary.boundary.projectionVersion,
       ),
     );
     cursor = boundary.endOffset + 1;
@@ -1031,7 +1145,11 @@ export function segmentMessages(
       flushOrdinaryTurns(true);
       const coveredTurns = history.turns.slice(v1.startIndex, v1.endIndex + 1);
       segments.push(
-        makeV1Segment(coveredTurns, coveredTurns.at(-1)?.closed ?? true),
+        makeV1Segment(
+          coveredTurns,
+          coveredTurns.at(-1)?.closed ?? true,
+          v1.boundary.projectionVersion,
+        ),
       );
       turnIndex = v1.endIndex + 1;
       continue;

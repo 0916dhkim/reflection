@@ -102,6 +102,181 @@ describe("textOf", () => {
     expect(textOf(message)).toBe("visible");
   });
 
+  it("renders bounded sanitized tool activity into source messages", () => {
+    const toolStep = assistant("a1", "u1");
+    toolStep.info.finish = "tool-calls";
+    toolStep.parts = [
+      { type: "reasoning", text: "private reasoning" },
+      {
+        type: "tool",
+        tool: "grep",
+        state: {
+          status: "completed",
+          input: {
+            pattern: "needle",
+            note: "metadata: preserved",
+            embedded: "prefix data:image/png;base64,INPUT suffix",
+            "data:text/plain;base64,KEY": "key value",
+          },
+          output: "match",
+          attachments: [
+            {
+              mime: "image/png",
+              url: "data:image/png;base64,SECRET",
+            },
+          ],
+        },
+      },
+    ];
+    const messages = [user("u1", "inspect"), toolStep];
+    const segment = segmentMessages(messages, 20_000, [
+      v2Boundary("u1", "a1", "a1"),
+    ]).find((candidate) => candidate.startSourceMessageId === "a1");
+    if (!segment) throw new Error("missing tool-only segment");
+
+    expect(segment.messages).toHaveLength(1);
+    const rendered = segment.messages[0]?.text ?? "";
+    expect(rendered).toContain('[Tool "grep"]');
+    expect(rendered).toContain('"pattern":"needle"');
+    expect(rendered).toContain('"note":"metadata: preserved"');
+    expect(rendered).toContain('"output":"match"');
+    expect(rendered).toContain("[data URL omitted]");
+    expect(rendered).not.toContain("private reasoning");
+    expect(rendered).not.toContain("SECRET");
+    expect(rendered).not.toMatch(/data:[^,\s]*,/iu);
+    expect(segment.projectionVersion).toBe(2);
+    expect(submissionSourceFingerprint("session", segment)).not.toBe(
+      sourceFingerprint({
+        session_id: "session",
+        start_user_message_id: "u1",
+        end_user_message_id: "u1",
+        projection_version: 0,
+        processing_priority: 0,
+        source_boundary_version: 2,
+        start_source_message_id: "a1",
+        end_source_message_id: "a1",
+        messages: [{ role: "assistant", text: "" }],
+      }),
+    );
+  });
+
+  it("preserves text-only extraction payloads for mixed source messages", () => {
+    const mixed = assistant("a1", "u1", "visible answer");
+    mixed.parts = [
+      ...mixed.parts,
+      {
+        type: "tool",
+        tool: "read",
+        state: { status: "completed", output: "tool result" },
+      },
+    ];
+
+    const messages = [user("u1", "inspect"), mixed];
+    expect(readSegmentMessages(messages, v2Boundary("u1", "a1", "a1"))).toEqual(
+      [{ role: "assistant", text: "visible answer" }],
+    );
+    const segment = segmentMessages(messages, 20_000, [
+      v2Boundary("u1", "a1", "a1"),
+    ]).find((candidate) => candidate.startSourceMessageId === "a1");
+    expect(segment?.projectionVersion).toBeUndefined();
+
+    const upgraded = segmentMessages(messages, 20_000, [
+      { ...v2Boundary("u1", "a1", "a1"), projectionVersion: 2 },
+    ]).find((candidate) => candidate.startSourceMessageId === "a1");
+    expect(upgraded?.projectionVersion).toBe(2);
+  });
+
+  it("bounds tool activity in source messages", () => {
+    const toolStep = assistant("a1", "u1");
+    toolStep.info.finish = "tool-calls";
+    toolStep.parts = [
+      { type: "text", text: " ".repeat(100) },
+      {
+        type: "tool",
+        tool: "read",
+        state: { status: "completed", output: "x".repeat(25_000) },
+      },
+      {
+        type: "tool",
+        tool: "read",
+        state: { status: "completed", output: "unreachable" },
+      },
+    ];
+    const [rendered] = readSegmentMessages(
+      [user("u1", "inspect"), toolStep],
+      v2Boundary("u1", "a1", "a1"),
+    );
+
+    expect(rendered?.text).toHaveLength(20_000);
+    expect(rendered?.text.endsWith("[Tool activity truncated]")).toBe(true);
+    expect(rendered?.text).not.toContain("unreachable");
+  });
+
+  it("fails safely for malformed runtime tool fields", () => {
+    const toolStep = assistant("a1", "u1");
+    const state = {} as Record<string, unknown>;
+    Object.defineProperty(state, "time", {
+      enumerable: true,
+      get: () => {
+        throw new Error("invalid state");
+      },
+    });
+    toolStep.parts = [
+      {
+        type: "tool",
+        tool: 42,
+        state,
+      } as unknown as OpenCodeMessage["parts"][number],
+    ];
+
+    const [rendered] = readSegmentMessages(
+      [user("u1", "inspect"), toolStep],
+      v2Boundary("u1", "a1", "a1"),
+    );
+    expect(rendered?.text).toContain('[Tool "unknown"]');
+    expect(rendered?.text).toContain("[tool state unavailable]");
+
+    const callableState = assistant("a2", "u1");
+    callableState.parts = [
+      {
+        type: "tool",
+        tool: { length: "corrupt" },
+        state: {
+          status: "completed",
+          toJSON: () => "data:image/png;base64,SECRET",
+        },
+      } as unknown as OpenCodeMessage["parts"][number],
+    ];
+    expect(modelVisibleCharWeightOf(callableState)).toBeTypeOf("number");
+    const [sanitized] = readSegmentMessages(
+      [user("u1", "inspect"), callableState],
+      v2Boundary("u1", "a2", "a2"),
+    );
+    expect(sanitized?.text).toContain("[non-JSON value omitted]");
+    expect(sanitized?.text).not.toContain("data:");
+
+    const throwingName = assistant("a3", "u1");
+    const malformedPart = { type: "tool", state: {} } as Record<
+      string,
+      unknown
+    >;
+    Object.defineProperty(malformedPart, "tool", {
+      get: () => {
+        throw new Error("invalid name");
+      },
+    });
+    throwingName.parts = [malformedPart as OpenCodeMessage["parts"][number]];
+    expect(modelVisibleCharWeightOf(throwingName)).toBe(
+      Number.POSITIVE_INFINITY,
+    );
+    expect(
+      readSegmentMessages(
+        [user("u1", "inspect"), throwingName],
+        v2Boundary("u1", "a3", "a3"),
+      )[0]?.text,
+    ).toContain('[Tool "unknown"]');
+  });
+
   it("matches assistant error visibility", () => {
     const generic = assistant("generic", "u1", "partial");
     generic.info.error = { name: "UnknownError" };

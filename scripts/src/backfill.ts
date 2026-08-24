@@ -593,7 +593,7 @@ export function segmentSubmission(
     session_id: sessionId,
     start_user_message_id: segment.startUserMessageId,
     end_user_message_id: segment.endUserMessageId,
-    projection_version: PROJECTION_VERSION,
+    projection_version: segment.projectionVersion ?? PROJECTION_VERSION,
     processing_priority: 0,
     messages: segment.messages,
   } as const;
@@ -706,7 +706,7 @@ export function planSessionSegments(
       if (target.source_fingerprint !== localFingerprint) {
         drifts.push("source_fingerprint_mismatch");
       }
-      if (target.projection_version !== PROJECTION_VERSION) {
+      if (target.projection_version !== submission.projection_version) {
         drifts.push("projection_version_mismatch");
       }
       status =
@@ -726,7 +726,7 @@ export function planSessionSegments(
       } else if (boundary.source_fingerprint !== localFingerprint) {
         drifts.push("source_fingerprint_mismatch");
       }
-      if (boundary.projection_version !== PROJECTION_VERSION) {
+      if (boundary.projection_version !== submission.projection_version) {
         drifts.push("projection_version_mismatch");
       }
       status =
@@ -1567,7 +1567,7 @@ export async function processPriorityJobs(
     try {
       const job = await context.service.getJob(jobId);
       const snapshotKey = job.source_fingerprint
-        ? `${job.segment_id}:${job.source_fingerprint}:${PROJECTION_VERSION}`
+        ? `${job.segment_id}:${job.source_fingerprint}:${job.projection_version}`
         : null;
       if (job.status === "succeeded") {
         if (snapshotKey) context.completedSnapshots.add(snapshotKey);
@@ -1807,7 +1807,7 @@ export async function processSession(
       let projectionUpgradeReplays = 0;
       while (
         completed.status === "succeeded" &&
-        completed.projection_version < PROJECTION_VERSION
+        completed.projection_version < segment.submission.projection_version
       ) {
         if (projectionUpgradeReplays >= MAX_PROJECTION_UPGRADE_REPLAYS) {
           context.attemptedSnapshots.add(completedSnapshotKey);
@@ -1817,7 +1817,7 @@ export async function processSession(
             segment,
             completed,
             new Error(
-              `projection upgrade did not reach version ${PROJECTION_VERSION}`,
+              `projection upgrade did not reach version ${segment.submission.projection_version}`,
             ),
           );
           projectionUpgradeFailed = true;

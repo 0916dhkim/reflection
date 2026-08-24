@@ -240,6 +240,7 @@ describe("strict model schemas", () => {
             },
             "summary": {
               "maxLength": 1000,
+              "minLength": 1,
               "type": "string",
             },
           },
@@ -447,6 +448,9 @@ describe("ModelClient", () => {
       strict: true,
     });
     assertAllObjectPropertiesRequired(jsonSchema.schema);
+    expect(
+      record(record(record(jsonSchema.schema).properties).summary),
+    ).toMatchObject({ minLength: 1, maxLength: 1000 });
 
     const messages = captured.messages as Array<Record<string, string>>;
     const userContent = messages[2]?.content;
@@ -582,6 +586,18 @@ describe("ModelClient", () => {
         },
       ],
     });
+  });
+
+  test("rejects empty extraction summaries", async () => {
+    const fetcher: FetchLike = async () =>
+      modelResponse({ summary: " \n ", claims: [] });
+
+    await expect(
+      new ModelClient(settings(), fetcher, silentLogger).extract(
+        segmentRequest("source"),
+        [],
+      ),
+    ).rejects.toBeInstanceOf(UpstreamValidationError);
   });
 
   test("uses compact prompt schemas for non-native structured output", async () => {
