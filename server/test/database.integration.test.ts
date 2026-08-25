@@ -1250,6 +1250,106 @@ describe.sequential("Database PostgreSQL integration", () => {
   );
 
   test.skipIf(!DATABASE_URL)(
+    "requeues an exact committed source when its summary is empty",
+    async () => {
+      const database = new Database(settings());
+      await database.open();
+      try {
+        await truncate(database);
+        const source = request({
+          session_id: "empty-summary-session",
+          start_user_message_id: "start",
+          end_user_message_id: "end",
+          projection_version: 1,
+          messages: [{ role: "user", text: "source" }],
+        });
+        const initial = await database.enqueue(source);
+        const claim = required(
+          await withClient(database, (client) =>
+            database.claimOldestJob(client),
+          ),
+        );
+        await completeResolution(
+          database,
+          claim,
+          emptyPrepared(claim, "Initial summary"),
+        );
+        const blankSummary =
+          "\t\n\v\f\r \u00a0\u1680\u2000\u2007\u200a\u2028\u2029\u202f\u205f\u3000\ufeff";
+        await database.pool.query(
+          `UPDATE segments
+           SET summary = $2::text,
+               projection_commit_fingerprint = reflection_projection_fingerprint(
+                   id,
+                   source_boundary_version,
+                   end_user_message_id,
+                   end_source_message_id,
+                   $2::text,
+                   projection_version
+               )
+           WHERE id = $1`,
+          [initial.segment_id, blankSummary],
+        );
+
+        const [summaries, boundaries] = await database.sessionSegmentListing(
+          "empty-summary-session",
+        );
+        expect(summaries).toEqual([]);
+        expect(boundaries).toMatchObject([
+          { id: initial.segment_id, source_eligible: false },
+        ]);
+
+        const requeued = await database.enqueue(source);
+        expect(requeued).toMatchObject({
+          id: initial.id,
+          segment_id: initial.segment_id,
+          status: "pending",
+          source_fingerprint: sourceFingerprint(source),
+        });
+        const stagedBlank = { summary: blankSummary, claims: [] };
+        await database.pool.query(
+          `UPDATE segment_targets
+           SET extraction_result = $2::jsonb,
+               summary_commit_fingerprint = reflection_projection_fingerprint(
+                   segment_id,
+                   source_boundary_version,
+                   end_user_message_id,
+                   end_source_message_id,
+                   $3::text,
+                   projection_version
+               )
+           WHERE segment_id = $1`,
+          [initial.segment_id, JSON.stringify(stagedBlank), blankSummary],
+        );
+        const repairClaim = required(
+          await withClient(database, (client) =>
+            database.claimOldestJob(client),
+          ),
+        );
+        expect(repairClaim.extractionResult).toBeNull();
+        await expect(
+          database.publishExtraction(repairClaim, stagedBlank),
+        ).rejects.toThrow(
+          "extraction summary must contain non-whitespace text",
+        );
+        await completeResolution(
+          database,
+          repairClaim,
+          emptyPrepared(repairClaim, "Repaired summary"),
+        );
+        expect(
+          (await database.segmentSummaries("empty-summary-session")).map(
+            (segment) => segment.summary,
+          ),
+        ).toEqual(["Repaired summary"]);
+      } finally {
+        await database.close();
+      }
+    },
+    15_000,
+  );
+
+  test.skipIf(!DATABASE_URL)(
     "supports v2 siblings, priority, staged summaries, retries, and stale fencing",
     async () => {
       const database = new Database(settings());

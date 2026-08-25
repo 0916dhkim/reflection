@@ -42,8 +42,16 @@ import type { Settings } from "./config.js";
 
 pgTypes.setTypeParser(1184, (value) => value);
 
+const BLANK_SUMMARY_SQL_PATTERN =
+  "U&'^[\\0009-\\000D\\0020\\00A0\\1680\\2000-\\200A\\2028-\\2029\\202F\\205F\\3000\\FEFF]*$'";
+
+function summaryHasContentSql(expression: string): string {
+  return `${expression} !~ ${BLANK_SUMMARY_SQL_PATTERN}`;
+}
+
 const COMMITTED_SEGMENT_ELIGIBILITY_SQL = `
-  s.projection_commit_fingerprint = reflection_projection_fingerprint(
+  ${summaryHasContentSql("s.summary")}
+  AND s.projection_commit_fingerprint = reflection_projection_fingerprint(
       s.id,
       s.source_boundary_version,
       s.end_user_message_id,
@@ -69,6 +77,7 @@ const COMMITTED_SEGMENT_ELIGIBILITY_SQL = `
 
 const STAGED_TARGET_ELIGIBILITY_SQL = `
   t.extraction_result IS NOT NULL
+  AND ${summaryHasContentSql("t.extraction_result->>'summary'")}
   AND t.summary_commit_fingerprint = reflection_projection_fingerprint(
       t.segment_id,
       t.source_boundary_version,
@@ -161,6 +170,7 @@ interface CurrentSegmentRow extends QueryResultRow {
   source_generation: PgBigInt;
   source_fingerprint: string | null;
   projection_safe: boolean;
+  summary_nonempty: boolean;
 }
 
 interface ClaimedJobRow extends QueryResultRow {
@@ -480,6 +490,16 @@ function extractionResultsEqual(
   );
 }
 
+function extractionResultForPersistence(
+  value: ExtractionResult,
+): ExtractionResult {
+  const result = parseExtractionResult(value);
+  if (result.summary.trim() === "") {
+    throw new Error("extraction summary must contain non-whitespace text");
+  }
+  return result;
+}
+
 async function transaction<T>(
   client: ReservedClient,
   operation: () => Promise<T>,
@@ -668,9 +688,10 @@ export class Database {
           `
           SELECT s.start_user_message_id, s.end_user_message_id,
                  s.source_boundary_version, s.start_source_message_id,
-                 s.end_source_message_id, s.projection_version,
-                 s.source_generation, s.source_fingerprint,
-                 s.projection_commit_fingerprint = reflection_projection_fingerprint(
+                  s.end_source_message_id, s.projection_version,
+                  s.source_generation, s.source_fingerprint,
+                  ${summaryHasContentSql("s.summary")} AS summary_nonempty,
+                  s.projection_commit_fingerprint = reflection_projection_fingerprint(
                      s.id,
                      s.source_boundary_version,
                      s.end_user_message_id,
@@ -788,7 +809,8 @@ export class Database {
         currentSegment.source_fingerprint === fingerprint &&
         currentSegment.projection_version === request.projection_version &&
         (request.projection_version < PROJECTION_SAFE_VERSION ||
-          currentSegment.projection_safe)
+          currentSegment.projection_safe) &&
+        currentSegment.summary_nonempty
       ) {
         let jobId: PgBigInt;
         if (boundaryJob === undefined) {
@@ -1255,6 +1277,9 @@ export class Database {
                   jobs.payload, jobs.source_generation, jobs.source_fingerprint,
                   CASE
                       WHEN targets.extraction_result IS NOT NULL
+                       AND ${summaryHasContentSql(
+                         "targets.extraction_result->>'summary'",
+                       )}
                        AND targets.summary_commit_fingerprint =
                            reflection_projection_fingerprint(
                                targets.segment_id,
@@ -1636,7 +1661,7 @@ export class Database {
     job: ClaimedJob,
     result: ExtractionResult,
   ): Promise<boolean> {
-    const extractionResult = parseExtractionResult(result);
+    const extractionResult = extractionResultForPersistence(result);
     const summaryFingerprint = projectionFingerprintForBoundary(
       job.segmentId,
       projectionBoundary({
@@ -1845,7 +1870,7 @@ export class Database {
     result: ExtractionResult,
     prepared: PreparedSegment,
   ): Promise<boolean> {
-    const extractionResult = parseExtractionResult(result);
+    const extractionResult = extractionResultForPersistence(result);
     if (
       prepared.id !== job.segmentId ||
       prepared.sessionId !== job.request.session_id ||
