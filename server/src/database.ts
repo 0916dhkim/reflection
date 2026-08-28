@@ -39,6 +39,10 @@ import {
 } from "pg";
 
 import type { Settings } from "./config.js";
+import {
+  EXTRACTION_VALIDATION_VERSION,
+  type ValidatedExtractionResult,
+} from "./extraction-validation.js";
 
 pgTypes.setTypeParser(1184, (value) => value);
 
@@ -77,6 +81,13 @@ const COMMITTED_SEGMENT_ELIGIBILITY_SQL = `
 
 const STAGED_TARGET_ELIGIBILITY_SQL = `
   t.extraction_result IS NOT NULL
+  AND t.extraction_validation_version = ${EXTRACTION_VALIDATION_VERSION}
+  AND t.extraction_validation_fingerprint =
+      reflection_extraction_validation_fingerprint(
+          t.extraction_result,
+          t.extraction_validation_version,
+          t.source_fingerprint
+      )
   AND ${summaryHasContentSql("t.extraction_result->>'summary'")}
   AND t.summary_commit_fingerprint = reflection_projection_fingerprint(
       t.segment_id,
@@ -103,7 +114,7 @@ export interface ClaimedJob {
   sourceFingerprint: string;
   attempts: number;
   request: SegmentCreate;
-  extractionResult: ExtractionResult | null;
+  extractionResult: ValidatedExtractionResult | null;
 }
 
 export class JobNotRetryableError extends Error {
@@ -156,8 +167,11 @@ interface TargetRow extends QueryResultRow {
   source_generation: PgBigInt;
   source_fingerprint: string | null;
   extraction_result: unknown | null;
+  extraction_validation_version: number | null;
+  extraction_validation_fingerprint: string | null;
   summary_commit_fingerprint: string | null;
   processing_priority: number;
+  staged_eligible?: boolean;
 }
 
 interface CurrentSegmentRow extends QueryResultRow {
@@ -491,7 +505,7 @@ function extractionResultsEqual(
 }
 
 function extractionResultForPersistence(
-  value: ExtractionResult,
+  value: ValidatedExtractionResult,
 ): ExtractionResult {
   const result = parseExtractionResult(value);
   if (result.summary.trim() === "") {
@@ -674,10 +688,13 @@ export class Database {
           SELECT job_id, end_user_message_id, source_boundary_version,
                  start_source_message_id, end_source_message_id,
                  projection_version, payload, source_generation,
-                 source_fingerprint, extraction_result,
-                 summary_commit_fingerprint, processing_priority
-          FROM segment_targets
-          WHERE segment_id = $1
+                  source_fingerprint, extraction_result,
+                   extraction_validation_version,
+                   extraction_validation_fingerprint,
+                   summary_commit_fingerprint, processing_priority,
+                   (${STAGED_TARGET_ELIGIBILITY_SQL}) AS staged_eligible
+           FROM segment_targets AS t
+           WHERE t.segment_id = $1
           FOR UPDATE
           `,
           [segmentId],
@@ -768,6 +785,11 @@ export class Database {
         target !== undefined &&
         targetMatchesRequest(target, request, segmentId, fingerprint)
       ) {
+        const targetJob = jobs.find((job) => sameBigInt(job.id, target.job_id));
+        const resetStaleExtraction =
+          target.extraction_result !== null &&
+          target.staged_eligible !== true &&
+          targetJob?.status === "failed";
         const priority = Math.max(
           target.processing_priority,
           request.processing_priority,
@@ -778,20 +800,38 @@ export class Database {
         });
         await connection.query(
           `
-          UPDATE segment_targets
-          SET payload = $1::jsonb,
-              processing_priority = $2
-          WHERE segment_id = $3
-          `,
-          [exactPayload, priority, segmentId],
+           UPDATE segment_targets
+           SET payload = $1::jsonb,
+               processing_priority = $2,
+               extraction_result = CASE WHEN $3 THEN NULL ELSE extraction_result END,
+               extraction_validation_version = CASE
+                   WHEN $3 THEN NULL ELSE extraction_validation_version
+               END,
+               extraction_validation_fingerprint = CASE
+                   WHEN $3 THEN NULL ELSE extraction_validation_fingerprint
+               END,
+               summary_commit_fingerprint = CASE
+                   WHEN $3 THEN NULL ELSE summary_commit_fingerprint
+               END
+           WHERE segment_id = $4
+           `,
+          [exactPayload, priority, resetStaleExtraction, segmentId],
         );
         await connection.query(
           `
-          UPDATE extraction_jobs
-          SET payload = $1::jsonb, processing_priority = $2
-          WHERE id = $3
-          `,
-          [exactPayload, priority, target.job_id],
+           UPDATE extraction_jobs
+           SET payload = $1::jsonb,
+               processing_priority = $2,
+               status = CASE WHEN $3 THEN 'pending' ELSE status END,
+               attempts = CASE WHEN $3 THEN 0 ELSE attempts END,
+               error = CASE WHEN $3 THEN NULL ELSE error END,
+               lease_id = CASE WHEN $3 THEN NULL ELSE lease_id END,
+               started_at = CASE WHEN $3 THEN NULL ELSE started_at END,
+               finished_at = CASE WHEN $3 THEN NULL ELSE finished_at END,
+               next_attempt_at = CASE WHEN $3 THEN now() ELSE next_attempt_at END
+           WHERE id = $4
+           `,
+          [exactPayload, priority, resetStaleExtraction, target.job_id],
         );
         const row = await Database.#jobRow(connection, target.job_id);
         if (row === undefined) {
@@ -969,6 +1009,8 @@ export class Database {
             source_generation = EXCLUDED.source_generation,
             source_fingerprint = EXCLUDED.source_fingerprint,
             extraction_result = NULL,
+            extraction_validation_version = NULL,
+            extraction_validation_fingerprint = NULL,
             summary_commit_fingerprint = NULL,
             processing_priority = EXCLUDED.processing_priority,
             updated_at = now()
@@ -1070,8 +1112,10 @@ export class Database {
           SELECT job_id, end_user_message_id, source_boundary_version,
                  start_source_message_id, end_source_message_id,
                  projection_version, payload, source_generation,
-                 source_fingerprint, extraction_result,
-                 summary_commit_fingerprint, processing_priority
+                  source_fingerprint, extraction_result,
+                  extraction_validation_version,
+                  extraction_validation_fingerprint,
+                  summary_commit_fingerprint, processing_priority
           FROM segment_targets
           WHERE segment_id = $1
           FOR UPDATE
@@ -1280,6 +1324,14 @@ export class Database {
                        AND ${summaryHasContentSql(
                          "targets.extraction_result->>'summary'",
                        )}
+                       AND targets.extraction_validation_version =
+                           ${EXTRACTION_VALIDATION_VERSION}
+                       AND targets.extraction_validation_fingerprint =
+                           reflection_extraction_validation_fingerprint(
+                               targets.extraction_result,
+                               targets.extraction_validation_version,
+                               targets.source_fingerprint
+                           )
                        AND targets.summary_commit_fingerprint =
                            reflection_projection_fingerprint(
                                targets.segment_id,
@@ -1383,12 +1435,12 @@ export class Database {
         return null;
       }
 
-      let extractionResult: ExtractionResult | null = null;
+      let extractionResult: ValidatedExtractionResult | null = null;
       if (pending.extraction_result !== null) {
         try {
           extractionResult = parseExtractionResult(
             parsedJson(pending.extraction_result),
-          );
+          ) as ValidatedExtractionResult;
         } catch (error) {
           const persistedError = truncateCodePoints(
             `invalid persisted extraction result: ${errorMessage(error)}`,
@@ -1500,8 +1552,10 @@ export class Database {
           SELECT job_id, end_user_message_id, source_boundary_version,
                  start_source_message_id, end_source_message_id,
                  projection_version, payload, source_generation,
-                 source_fingerprint, extraction_result,
-                 summary_commit_fingerprint, processing_priority
+                  source_fingerprint, extraction_result,
+                  extraction_validation_version,
+                  extraction_validation_fingerprint,
+                  summary_commit_fingerprint, processing_priority
           FROM segment_targets
           WHERE segment_id = $1
           FOR UPDATE
@@ -1659,7 +1713,7 @@ export class Database {
 
   async publishExtraction(
     job: ClaimedJob,
-    result: ExtractionResult,
+    result: ValidatedExtractionResult,
   ): Promise<boolean> {
     const extractionResult = extractionResultForPersistence(result);
     const summaryFingerprint = projectionFingerprintForBoundary(
@@ -1717,8 +1771,10 @@ export class Database {
           SELECT job_id, end_user_message_id, source_boundary_version,
                  start_source_message_id, end_source_message_id,
                  projection_version, payload, source_generation,
-                 source_fingerprint, extraction_result,
-                 summary_commit_fingerprint, processing_priority
+                  source_fingerprint, extraction_result,
+                  extraction_validation_version,
+                  extraction_validation_fingerprint,
+                  summary_commit_fingerprint, processing_priority
           FROM segment_targets
           WHERE segment_id = $1
           FOR UPDATE
@@ -1734,9 +1790,16 @@ export class Database {
 
       const updated = await connection.query(
         `
-        UPDATE segment_targets
-        SET extraction_result = $1::jsonb,
-            summary_commit_fingerprint = $2
+         UPDATE segment_targets
+         SET extraction_result = $1::jsonb,
+             extraction_validation_version = ${EXTRACTION_VALIDATION_VERSION},
+             extraction_validation_fingerprint =
+                 reflection_extraction_validation_fingerprint(
+                     $1::jsonb,
+                     ${EXTRACTION_VALIDATION_VERSION},
+                     source_fingerprint
+                 ),
+             summary_commit_fingerprint = $2
         WHERE segment_id = $3 AND job_id = $4
           AND source_generation = $5 AND source_fingerprint = $6
           AND projection_version = $7
@@ -1808,14 +1871,18 @@ export class Database {
           )
           SELECT e.id, e.canonical_name, e.description,
                  ARRAY(
-                     SELECT a.alias FROM entity_aliases a
-                     WHERE a.entity_id = e.id ORDER BY a.normalized_alias
+                      SELECT a.alias FROM entity_aliases a
+                      WHERE a.entity_id = e.id
+                      ORDER BY (a.normalized_alias = $2) DESC,
+                               similarity(a.alias, $1) DESC,
+                               a.normalized_alias
+                      LIMIT 10
                  ) AS aliases
           FROM ranked r
           JOIN entities e ON e.id = r.entity_id
           ORDER BY r.match_score DESC
           `,
-          [mention],
+          [mention, normalizeName(mention)],
         )
       ).rows;
       const vectorRows = (
@@ -1837,13 +1904,17 @@ export class Database {
           )
           SELECT n.id, n.canonical_name, n.description,
                  ARRAY(
-                     SELECT a.alias FROM entity_aliases a
-                     WHERE a.entity_id = n.id ORDER BY a.normalized_alias
+                      SELECT a.alias FROM entity_aliases a
+                      WHERE a.entity_id = n.id
+                      ORDER BY (a.normalized_alias = $3) DESC,
+                               similarity(a.alias, $2) DESC,
+                               a.normalized_alias
+                      LIMIT 10
                  ) AS aliases
           FROM nearest n
           ORDER BY n.distance
           `,
-          [queryVector],
+          [queryVector, mention, normalizeName(mention)],
         )
       ).rows;
 
@@ -1867,7 +1938,7 @@ export class Database {
 
   async commitResolution(
     job: ClaimedJob,
-    result: ExtractionResult,
+    result: ValidatedExtractionResult,
     prepared: PreparedSegment,
   ): Promise<boolean> {
     const extractionResult = extractionResultForPersistence(result);
@@ -1934,10 +2005,14 @@ export class Database {
           `
           SELECT job_id, end_user_message_id, source_boundary_version,
                  start_source_message_id, end_source_message_id,
-                 projection_version, payload, source_generation,
-                 source_fingerprint, extraction_result,
-                 summary_commit_fingerprint, processing_priority
-          FROM segment_targets
+                  projection_version, payload, source_generation,
+                  source_fingerprint, extraction_result,
+                  extraction_validation_version,
+                  extraction_validation_fingerprint,
+                  summary_commit_fingerprint, processing_priority,
+                  COALESCE((${STAGED_TARGET_ELIGIBILITY_SQL}), FALSE)
+                      AS staged_eligible
+           FROM segment_targets t
           WHERE segment_id = $1
           FOR UPDATE
           `,
@@ -1954,14 +2029,15 @@ export class Database {
       if (
         target === undefined ||
         target.extraction_result === null ||
+        !target.staged_eligible ||
         target.summary_commit_fingerprint !== projectionCommitFingerprint
       ) {
         throw new Error("staged extraction is missing or does not match");
       }
-      const stagedExtraction = parseExtractionResult(
+      const persistedExtraction = parseExtractionResult(
         parsedJson(target.extraction_result),
       );
-      if (!extractionResultsEqual(stagedExtraction, extractionResult)) {
+      if (!extractionResultsEqual(persistedExtraction, extractionResult)) {
         throw new Error("staged extraction result changed before resolution");
       }
 
@@ -1994,9 +2070,16 @@ export class Database {
             AND source_fingerprint = $4 AND projection_version = $5
             AND end_user_message_id = $6 AND source_boundary_version = $7
             AND start_source_message_id IS NOT DISTINCT FROM $8
-            AND end_source_message_id IS NOT DISTINCT FROM $9
-            AND extraction_result = $10::jsonb
-            AND summary_commit_fingerprint = $11
+             AND end_source_message_id IS NOT DISTINCT FROM $9
+             AND extraction_result = $10::jsonb
+             AND extraction_validation_version = ${EXTRACTION_VALIDATION_VERSION}
+             AND extraction_validation_fingerprint =
+                 reflection_extraction_validation_fingerprint(
+                     extraction_result,
+                     extraction_validation_version,
+                     source_fingerprint
+                 )
+             AND summary_commit_fingerprint = $11
           `,
           [
             job.segmentId,
@@ -2061,8 +2144,7 @@ export class Database {
             `
             INSERT INTO entity_aliases (entity_id, alias, normalized_alias)
             VALUES ($1, $2, $3)
-            ON CONFLICT (entity_id, normalized_alias) DO UPDATE
-            SET alias = EXCLUDED.alias
+            ON CONFLICT (entity_id, normalized_alias) DO NOTHING
             `,
             [entity.id, alias, normalizeName(alias)],
           );
@@ -2184,9 +2266,16 @@ export class Database {
           AND projection_version = $5 AND end_user_message_id = $6
           AND source_boundary_version = $7
           AND start_source_message_id IS NOT DISTINCT FROM $8
-          AND end_source_message_id IS NOT DISTINCT FROM $9
-          AND extraction_result = $10::jsonb
-          AND summary_commit_fingerprint = $11
+           AND end_source_message_id IS NOT DISTINCT FROM $9
+           AND extraction_result = $10::jsonb
+           AND extraction_validation_version = ${EXTRACTION_VALIDATION_VERSION}
+           AND extraction_validation_fingerprint =
+               reflection_extraction_validation_fingerprint(
+                   extraction_result,
+                   extraction_validation_version,
+                   source_fingerprint
+               )
+           AND summary_commit_fingerprint = $11
         `,
         [
           job.segmentId,

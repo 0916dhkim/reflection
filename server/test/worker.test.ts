@@ -12,6 +12,7 @@ import { describe, expect, test, vi } from "vitest";
 import { UpstreamValidationError } from "../src/clients.js";
 import type { Settings } from "../src/config.js";
 import type { ClaimedJob } from "../src/database.js";
+import type { ValidatedExtractionResult } from "../src/extraction-validation.js";
 import { ExtractionWorker, type WorkerLogger } from "../src/worker.js";
 
 function settings(overrides: Partial<Settings> = {}): Settings {
@@ -47,13 +48,16 @@ function settings(overrides: Partial<Settings> = {}): Settings {
   };
 }
 
-function extractionResult(summary = "summary"): ExtractionResult {
-  return { summary, claims: [] };
+function extractionResult(summary = "summary"): ValidatedExtractionResult {
+  return {
+    summary,
+    claims: [],
+  } as ExtractionResult as ValidatedExtractionResult;
 }
 
 function job(
   attempts: number,
-  staged: ExtractionResult | null = null,
+  staged: ValidatedExtractionResult | null = null,
 ): ClaimedJob {
   const request = {
     session_id: "session",

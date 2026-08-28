@@ -9,7 +9,7 @@ import {
   ExtractionValidationError,
   claimIdFor,
   equivalenceKey,
-  newEntityIdFor,
+  newMentionEntityIdFor,
   normalizeName,
   projectionFingerprint,
   projectionFingerprintForBoundary,
@@ -18,8 +18,7 @@ import {
   segmentIdForRequest,
   sourceFingerprint,
   unionCandidates,
-  validateClaimDecisions,
-  validateResolutions,
+  validateResolutionResult,
   type ClaimSupport,
   type EntityCandidate,
   type MentionContext,
@@ -122,8 +121,43 @@ describe("deterministic identities", () => {
         start_source_message_id: null,
       }),
     ).toBe(segmentId);
-    expect(newEntityIdFor(segmentId, " Example ")).toBe(
-      newEntityIdFor(segmentId, "example"),
+    expect(
+      newMentionEntityIdFor(segmentId, "fingerprint", "c0.subject", {
+        subject: "Example",
+        predicate: "is",
+        object_entity: null,
+        object_value: "true",
+      }),
+    ).toBe("35fcb996-705f-5f55-8fc2-708db5b2a54c");
+    expect(
+      newMentionEntityIdFor(segmentId, "fingerprint", "c0.subject", {
+        subject: "Example",
+        predicate: "is",
+        object_entity: null,
+        object_value: "true",
+      }),
+    ).not.toBe(
+      newMentionEntityIdFor(segmentId, "fingerprint", "c1.subject", {
+        subject: "Example",
+        predicate: "is",
+        object_entity: null,
+        object_value: "true",
+      }),
+    );
+    expect(
+      newMentionEntityIdFor(segmentId, "fingerprint", "c0.subject", {
+        subject: "Alpha | uses",
+        predicate: "supports",
+        object_entity: "PostgreSQL",
+        object_value: null,
+      }),
+    ).not.toBe(
+      newMentionEntityIdFor(segmentId, "fingerprint", "c0.subject", {
+        subject: "Alpha",
+        predicate: "uses",
+        object_entity: "supports | PostgreSQL",
+        object_value: null,
+      }),
     );
     expect(claimIdFor(segmentId, 0)).not.toBe(claimIdFor(segmentId, 1));
     expect(projectionFingerprint(segmentId, "end😀", "summary😀", 1)).toMatch(
@@ -227,44 +261,128 @@ describe("resolution validation", () => {
       candidates: [entity(UUIDS[0]!, "Reflection")],
     };
     const bad: ResolutionResult = {
-      claims: [],
+      claims: [{ claim_id: "c0", action: "keep", reason: "supported" }],
       resolutions: [
         {
           mention_id: "c0.subject",
           candidate_entity_id: UUIDS[1]!,
-          canonical_name: "Reflection",
-          description: "A memory service",
-          aliases: [],
+          same_new_entity_as: null,
         },
       ],
     };
-    expect(() => validateResolutions([context], bad)).toThrow(
+    expect(() => validateResolutionResult(proposed, [context], bad)).toThrow(
       ExtractionValidationError,
     );
+    const alphabeticId = "deadbeef-dead-4abc-8abc-123456789012";
     expect(() =>
-      validateResolutions([context, { ...context, mentionId: "c0.object" }], {
-        ...bad,
+      validateResolutionResult(
+        proposed,
+        [{ ...context, candidates: [entity(alphabeticId, "Reflection")] }],
+        {
+          ...bad,
+          resolutions: [
+            {
+              ...bad.resolutions[0]!,
+              candidate_entity_id: alphabeticId.toUpperCase(),
+            },
+          ],
+        },
+      ),
+    ).toThrow("unknown candidate");
+    expect(() =>
+      validateResolutionResult(
+        proposed,
+        [context, { ...context, mentionId: "c0.object" }],
+        {
+          ...bad,
+          resolutions: [
+            { ...bad.resolutions[0]!, candidate_entity_id: UUIDS[0]! },
+          ],
+        },
+      ),
+    ).toThrow("every mention");
+  });
+
+  it("allows only direct earlier links between equivalent new mentions", () => {
+    const contexts: MentionContext[] = [
+      {
+        mentionId: "c0.subject",
+        role: "subject",
+        text: "Reflection",
+        supportingClaim: "Reflection | uses | PostgreSQL",
+        candidates: [],
+      },
+      {
+        mentionId: "c1.subject",
+        role: "subject",
+        text: "reflection",
+        supportingClaim: "reflection | stores | claims",
+        candidates: [],
+      },
+    ];
+    const resolutions = [
+      {
+        mention_id: "c0.subject",
+        candidate_entity_id: null,
+        same_new_entity_as: null,
+      },
+      {
+        mention_id: "c1.subject",
+        candidate_entity_id: null,
+        same_new_entity_as: "c0.subject",
+      },
+    ];
+    const groupedProposed = contexts.map((context, index) => ({
+      subject: context.text,
+      predicate: "has property",
+      confidence: 0.9,
+      object_entity: null,
+      object_value: String(index),
+    }));
+    const claims = groupedProposed.map((_, index) => ({
+      claim_id: `c${index}`,
+      action: "keep" as const,
+      reason: "supported" as const,
+    }));
+
+    expect(
+      validateResolutionResult(groupedProposed, contexts, {
+        claims,
+        resolutions,
+      }).mentions.length,
+    ).toBe(2);
+    expect(() =>
+      validateResolutionResult(groupedProposed, contexts, {
+        claims,
         resolutions: [
-          { ...bad.resolutions[0]!, candidate_entity_id: UUIDS[0]! },
+          { ...resolutions[0]!, same_new_entity_as: "c1.subject" },
+          resolutions[1]!,
         ],
       }),
-    ).toThrow("every mention");
+    ).toThrow("invalid new-entity group");
+    expect(() =>
+      validateResolutionResult(
+        groupedProposed,
+        [{ ...contexts[0]!, text: "Other" }, contexts[1]!],
+        { claims, resolutions },
+      ),
+    ).toThrow("invalid new-entity group");
   });
 
   it("keeps original claims and excludes review/drop decisions", () => {
     expect(
-      validateClaimDecisions(proposed, {
+      validateResolutionResult(proposed, [], {
         claims: [{ claim_id: "c0", action: "keep", reason: "supported" }],
         resolutions: [],
-      }),
+      }).keptClaims,
     ).toEqual([{ index: 0, claim: proposed[0] }]);
     expect(
-      validateClaimDecisions(proposed, {
+      validateResolutionResult(proposed, [], {
         claims: [
           { claim_id: "c0", action: "review", reason: "unstable_scope" },
         ],
         resolutions: [],
-      }),
+      }).keptClaims,
     ).toEqual([]);
   });
 });

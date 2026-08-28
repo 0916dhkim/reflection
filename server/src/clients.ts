@@ -5,6 +5,7 @@ import {
   codePointLength,
   ExtractionWireResultSchema,
   ResolutionResultSchema,
+  parseExtractionResult,
   parseExtractionWireResult,
   parseResolutionResult,
   toExtractionResult,
@@ -14,16 +15,21 @@ import {
   type SegmentCreate,
 } from "@reflection/shared/contracts";
 import {
+  ExtractionValidationError,
   TerminalExtractionValidationError,
   segmentIdForRequest,
+  validateResolutionResult,
   type MentionContext,
+  type ValidatedResolutionPlan,
 } from "@reflection/shared/domain";
-
 import type { Settings } from "./config.js";
+import type { ValidatedExtractionResult } from "./extraction-validation.js";
+import { IdentifierValidationSession } from "./identifier-validation.js";
 
 export const MAX_EMBEDDING_INPUT_BYTES = 30_000;
 export const MAX_EMBEDDING_BATCH_BYTES = 100_000;
 export const MAX_EMBEDDING_BATCH_ITEMS = 128;
+export const MAX_RESOLUTION_CANDIDATE_PAYLOAD_BYTES = 1_000_000;
 
 export type FetchLike = (
   input: string | URL | Request,
@@ -73,17 +79,6 @@ export class UpstreamValidationError extends UpstreamResponseError {
     this.name = "UpstreamValidationError";
   }
 }
-
-const COPIED_TOKEN_PATTERNS = [
-  /(?<![A-Za-z0-9_])tool_[A-Za-z0-9]+(?![A-Za-z0-9_])/g,
-  /(?<![A-Za-z0-9])[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}(?![A-Za-z0-9])/g,
-  /(?<![A-Za-z0-9-])(?=[0-9a-f]{7,64}(?![A-Za-z0-9-]))(?=[0-9a-f]*[0-9])(?=[0-9a-f]*[a-f])[0-9a-f]{7,64}(?![A-Za-z0-9-])/g,
-  /(?<![A-Za-z0-9_])#[0-9]+(?![A-Za-z0-9_])/g,
-  /(?<![A-Za-z0-9_])[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z0-9_]+)+(?![A-Za-z0-9_])/g,
-  /(?<![A-Za-z0-9_])[A-Za-z][A-Za-z0-9]*(?:_[A-Za-z0-9]+){2,}(?![A-Za-z0-9_])/g,
-  /(?<![A-Za-z0-9_])\/[A-Za-z0-9._~!$&'()*+=:@%/-]+(?![A-Za-z0-9_])/g,
-  /(?<![A-Za-z0-9_])[A-Z][A-Za-z0-9]*(?:-[A-Z][A-Za-z0-9]*)+(?![A-Za-z0-9_])/g,
-] as const;
 
 const EXTRACTION_SYSTEM_PROMPT = [
   "Extract durable, source-grounded memory from the source messages. ",
@@ -156,7 +151,13 @@ const EXTRACTION_SYSTEM_PROMPT = [
   "states a proposition. Copy code identifiers, field names, routes, UUIDs, slugs, ",
   "filenames, property names, commits, and saved-artifact identifiers exactly from the ",
   "source, preserving case, underscores, punctuation, and characters. Never paraphrase ",
-  "or shorten an identifier; omit it if exact copying is uncertain. ",
+  "or shorten an identifier; omit it if exact copying is uncertain. Do not prepend a ",
+  "directory to an abbreviated filename or combine separately written field names into ",
+  "a dotted identifier. If the source writes `/dir/first` and `second`, copy `second`; ",
+  "the path `/dir/second` is not present in the source. ",
+  "Do not introduce hyphenated or slash-separated shorthand for ordinary prose; use ",
+  "spaces or conjunctions unless the exact hyphenated or slash-separated form appears in ",
+  "the source. ",
   "One claim should contain one independently updateable fact. A value may include one ",
   "tightly coupled measurement and its breakdown. For dense tabular source material, one ",
   "claim may contain one homogeneous record for a single entity and variant or effort ",
@@ -240,52 +241,22 @@ const RESOLUTION_SYSTEM_PROMPT = [
   "sampling-coordinator' when it is true only for one PR rollout, but keep an already ",
   "contextual claim about 'PR #14330 deployment order'. Resolve every subject and entity ",
   "object of kept claims exactly once using its cN.subject or cN.object mention_id. ",
-  "Return no resolutions for dropped, review, or literal-object claims. ",
-  "Resolve to one supplied candidate or a new canonical entity. Identical mention text ",
-  "may refer to different entities in different claims. Select a candidate only when its ",
-  "description identifies the same real entity. ",
-  "For a new entity, provide a concise source-grounded identity description only. Do not ",
-  "add lifecycle state, dates, paths, decisions, or other factual assertions that are ",
-  "not present in a kept claim; descriptions must not smuggle dropped information into ",
-  "memory. ",
-  "For an existing candidate, preserve its canonical name and description. Keep useful ",
-  "aliases. candidate_entity_id must copy an exact ID from that mention's candidates. If its ",
-  "candidate list is empty, candidate_entity_id must be null; never invent an ID. Different real entities must have distinguishable canonical names, such as ",
-  "Apple (company) and Apple (fruit).",
+  "Return no resolutions for dropped or review claims. Every kept claim requires its ",
+  "subject resolution; return no object resolution when its object is literal. ",
+  "Resolve to one supplied candidate or a new entity. Identical mention text may refer ",
+  "to different entities in different claims. When two kept mentions unambiguously name ",
+  "the same new entity, set the later mention's same_new_entity_as to the earlier mention_id; ",
+  "otherwise set it to null. Group only mentions with the same normalized text, never chain ",
+  "groups, and keep candidate_entity_id null for both mentions. Select a candidate only when its description ",
+  "identifies the same real entity. ",
+  "candidate_entity_id must copy an exact ID from that mention's candidates. If its ",
+  "candidate list is empty, candidate_entity_id must be null; never invent an ID.",
 ].join("");
 
 function asRecord(value: unknown): Record<string, unknown> | null {
   return typeof value === "object" && value !== null && !Array.isArray(value)
     ? (value as Record<string, unknown>)
     : null;
-}
-
-function escapeRegExp(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
-export function copiedSourceTokens(text: string): Set<string> {
-  const tokens = new Set<string>();
-  for (const pattern of COPIED_TOKEN_PATTERNS) {
-    for (const match of text.matchAll(pattern)) tokens.add(match[0]);
-  }
-  return tokens;
-}
-
-export function copiedTokenSupported(
-  token: string,
-  sourceText: string,
-  sourceTokens: ReadonlySet<string>,
-): boolean {
-  if (sourceTokens.has(token)) return true;
-  if (!token.includes(".")) return false;
-  return token
-    .split(".")
-    .every((part) =>
-      new RegExp(`(?<![A-Za-z0-9_])${escapeRegExp(part)}(?![A-Za-z0-9_])`).test(
-        sourceText,
-      ),
-    );
 }
 
 export function partitionEmbeddingInputs(texts: readonly string[]): string[][] {
@@ -514,6 +485,108 @@ interface StructuredCallOptions<T> {
   maxTokens: number;
 }
 
+function truncateUtf8Bytes(value: string, maximum: number): string {
+  if (Buffer.byteLength(value, "utf8") <= maximum) return value;
+  const retained: string[] = [];
+  let bytes = 0;
+  for (const character of value) {
+    const characterBytes = Buffer.byteLength(character, "utf8");
+    if (bytes + characterBytes > maximum) break;
+    retained.push(character);
+    bytes += characterBytes;
+  }
+  return retained.join("");
+}
+
+function compactAsciiJsonByteLength(value: unknown): number {
+  return Buffer.byteLength(compactAsciiJson(value), "utf8");
+}
+
+function resolutionPromptMentions(
+  mentions: readonly MentionContext[],
+): Array<Record<string, unknown>> {
+  const candidates = mentions.map((mention) =>
+    mention.candidates.map((candidate) => {
+      if (codePointLength(candidate.canonicalName) > 500) {
+        throw new TerminalExtractionValidationError(
+          "entity candidate name exceeds the extraction contract",
+        );
+      }
+      return {
+        entity_id: candidate.id,
+        canonical_name: candidate.canonicalName,
+        description: "",
+        aliases: [] as string[],
+      };
+    }),
+  );
+  let candidateBytes = compactAsciiJsonByteLength(candidates);
+  if (candidateBytes > MAX_RESOLUTION_CANDIDATE_PAYLOAD_BYTES) {
+    throw new TerminalExtractionValidationError(
+      "entity candidate identities exceed the prompt budget",
+    );
+  }
+
+  for (const [mentionIndex, mention] of mentions.entries()) {
+    for (const [candidateIndex, candidate] of mention.candidates.entries()) {
+      const projected = candidates[mentionIndex]![candidateIndex]!;
+      const description = truncateUtf8Bytes(candidate.description, 1_000);
+      const beforeDescription = compactAsciiJsonByteLength(projected);
+      projected.description = description;
+      const afterDescription = compactAsciiJsonByteLength(projected);
+      if (
+        candidateBytes + afterDescription - beforeDescription <=
+        MAX_RESOLUTION_CANDIDATE_PAYLOAD_BYTES
+      ) {
+        candidateBytes += afterDescription - beforeDescription;
+      } else {
+        projected.description = "";
+      }
+
+      for (const alias of candidate.aliases.slice(0, 10)) {
+        const boundedAlias = truncateUtf8Bytes(alias, 256);
+        if (boundedAlias.length === 0) continue;
+        const beforeAlias = compactAsciiJsonByteLength(projected);
+        projected.aliases.push(boundedAlias);
+        const afterAlias = compactAsciiJsonByteLength(projected);
+        if (
+          candidateBytes + afterAlias - beforeAlias <=
+          MAX_RESOLUTION_CANDIDATE_PAYLOAD_BYTES
+        ) {
+          candidateBytes += afterAlias - beforeAlias;
+        } else {
+          projected.aliases.pop();
+        }
+      }
+    }
+  }
+
+  for (const mentionCandidates of candidates) {
+    const identities = new Set<string>();
+    for (const candidate of mentionCandidates) {
+      const identity = compactAsciiJson({
+        canonical_name: candidate.canonical_name,
+        description: candidate.description,
+        aliases: candidate.aliases,
+      });
+      if (identities.has(identity)) {
+        throw new TerminalExtractionValidationError(
+          "entity candidates are indistinguishable within the prompt budget",
+        );
+      }
+      identities.add(identity);
+    }
+  }
+
+  return mentions.map((mention, index) => ({
+    mention_id: mention.mentionId,
+    role: mention.role,
+    text: mention.text,
+    supporting_claim: mention.supportingClaim,
+    candidates: candidates[index]!,
+  }));
+}
+
 export class ModelClient {
   readonly #settings: Settings;
   readonly #fetcher: FetchLike;
@@ -532,7 +605,12 @@ export class ModelClient {
   async extract(
     request: SegmentCreate,
     priorSummaries: readonly string[],
-  ): Promise<{ summary: string; claims: ExtractedClaim[] }> {
+  ): Promise<ValidatedExtractionResult> {
+    const identifierValidation = await IdentifierValidationSession.create(
+      request,
+      this.#settings.extractionModel,
+      this.#logger,
+    );
     const wireResult = await this.#structuredCall<ExtractionWireResult>({
       model: this.#settings.extractionModel,
       provider: this.#settings.extractionProvider,
@@ -542,7 +620,10 @@ export class ModelClient {
       user: {
         source_context: sourceContext(request),
         prior_session_segment_summaries: [...priorSummaries],
-        source_messages: request.messages.map((message) => ({ ...message })),
+        source_messages: request.messages.map(({ role, text }) => ({
+          role,
+          text,
+        })),
       },
       responseSchema: ExtractionWireResultSchema,
       parseResponse: parseExtractionWireResult,
@@ -550,6 +631,7 @@ export class ModelClient {
       maxTokens: 16_384,
     });
 
+    await identifierValidation.prepare(wireResult.claims);
     let result: { summary: string; claims: ExtractedClaim[] };
     try {
       result = toExtractionResult(wireResult);
@@ -560,8 +642,26 @@ export class ModelClient {
       });
       throw new UpstreamValidationError();
     }
-    this.#validateSourceIdentifiers(result, request);
-    return result;
+    const normalized = await identifierValidation.normalizePaths(result);
+    result = normalized.result;
+    if (normalized.normalizedPaths > 0) {
+      this.#logger.warn("normalized extracted paths to source filenames", {
+        model: this.#settings.extractionModel,
+        paths: normalized.normalizedPaths,
+      });
+    }
+    try {
+      result = parseExtractionResult(result);
+    } catch (error) {
+      this.#logger.warn("invalid normalized extraction schema", {
+        model: this.#settings.extractionModel,
+        issues: validationIssues(error),
+      });
+      throw new UpstreamValidationError();
+    }
+    const validatedResult = await identifierValidation.validate(result);
+    if (validatedResult === null) throw new UpstreamValidationError();
+    return validatedResult;
   }
 
   async resolve(
@@ -569,8 +669,8 @@ export class ModelClient {
     summary: string,
     claims: readonly ExtractedClaim[],
     mentions: readonly MentionContext[],
-  ): Promise<ResolutionResult> {
-    return this.#structuredCall<ResolutionResult>({
+  ): Promise<ValidatedResolutionPlan> {
+    const rawResult = await this.#structuredCall<ResolutionResult>({
       model: this.#settings.resolutionModel,
       provider: this.#settings.resolutionProvider,
       reasoningEffort: this.#settings.resolutionReasoningEffort,
@@ -578,64 +678,32 @@ export class ModelClient {
       system: RESOLUTION_SYSTEM_PROMPT,
       user: {
         source_context: sourceContext(request),
-        source_messages: request.messages.map((message) => ({ ...message })),
+        source_messages: request.messages.map(({ role, text }) => ({
+          role,
+          text,
+        })),
         segment_summary: summary,
         proposed_claims: claims.map((claim, index) => ({
           claim_id: `c${index}`,
           ...claim,
         })),
-        mentions: mentions.map((mention) => ({
-          mention_id: mention.mentionId,
-          role: mention.role,
-          text: mention.text,
-          supporting_claim: mention.supportingClaim,
-          candidates: mention.candidates.map((candidate) => ({
-            entity_id: candidate.id,
-            canonical_name: candidate.canonicalName,
-            description: candidate.description,
-            aliases: [...candidate.aliases],
-          })),
-        })),
+        mentions: resolutionPromptMentions(mentions),
       },
       responseSchema: ResolutionResultSchema,
       parseResponse: parseResolutionResult,
       schemaName: "entity_resolution",
       maxTokens: 32_768,
     });
-  }
-
-  #validateSourceIdentifiers(
-    result: { summary: string; claims: readonly ExtractedClaim[] },
-    request: SegmentCreate,
-  ): void {
-    const context = sourceContext(request);
-    const sourceText = [
-      ...request.messages.map((message) => message.text),
-      ...Object.values(context)
-        .filter((value): value is string | number => value !== null)
-        .map(String),
-    ].join("\n");
-    const outputText = [
-      result.summary,
-      ...result.claims.flatMap((claim) =>
-        [
-          claim.subject,
-          claim.predicate,
-          claim.object_entity,
-          claim.object_value,
-        ].filter((value): value is string => value !== null),
-      ),
-    ].join("\n");
-    const sourceIdentifiers = copiedSourceTokens(sourceText);
-    const unknownIdentifiers = [...copiedSourceTokens(outputText)].filter(
-      (token) => !copiedTokenSupported(token, sourceText, sourceIdentifiers),
-    );
-    if (unknownIdentifiers.length === 0) return;
-    this.#logger.warn("extraction altered source identifiers", {
-      model: this.#settings.extractionModel,
-      unknownIdentifiers: unknownIdentifiers.length,
-    });
-    throw new UpstreamValidationError();
+    try {
+      return validateResolutionResult(claims, mentions, rawResult);
+    } catch (error) {
+      if (!(error instanceof ExtractionValidationError)) throw error;
+      this.#logger.warn("invalid joint resolution result", {
+        model: this.#settings.resolutionModel,
+        issues: [error.message],
+      });
+      throw new UpstreamValidationError();
+    }
   }
 
   async #structuredCall<T>(options: StructuredCallOptions<T>): Promise<T> {

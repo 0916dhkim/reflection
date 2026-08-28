@@ -1,11 +1,31 @@
 import { sourceFingerprint } from "./domain.js";
+import {
+  MAX_COMPLETE_TOOL_SOURCE_CHARS,
+  modelVisibleMediaTokens,
+  modelVisibleToolAttachmentTokens,
+  modelVisibleToolInlineDataTokens,
+  modelVisibleToolStateSize,
+  TOOL_SOURCE_CHAR_LIMIT,
+  toolSourceText,
+  truncatedToolSourceText,
+} from "./tool-source.js";
 
-export const DEFAULT_MAX_SEGMENT_CHARS = 20_000;
-const MEDIA_TOKEN_RESERVE = 8_000;
-const MEDIA_BYTES_PER_TOKEN = 2;
+export {
+  canonicalToolFallbackBlocks,
+  canonicalToolFallbackFrames,
+  type CanonicalToolFallbackBlock,
+  MAX_COMPLETE_TOOL_SOURCE_CHARS,
+  modelVisibleMediaTokens,
+  modelVisibleToolAttachmentTokens,
+  modelVisibleToolInlineDataTokens,
+  modelVisibleToolState,
+  modelVisibleToolStateSize,
+  SANITIZED_TOOL_OBJECT_KEY,
+  toolFallbackFrameRanges,
+} from "./tool-source.js";
+
+export const DEFAULT_MAX_SEGMENT_CHARS = TOOL_SOURCE_CHAR_LIMIT;
 const ESTIMATED_CHARS_PER_TOKEN = 4;
-const TOOL_SOURCE_CHAR_LIMIT = DEFAULT_MAX_SEGMENT_CHARS;
-const TOOL_SOURCE_TRUNCATION = "\n[Tool activity truncated]";
 export const PROJECTION_LOSS_WARNING =
   "Reflection compacted older context with omissions. Some archived details are unavailable in this prompt; use memory_search and memory_read_segment when exact history matters.";
 export const PROJECTION_LOSS_WARNING_METADATA = {
@@ -281,28 +301,6 @@ export function textOf(message: OpenCodeMessage): string {
     .join("");
 }
 
-function containsDataUrl(value: string): boolean {
-  return /(?:^|[^a-z0-9+.-])data:/iu.test(value);
-}
-
-function toolSourceText(part: OpenCodeMessage["parts"][number]): string {
-  let state: string;
-  try {
-    state = JSON.stringify(modelVisibleToolState(part.state)) ?? "null";
-  } catch {
-    state = '"[tool state unavailable]"';
-  }
-  let rawName = "unknown";
-  try {
-    if (typeof part.tool === "string") rawName = part.tool;
-  } catch {}
-  const sanitizedName = containsDataUrl(rawName)
-    ? "[data URL omitted]"
-    : rawName;
-  const name = JSON.stringify(sanitizedName.slice(0, 500));
-  return `\n[Tool ${name}]\n${state}\n[/Tool]\n`;
-}
-
 interface ToolSourceBudget {
   remainingChars: number;
   truncated: boolean;
@@ -330,9 +328,12 @@ function reflectionTextOf(
         return [rendered];
       }
       toolBudget.truncated = true;
-      const prefix = rendered.slice(0, toolBudget.remainingChars);
+      const truncated = truncatedToolSourceText(
+        part,
+        toolBudget.remainingChars,
+      );
       toolBudget.remainingChars = 0;
-      return [prefix, TOOL_SOURCE_TRUNCATION];
+      return [truncated];
     })
     .join("");
 }
@@ -386,179 +387,6 @@ function canonicalHistory(
   return { turns: completeTurns, messages: sourceMessages };
 }
 
-function sanitizeModelValue(value: unknown, depth = 0): unknown {
-  if (depth > 8) return "[nested value omitted]";
-  if (typeof value === "string") {
-    return containsDataUrl(value) ? "[data URL omitted]" : value;
-  }
-  if (Array.isArray(value)) {
-    return value.map((item) => sanitizeModelValue(item, depth + 1));
-  }
-  if (typeof value === "function" || typeof value === "symbol") {
-    return "[non-JSON value omitted]";
-  }
-  if (typeof value !== "object" || value === null) return value;
-  return Object.fromEntries(
-    Object.entries(value)
-      .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
-      .map(([key, item], index) => [
-        containsDataUrl(key) ? `[data URL key omitted ${index}]` : key,
-        sanitizeModelValue(item, depth + 1),
-      ]),
-  );
-}
-
-export function modelVisibleToolState(value: unknown): unknown {
-  return sanitizeModelValue(modelVisibleToolStateValue(value));
-}
-
-function modelVisibleToolStateValue(value: unknown): unknown {
-  if (typeof value !== "object" || value === null) {
-    return value;
-  }
-  const state = value as Record<string, unknown>;
-  const time =
-    typeof state.time === "object" && state.time !== null
-      ? (state.time as Record<string, unknown>)
-      : {};
-  return typeof time.compacted === "number"
-    ? { ...state, output: "[Old tool result content cleared]" }
-    : state;
-}
-
-export function modelVisibleToolStateSize(value: unknown): {
-  chars: number;
-  utf8Bytes: number;
-} {
-  try {
-    const visible = modelVisibleToolStateValue(value);
-    const seen = new WeakSet<object>();
-    const serialized =
-      JSON.stringify(visible, function (key, item: unknown) {
-        if (this === visible && key === "attachments") return undefined;
-        if (typeof item === "string" && item.startsWith("data:")) {
-          return "[data URL omitted]";
-        }
-        if (typeof item === "object" && item !== null) {
-          if (seen.has(item)) throw new Error("cyclic tool state");
-          seen.add(item);
-        }
-        return item;
-      }) ?? "null";
-    return {
-      chars: serialized.length,
-      utf8Bytes: Buffer.byteLength(serialized, "utf8"),
-    };
-  } catch {
-    return {
-      chars: Number.POSITIVE_INFINITY,
-      utf8Bytes: Number.POSITIVE_INFINITY,
-    };
-  }
-}
-
-function dataUrlBytes(url: string): number | null {
-  if (!url.startsWith("data:")) return null;
-  const separator = url.indexOf(",");
-  if (separator < 0) return null;
-  const metadata = url.slice(0, separator);
-  const payload = url.slice(separator + 1);
-  return metadata.endsWith(";base64")
-    ? Math.ceil((payload.length * 3) / 4)
-    : Buffer.byteLength(payload, "utf8");
-}
-
-export function modelVisibleMediaTokens(value: unknown): number {
-  if (typeof value !== "object" || value === null)
-    return Number.POSITIVE_INFINITY;
-  const media = value as Record<string, unknown>;
-  const mime = typeof media.mime === "string" ? media.mime : "";
-  if (mime.startsWith("image/")) return MEDIA_TOKEN_RESERVE;
-  if (typeof media.url !== "string") return Number.POSITIVE_INFINITY;
-  const bytes = dataUrlBytes(media.url);
-  return bytes === null
-    ? Number.POSITIVE_INFINITY
-    : Math.max(MEDIA_TOKEN_RESERVE, Math.ceil(bytes / MEDIA_BYTES_PER_TOKEN));
-}
-
-function toolAttachmentTokens(value: unknown): number {
-  if (typeof value !== "object" || value === null) return 0;
-  const state = value as Record<string, unknown>;
-  const time =
-    typeof state.time === "object" && state.time !== null
-      ? (state.time as Record<string, unknown>)
-      : {};
-  if (
-    state.status !== "completed" ||
-    typeof time.compacted === "number" ||
-    !Array.isArray(state.attachments)
-  ) {
-    return 0;
-  }
-  return state.attachments.reduce((total, attachment) => {
-    if (typeof attachment !== "object" || attachment === null) return total;
-    const item = attachment as Record<string, unknown>;
-    const mime = typeof item.mime === "string" ? item.mime : "";
-    const url = typeof item.url === "string" ? item.url : "";
-    const validDataUrl = url.startsWith("data:") && url.includes(",");
-    const hostMedia = mime.startsWith("image/") || mime === "application/pdf";
-    return (
-      total +
-      (validDataUrl || (hostMedia && url.length > 0)
-        ? modelVisibleMediaTokens(item)
-        : 0)
-    );
-  }, 0);
-}
-
-export function modelVisibleToolAttachmentTokens(value: unknown): number {
-  try {
-    return toolAttachmentTokens(value);
-  } catch {
-    return Number.POSITIVE_INFINITY;
-  }
-}
-
-function inlineDataUrlTokens(value: unknown): number {
-  const pending: Array<{ value: unknown; root: boolean }> = [
-    { value, root: true },
-  ];
-  const seen = new WeakSet<object>();
-  let total = 0;
-  while (pending.length > 0) {
-    const current = pending.pop()!;
-    if (typeof current.value === "string") {
-      if (!current.value.startsWith("data:")) continue;
-      const bytes = dataUrlBytes(current.value);
-      if (bytes === null) return Number.POSITIVE_INFINITY;
-      total += Math.max(
-        MEDIA_TOKEN_RESERVE,
-        Math.ceil(bytes / MEDIA_BYTES_PER_TOKEN),
-      );
-      continue;
-    }
-    if (typeof current.value !== "object" || current.value === null) continue;
-    if (seen.has(current.value)) return Number.POSITIVE_INFINITY;
-    seen.add(current.value);
-    for (const [key, item] of Object.entries(current.value)) {
-      if (current.root && key === "attachments") continue;
-      pending.push({ value: item, root: false });
-    }
-  }
-  return total;
-}
-
-export function modelVisibleToolInlineDataTokens(value: unknown): number {
-  try {
-    if (typeof value !== "object" || value === null) {
-      return inlineDataUrlTokens(value);
-    }
-    return inlineDataUrlTokens(modelVisibleToolStateValue(value));
-  } catch {
-    return Number.POSITIVE_INFINITY;
-  }
-}
-
 export function modelVisibleCharWeightOf(message: OpenCodeMessage): number {
   if (!isModelVisibleMessage(message)) return 0;
   let weight = 0;
@@ -579,8 +407,11 @@ export function modelVisibleCharWeightOf(message: OpenCodeMessage): number {
         continue;
       }
       const stateSize = modelVisibleToolStateSize(state);
-      weight +=
-        (typeof toolName === "string" ? toolName.length : 0) + stateSize.chars;
+      const renderedChars = toolSourceText(part).length;
+      weight += Math.max(
+        (typeof toolName === "string" ? toolName.length : 0) + stateSize.chars,
+        renderedChars,
+      );
       weight +=
         modelVisibleToolAttachmentTokens(state) * ESTIMATED_CHARS_PER_TOKEN;
       weight +=
@@ -616,7 +447,7 @@ function reflectionMessagesWithMetadata(
   // Existing mixed-content fingerprints intentionally exclude tools. Render
   // tool activity only when the extraction payload would otherwise be blank.
   const toolBudget: ToolSourceBudget = {
-    remainingChars: TOOL_SOURCE_CHAR_LIMIT - TOOL_SOURCE_TRUNCATION.length,
+    remainingChars: MAX_COMPLETE_TOOL_SOURCE_CHARS,
     truncated: false,
   };
   const messages = ordered.map(({ message }) => ({

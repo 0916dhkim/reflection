@@ -494,7 +494,6 @@ const NaturalPredicateSchema = Type.String({
     "Short user-facing natural-language verb phrase stored and displayed verbatim. Use lowercase words with spaces, never snake_case, camelCase, or database identifiers.",
 });
 const ShortTextSchema = Type.String({ minLength: 1, maxLength: 500 });
-const DescriptionSchema = Type.String({ minLength: 1, maxLength: 1000 });
 const LiteralTextSchema = Type.String({ minLength: 1, maxLength: 10_000 });
 
 const ExtractedClaimProperties = {
@@ -663,9 +662,10 @@ export const ResolutionSchema = Type.Object(
       description:
         "Exact ID copied from this mention's supplied candidates, or null when creating a new entity. Always null when the candidate list is empty; never invent an ID.",
     }),
-    canonical_name: ShortTextSchema,
-    description: DescriptionSchema,
-    aliases: Type.Array(ShortTextSchema, { maxItems: 20 }),
+    same_new_entity_as: Type.Union([Type.String(), Type.Null()], {
+      description:
+        "Earlier mention_id for the same newly created entity, or null. Use only when both mentions select no candidate and their normalized mention text is identical.",
+    }),
   },
   { additionalProperties: false },
 );
@@ -682,28 +682,21 @@ export type ResolutionResult = Static<typeof ResolutionResultSchema>;
 
 export function parseResolutionResult(value: unknown): ResolutionResult {
   const object = record(value);
-  const normalized = object
-    ? {
-        ...object,
-        resolutions: Array.isArray(object.resolutions)
-          ? object.resolutions.map((resolution) => {
-              let current: unknown = resolution;
-              for (const property of ["canonical_name", "description"]) {
-                current = trimProperty(current, property);
-              }
-              const item = record(current);
-              return item && Array.isArray(item.aliases)
-                ? {
-                    ...item,
-                    aliases: item.aliases.map((alias) =>
-                      typeof alias === "string" ? alias.trim() : alias,
-                    ),
-                  }
-                : current;
-            })
-          : object.resolutions,
-      }
-    : value;
+  const normalized =
+    object && Array.isArray(object.resolutions)
+      ? {
+          ...object,
+          resolutions: object.resolutions.map((resolution) => {
+            const item = record(resolution);
+            return item
+              ? {
+                  ...item,
+                  same_new_entity_as: item.same_new_entity_as ?? null,
+                }
+              : resolution;
+          }),
+        }
+      : value;
   const result = parse("resolution result", ResolutionResultSchema, normalized);
   for (const decision of result.claims) {
     const expected =
