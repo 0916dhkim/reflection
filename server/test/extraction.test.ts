@@ -8,15 +8,21 @@ import type {
 import {
   claimIdFor,
   equivalenceKey,
-  newEntityIdFor,
+  newMentionEntityIdFor,
   segmentIdForRequest,
   sourceFingerprint,
+  validateResolutionResult,
   type EntityCandidate,
   type MentionContext,
+  type ValidatedResolutionPlan,
 } from "@reflection/shared/domain";
 import { describe, expect, test, vi } from "vitest";
 
-import type { EmbeddingClient, ModelClient } from "../src/clients.js";
+import {
+  MAX_EMBEDDING_INPUT_BYTES,
+  type EmbeddingClient,
+  type ModelClient,
+} from "../src/clients.js";
 import type { ClaimedJob, Database } from "../src/database.js";
 import { ExtractionEngine } from "../src/extraction.js";
 
@@ -59,6 +65,14 @@ function asModels(value: object): Pick<ModelClient, "extract" | "resolve"> {
 
 function asEmbeddings(value: object): Pick<EmbeddingClient, "embed"> {
   return value as Pick<EmbeddingClient, "embed">;
+}
+
+function resolutionPlan(
+  claims: readonly ExtractedClaim[],
+  contexts: readonly MentionContext[],
+  result: ResolutionResult,
+): ValidatedResolutionPlan {
+  return validateResolutionResult(claims, contexts, result);
 }
 
 class FakeDatabase {
@@ -117,16 +131,11 @@ class FakeModels {
     summary: string,
     claims: readonly ExtractedClaim[],
     contexts: readonly MentionContext[],
-  ): Promise<ResolutionResult> {
+  ): Promise<ValidatedResolutionPlan> {
     expect(summary).toBe("Contextual summary");
     expect(requestValue).toBe(this.request);
     this.contexts = contexts;
-    const canonical: Record<string, string> = {
-      "c0.subject": "Alex One",
-      "c0.object": "Jordan",
-      "c1.subject": "Alex Two",
-    };
-    return {
+    return validateResolutionResult(claims, contexts, {
       claims: claims.map((_claim, index) => ({
         claim_id: `c${index}`,
         action: "keep",
@@ -135,11 +144,9 @@ class FakeModels {
       resolutions: contexts.map((context) => ({
         mention_id: context.mentionId,
         candidate_entity_id: null,
-        canonical_name: canonical[context.mentionId]!,
-        description: `Description for ${canonical[context.mentionId]}`,
-        aliases: [],
+        same_new_entity_as: null,
       })),
-    };
+    });
   }
 }
 
@@ -181,11 +188,11 @@ class TriagingModels extends FakeModels {
     summary: string,
     claims: readonly ExtractedClaim[],
     contexts: readonly MentionContext[],
-  ): Promise<ResolutionResult> {
+  ): Promise<ValidatedResolutionPlan> {
     expect(summary).toBe("PR-specific deployment discussion");
     expect(claims[0]?.subject).toBe("log-consumer");
     this.contexts = contexts;
-    return {
+    return validateResolutionResult(claims, contexts, {
       claims: [
         { claim_id: "c0", action: "drop", reason: "unsupported" },
         { claim_id: "c1", action: "drop", reason: "transient" },
@@ -195,12 +202,10 @@ class TriagingModels extends FakeModels {
         {
           mention_id: "c2.subject",
           candidate_entity_id: null,
-          canonical_name: "PR #14330 deployment order",
-          description: "The required service rollout order for PR #14330",
-          aliases: [],
+          same_new_entity_as: null,
         },
       ],
-    };
+    });
   }
 }
 
@@ -255,15 +260,15 @@ describe("ExtractionEngine", () => {
       new Set(prepared.entities.map((entity) => entity.description)),
     ).toEqual(
       new Set([
-        "Entity named Alex One.",
-        "Entity named Alex Two.",
-        "Entity named Jordan.",
+        "Entity named Alex in claim: Alex | likes | Jordan.",
+        "Entity named Jordan in claim: Alex | likes | Jordan.",
+        "Entity named Alex in claim: Alex | has age | 30 years.",
       ]),
     );
     expect(prepared.entities.map((entity) => entity.canonicalName)).toEqual([
-      "Alex One",
+      "Alex",
       "Jordan",
-      "Alex Two",
+      "Alex",
     ]);
     expect(prepared.claims.map((claim) => claim.embedding)).toEqual([
       [200],
@@ -284,6 +289,76 @@ describe("ExtractionEngine", () => {
       endSourceMessageId: null,
       projectionVersion: 0,
     });
+  });
+
+  test("coalesces explicitly grouped mentions of the same new entity", async () => {
+    const database = new FakeDatabase();
+    const models = asModels({
+      extract: vi.fn(async () => ({
+        summary: "Shared Concept has two properties.",
+        claims: [
+          {
+            subject: "Shared Concept",
+            predicate: "has state",
+            confidence: 0.9,
+            object_entity: null,
+            object_value: "active",
+          },
+          {
+            subject: "shared concept",
+            predicate: "has owner",
+            confidence: 0.9,
+            object_entity: null,
+            object_value: "team",
+          },
+        ] satisfies ExtractedClaim[],
+      })),
+      resolve: vi.fn(
+        async (
+          _request: SegmentCreate,
+          _summary: string,
+          claims: readonly ExtractedClaim[],
+          contexts: readonly MentionContext[],
+        ): Promise<ValidatedResolutionPlan> =>
+          resolutionPlan(claims, contexts, {
+            claims: [
+              { claim_id: "c0", action: "keep", reason: "supported" },
+              { claim_id: "c1", action: "keep", reason: "supported" },
+            ],
+            resolutions: [
+              {
+                mention_id: "c0.subject",
+                candidate_entity_id: null,
+                same_new_entity_as: null,
+              },
+              {
+                mention_id: "c1.subject",
+                candidate_entity_id: null,
+                same_new_entity_as: "c0.subject",
+              },
+            ],
+          }),
+      ),
+    });
+    const embeddings = new FakeEmbeddings();
+    const claimed = jobFor();
+    const engine = new ExtractionEngine(
+      asDatabase(database),
+      models,
+      asEmbeddings(embeddings),
+    );
+
+    const prepared = await engine.resolve(
+      claimed,
+      await engine.extract(claimed),
+    );
+
+    expect(prepared.entities).toHaveLength(1);
+    expect(prepared.entities[0]?.aliases).toEqual(["Shared Concept"]);
+    expect(prepared.claims[0]?.subjectEntityId).toBe(
+      prepared.claims[1]?.subjectEntityId,
+    );
+    expect(embeddings.calls[1]?.texts).toHaveLength(3);
   });
 
   test("stores only contextualized kept claims with original claim indexes", async () => {
@@ -331,7 +406,7 @@ describe("ExtractionEngine", () => {
       inputType: "document",
       texts: [
         "PR #14330 deployment order | is | log-consumer before sampling-coordinator",
-        "PR #14330 deployment order: Entity named PR #14330 deployment order.",
+        "PR #14330 deployment order: Entity named PR #14330 deployment order in claim: PR #14330 deployment order | is | log-consumer before sampling-coordinator.",
       ],
     });
     expect(embeddings.calls[1]?.texts.join("\n")).not.toContain(
@@ -389,11 +464,11 @@ describe("ExtractionEngine", () => {
         async (
           _request: SegmentCreate,
           _summary: string,
-          _claims: readonly ExtractedClaim[],
+          claims: readonly ExtractedClaim[],
           contexts: readonly MentionContext[],
-        ): Promise<ResolutionResult> => {
+        ): Promise<ValidatedResolutionPlan> => {
           receivedContexts = contexts;
-          return {
+          return resolutionPlan(claims, contexts, {
             claims: [
               { claim_id: "c0", action: "keep", reason: "supported" },
               { claim_id: "c1", action: "keep", reason: "supported" },
@@ -401,20 +476,16 @@ describe("ExtractionEngine", () => {
             resolutions: [
               {
                 mention_id: "c0.subject",
-                candidate_entity_id: selectedId.toUpperCase(),
-                canonical_name: "ignored model name",
-                description: "ignored model description",
-                aliases: ["postgres", "PG"],
+                candidate_entity_id: selectedId,
+                same_new_entity_as: null,
               },
               {
                 mention_id: "c1.subject",
                 candidate_entity_id: selectedId,
-                canonical_name: "ignored again",
-                description: "ignored again",
-                aliases: ["postgres db"],
+                same_new_entity_as: null,
               },
             ],
-          };
+          });
         },
       ),
     });
@@ -441,7 +512,7 @@ describe("ExtractionEngine", () => {
         canonicalName: "PostgreSQL",
         normalizedName: "postgresql",
         description: "A relational database",
-        aliases: ["PostgreSQL", "Postgres", "PG", "PGSQL", "postgres db"],
+        aliases: ["PostgreSQL", "Postgres", "PGSQL"],
         embedding: null,
         isNew: false,
       },
@@ -456,7 +527,152 @@ describe("ExtractionEngine", () => {
     ]);
   });
 
-  test("uses model descriptions only for new entities that had candidates", async () => {
+  test("does not persist an alias borrowed from an unselected candidate", async () => {
+    const selectedId = randomUUID();
+    const database = asDatabase({
+      priorSummaries: vi.fn(async () => []),
+      entityCandidates: vi.fn(async () => [
+        {
+          id: selectedId,
+          canonicalName: "AlphaService",
+          description: "The alpha service",
+          aliases: [],
+        },
+        {
+          id: randomUUID(),
+          canonicalName: "BetaService",
+          description: "The beta service",
+          aliases: ["beta service"],
+        },
+      ]),
+    });
+    const models = asModels({
+      extract: vi.fn(async () => ({
+        summary: "Alpha Service exists.",
+        claims: [
+          {
+            subject: "Alpha Service",
+            predicate: "exists",
+            confidence: 0.9,
+            object_entity: null,
+            object_value: "true",
+          },
+        ] satisfies ExtractedClaim[],
+      })),
+      resolve: vi.fn(
+        async (
+          _request: SegmentCreate,
+          _summary: string,
+          claims: readonly ExtractedClaim[],
+          contexts: readonly MentionContext[],
+        ): Promise<ValidatedResolutionPlan> =>
+          resolutionPlan(claims, contexts, {
+            claims: [{ claim_id: "c0", action: "keep", reason: "supported" }],
+            resolutions: [
+              {
+                mention_id: "c0.subject",
+                candidate_entity_id: selectedId,
+                same_new_entity_as: null,
+              },
+            ],
+          }),
+      ),
+    });
+    const engine = new ExtractionEngine(
+      database,
+      models,
+      asEmbeddings(new FakeEmbeddings()),
+    );
+    const claimed = jobFor({
+      ...request(),
+      messages: [{ role: "user", text: "Alpha Service exists." }],
+    });
+
+    const prepared = await engine.resolve(
+      claimed,
+      await engine.extract(claimed),
+    );
+
+    expect(prepared.entities[0]?.aliases).toEqual([
+      "AlphaService",
+      "Alpha Service",
+    ]);
+    expect(prepared.entities[0]?.aliases).not.toContain("beta service");
+  });
+
+  test("does not persist punctuated prose from an unselected candidate", async () => {
+    const database = asDatabase({
+      priorSummaries: vi.fn(async () => []),
+      entityCandidates: vi.fn(async () => [
+        {
+          id: randomUUID(),
+          canonicalName: "Unrelated Workspace",
+          description: "A separate workspace.",
+          aliases: [],
+        },
+      ]),
+    });
+    const models = asModels({
+      extract: vi.fn(async () => ({
+        summary: "Feature and Unrelated Workspace exist.",
+        claims: [
+          {
+            subject: "Feature",
+            predicate: "exists",
+            confidence: 0.9,
+            object_entity: null,
+            object_value: "true",
+          },
+        ] satisfies ExtractedClaim[],
+      })),
+      resolve: vi.fn(
+        async (
+          _request: SegmentCreate,
+          _summary: string,
+          claims: readonly ExtractedClaim[],
+          contexts: readonly MentionContext[],
+        ): Promise<ValidatedResolutionPlan> =>
+          resolutionPlan(claims, contexts, {
+            claims: [{ claim_id: "c0", action: "keep", reason: "supported" }],
+            resolutions: [
+              {
+                mention_id: "c0.subject",
+                candidate_entity_id: null,
+                same_new_entity_as: null,
+              },
+            ],
+          }),
+      ),
+    });
+    const engine = new ExtractionEngine(
+      database,
+      models,
+      asEmbeddings(new FakeEmbeddings()),
+    );
+    const claimed = jobFor({
+      ...request(),
+      messages: [
+        { role: "user", text: "Feature and Unrelated Workspace exist." },
+      ],
+    });
+
+    const prepared = await engine.resolve(
+      claimed,
+      await engine.extract(claimed),
+    );
+
+    expect(prepared.entities[0]).toMatchObject({
+      canonicalName: "Feature",
+      description: "Entity named Feature in claim: Feature | exists | true.",
+      aliases: ["Feature"],
+      isNew: true,
+    });
+    expect(prepared.entities[0]?.description).not.toContain(
+      "separate workspace",
+    );
+  });
+
+  test("derives new entity metadata from the extracted mention", async () => {
     const candidate = {
       id: randomUUID(),
       canonicalName: "Existing",
@@ -481,18 +697,22 @@ describe("ExtractionEngine", () => {
         ] satisfies ExtractedClaim[],
       })),
       resolve: vi.fn(
-        async (): Promise<ResolutionResult> => ({
-          claims: [{ claim_id: "c0", action: "keep", reason: "supported" }],
-          resolutions: [
-            {
-              mention_id: "c0.subject",
-              candidate_entity_id: null,
-              canonical_name: "New Concept",
-              description: "A source-grounded concept",
-              aliases: ["Concept"],
-            },
-          ],
-        }),
+        async (
+          _request: SegmentCreate,
+          _summary: string,
+          claims: readonly ExtractedClaim[],
+          contexts: readonly MentionContext[],
+        ): Promise<ValidatedResolutionPlan> =>
+          resolutionPlan(claims, contexts, {
+            claims: [{ claim_id: "c0", action: "keep", reason: "supported" }],
+            resolutions: [
+              {
+                mention_id: "c0.subject",
+                candidate_entity_id: null,
+                same_new_entity_as: null,
+              },
+            ],
+          }),
       ),
     });
 
@@ -508,12 +728,82 @@ describe("ExtractionEngine", () => {
     );
 
     expect(prepared.entities[0]).toMatchObject({
-      id: newEntityIdFor(jobFor().segmentId, "New Concept"),
+      id: newMentionEntityIdFor(
+        jobFor().segmentId,
+        jobFor().sourceFingerprint,
+        "c0.subject",
+        {
+          subject: "New Concept",
+          predicate: "has state",
+          object_entity: null,
+          object_value: "planned",
+        },
+      ),
       canonicalName: "New Concept",
-      description: "A source-grounded concept",
-      aliases: ["New Concept", "Concept"],
+      description:
+        "Entity named New Concept in claim: New Concept | has state | planned.",
+      aliases: ["New Concept"],
       isNew: true,
     });
+  });
+
+  test("bounds generated descriptions and embedding documents", async () => {
+    const literal = "界".repeat(10_000);
+    const database = new FakeDatabase();
+    const models = asModels({
+      extract: vi.fn(async () => ({
+        summary: "A long literal is retained.",
+        claims: [
+          {
+            subject: "New Concept",
+            predicate: "has payload",
+            confidence: 0.8,
+            object_entity: null,
+            object_value: literal,
+          },
+        ] satisfies ExtractedClaim[],
+      })),
+      resolve: vi.fn(
+        async (
+          _request: SegmentCreate,
+          _summary: string,
+          claims: readonly ExtractedClaim[],
+          contexts: readonly MentionContext[],
+        ): Promise<ValidatedResolutionPlan> =>
+          resolutionPlan(claims, contexts, {
+            claims: [{ claim_id: "c0", action: "keep", reason: "supported" }],
+            resolutions: [
+              {
+                mention_id: "c0.subject",
+                candidate_entity_id: null,
+                same_new_entity_as: null,
+              },
+            ],
+          }),
+      ),
+    });
+    const embeddings = new FakeEmbeddings();
+    const claimed = jobFor();
+    const engine = new ExtractionEngine(
+      asDatabase(database),
+      models,
+      asEmbeddings(embeddings),
+    );
+
+    const prepared = await engine.resolve(
+      claimed,
+      await engine.extract(claimed),
+    );
+
+    expect([...prepared.entities[0]!.description]).toHaveLength(2_000);
+    expect(
+      embeddings.calls
+        .flatMap((call) => call.texts)
+        .every(
+          (text) =>
+            Buffer.byteLength(text, "utf8") <= MAX_EMBEDDING_INPUT_BYTES,
+        ),
+    ).toBe(true);
   });
 
   test("skips joint resolution when extraction returns no claims", async () => {

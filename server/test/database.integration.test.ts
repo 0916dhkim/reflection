@@ -23,6 +23,7 @@ import {
   JobNotRetryableError,
   type ClaimedJob,
 } from "../src/database.js";
+import type { ValidatedExtractionResult } from "../src/extraction-validation.js";
 
 type DatabaseSettings = ConstructorParameters<typeof Database>[0];
 
@@ -58,6 +59,12 @@ function required<T>(
 
 function request(value: unknown): SegmentCreate {
   return parseSegmentCreate(value);
+}
+
+function validatedExtractionResult(
+  value: ExtractionResult,
+): ValidatedExtractionResult {
+  return value as ValidatedExtractionResult;
 }
 
 function updateRequest(
@@ -163,10 +170,9 @@ async function completeResolution(
   claimed: ClaimedJob,
   prepared: PreparedSegment,
 ): Promise<boolean> {
-  const extraction: ExtractionResult = claimed.extractionResult ?? {
-    summary: prepared.summary,
-    claims: [],
-  };
+  const extraction =
+    claimed.extractionResult ??
+    validatedExtractionResult({ summary: prepared.summary, claims: [] });
   if (
     claimed.extractionResult === null &&
     !(await database.publishExtraction(claimed, extraction))
@@ -1202,10 +1208,13 @@ describe.sequential("Database PostgreSQL integration", () => {
           ),
         );
         expect(
-          await database.publishExtraction(stagedSecond, {
-            summary: "Staged second summary",
-            claims: [],
-          }),
+          await database.publishExtraction(
+            stagedSecond,
+            validatedExtractionResult({
+              summary: "Staged second summary",
+              claims: [],
+            }),
+          ),
         ).toBe(true);
         expect(
           await database.priorSummaries("summary-session", firstSegmentId),
@@ -1310,6 +1319,11 @@ describe.sequential("Database PostgreSQL integration", () => {
         await database.pool.query(
           `UPDATE segment_targets
            SET extraction_result = $2::jsonb,
+               extraction_validation_version = 1,
+               extraction_validation_fingerprint =
+                   reflection_extraction_validation_fingerprint(
+                       $2::jsonb, 1, source_fingerprint
+                   ),
                summary_commit_fingerprint = reflection_projection_fingerprint(
                    segment_id,
                    source_boundary_version,
@@ -1328,7 +1342,10 @@ describe.sequential("Database PostgreSQL integration", () => {
         );
         expect(repairClaim.extractionResult).toBeNull();
         await expect(
-          database.publishExtraction(repairClaim, stagedBlank),
+          database.publishExtraction(
+            repairClaim,
+            validatedExtractionResult(stagedBlank),
+          ),
         ).rejects.toThrow(
           "extraction summary must contain non-whitespace text",
         );
@@ -1347,6 +1364,72 @@ describe.sequential("Database PostgreSQL integration", () => {
       }
     },
     15_000,
+  );
+
+  test.skipIf(!DATABASE_URL)(
+    "requeues a failed exact target when its staged extraction is stale",
+    async () => {
+      const database = new Database(settings());
+      await database.open();
+      try {
+        await truncate(database);
+        const source = request({
+          session_id: "stale-staged-session",
+          start_user_message_id: "turn",
+          end_user_message_id: "turn",
+          messages: [{ role: "user", text: "stale staged source" }],
+        });
+        const enqueued = await database.enqueue(source);
+        const claim = required(
+          await withClient(database, (client) =>
+            database.claimOldestJob(client),
+          ),
+        );
+        const extraction = validatedExtractionResult({
+          summary: "Staged under the old validator",
+          claims: [],
+        });
+        expect(await database.publishExtraction(claim, extraction)).toBe(true);
+        expect(
+          await database.finishFailedAttempt(claim, "resolution failed", {
+            retryAfterSeconds: null,
+          }),
+        ).toBe(true);
+        await database.pool.query(
+          `UPDATE segment_targets
+           SET extraction_validation_version = 2,
+               extraction_validation_fingerprint =
+                   reflection_extraction_validation_fingerprint(
+                       extraction_result, 2, source_fingerprint
+                   )
+           WHERE segment_id = $1`,
+          [enqueued.segment_id],
+        );
+
+        expect(await database.segmentSummaries(source.session_id)).toEqual([]);
+        const replayed = await database.enqueue(source);
+        expect(replayed).toMatchObject({ id: enqueued.id, status: "pending" });
+        const target = required(
+          (
+            await database.pool.query<
+              QueryResultRow & { extraction_result: unknown | null }
+            >(
+              "SELECT extraction_result FROM segment_targets WHERE segment_id = $1",
+              [enqueued.segment_id],
+            )
+          ).rows[0],
+        );
+        expect(target.extraction_result).toBeNull();
+        const freshClaim = required(
+          await withClient(database, (client) =>
+            database.claimOldestJob(client),
+          ),
+        );
+        expect(freshClaim.extractionResult).toBeNull();
+      } finally {
+        await database.close();
+      }
+    },
   );
 
   test.skipIf(!DATABASE_URL)(
@@ -1394,10 +1477,10 @@ describe.sequential("Database PostgreSQL integration", () => {
           ),
         );
         expect(foregroundClaim.id).toBe(foregroundJob.id);
-        const foregroundExtraction: ExtractionResult = {
+        const foregroundExtraction = validatedExtractionResult({
           summary: "Foreground staged summary",
           claims: [],
-        };
+        });
         expect(
           await database.publishExtraction(
             foregroundClaim,
@@ -1462,15 +1545,55 @@ describe.sequential("Database PostgreSQL integration", () => {
         expect(lowClaim.request.processing_priority).toBe(100);
         const subjectId = randomUUID();
         const objectId = randomUUID();
-        const lowExtraction: ExtractionResult = {
+        const lowExtraction = validatedExtractionResult({
           summary: "First sibling committed",
           claims: [],
-        };
+        });
         await database.publishExtraction(lowClaim, lowExtraction);
+        expect(
+          await database.finishFailedAttempt(lowClaim, "resolution failed", {
+            retryAfterSeconds: null,
+          }),
+        ).toBe(true);
+        await expect(
+          database.pool.query(
+            `UPDATE segment_targets
+              SET extraction_result = jsonb_set(
+                  extraction_result,
+                  '{summary}',
+                  '"rollback output"'::jsonb
+              )
+              WHERE segment_id = $1`,
+            [lowJob.segment_id],
+          ),
+        ).rejects.toThrow("segment_targets_extraction_validation_check");
+        await database.pool.query(
+          `UPDATE segment_targets
+           SET extraction_validation_version = 2,
+               extraction_validation_fingerprint =
+                   reflection_extraction_validation_fingerprint(
+                       extraction_result, 2, source_fingerprint
+                   )
+           WHERE segment_id = $1`,
+          [lowJob.segment_id],
+        );
+        expect(
+          (await database.segmentSummaries("v2-session")).some(
+            (summary) => summary.id === lowJob.segment_id,
+          ),
+        ).toBe(false);
+        await database.retryFailedJob(lowJob.id);
+        const lowRetry = required(
+          await withClient(database, (client) =>
+            database.claimOldestJob(client),
+          ),
+        );
+        expect(lowRetry.extractionResult).toBeNull();
+        await database.publishExtraction(lowRetry, lowExtraction);
         await database.commitResolution(
-          lowClaim,
+          lowRetry,
           lowExtraction,
-          preparedSegment(lowClaim, {
+          preparedSegment(lowRetry, {
             endId: "turn",
             summary: lowExtraction.summary,
             subjectId,
@@ -1503,10 +1626,10 @@ describe.sequential("Database PostgreSQL integration", () => {
             database.claimOldestJob(client),
           ),
         );
-        const advancedExtraction: ExtractionResult = {
+        const advancedExtraction = validatedExtractionResult({
           summary: "Advanced staged summary",
           claims: [],
-        };
+        });
         expect(
           await database.publishExtraction(advancedClaim, advancedExtraction),
         ).toBe(true);
@@ -1572,10 +1695,10 @@ describe.sequential("Database PostgreSQL integration", () => {
             database.claimOldestJob(client),
           ),
         );
-        const newestExtraction: ExtractionResult = {
+        const newestExtraction = validatedExtractionResult({
           summary: "Newest staged summary",
           claims: [],
-        };
+        });
         await database.publishExtraction(newestClaim, newestExtraction);
         expect(
           required(await database.getSegment(lowJob.segment_id)).claims,
@@ -1629,10 +1752,10 @@ describe.sequential("Database PostgreSQL integration", () => {
             database.claimOldestJob(client),
           ),
         );
-        const extraction: ExtractionResult = {
+        const extraction = validatedExtractionResult({
           summary: "Unicode summary 😀",
           claims: [],
-        };
+        });
         await database.publishExtraction(claim, extraction);
         const before = required(
           (
@@ -1694,6 +1817,7 @@ describe.sequential("Database PostgreSQL integration", () => {
           "005_mutable_source_snapshots.sql",
           "006_canonical_source_spans.sql",
           "007_superseded_job_status.sql",
+          "008_extraction_validation.sql",
         ]);
         expect(
           ledger.every((row) => /^[0-9a-f]{64}$/u.test(row.checksum)),
@@ -1744,7 +1868,61 @@ describe.sequential("Database PostgreSQL integration", () => {
             source.projection_version,
           ),
         );
+        const validationFingerprints = required(
+          (
+            await database.pool.query<
+              QueryResultRow & { current: string; other_source: string }
+            >(
+              `SELECT reflection_extraction_validation_fingerprint(
+                          $1::jsonb, 1, $2::char(64)
+                      ) AS current,
+                      reflection_extraction_validation_fingerprint(
+                          $1::jsonb, 1, $3::char(64)
+                      ) AS other_source`,
+              [
+                JSON.stringify(extraction),
+                sqlFingerprints.source_fingerprint,
+                "0".repeat(64),
+              ],
+            )
+          ).rows[0],
+        );
+        expect(validationFingerprints.current).not.toBe(
+          validationFingerprints.other_source,
+        );
         expect(job.segment_id).toBe(segmentIdForRequest(source));
+
+        const unstagedSource = request({
+          session_id: "old-writer-fence",
+          start_user_message_id: "turn",
+          end_user_message_id: "turn",
+          messages: [{ role: "user", text: "The service uses ModelClient." }],
+        });
+        const unstaged = await database.enqueue(unstagedSource);
+        const oldWriterExtraction = {
+          summary: "The service uses ModelClinet.",
+          claims: [],
+        };
+        await expect(
+          database.pool.query(
+            `UPDATE segment_targets
+             SET extraction_result = $2::jsonb,
+                 summary_commit_fingerprint = reflection_projection_fingerprint(
+                     segment_id,
+                     source_boundary_version,
+                     end_user_message_id,
+                     end_source_message_id,
+                     $3::text,
+                     projection_version
+                 )
+             WHERE segment_id = $1`,
+            [
+              unstaged.segment_id,
+              JSON.stringify(oldWriterExtraction),
+              oldWriterExtraction.summary,
+            ],
+          ),
+        ).rejects.toThrow("segment_targets_extraction_validation_check");
 
         const originalChecksum = required(
           ledger.find((row) => row.name === "001_init.sql"),
@@ -1759,6 +1937,110 @@ describe.sequential("Database PostgreSQL integration", () => {
           "UPDATE reflection_schema_migrations SET checksum = $1 WHERE name = '001_init.sql'",
           [originalChecksum],
         );
+      } finally {
+        await database.close();
+      }
+    },
+    15_000,
+  );
+
+  test.skipIf(!DATABASE_URL)(
+    "invalidates and requeues failed staged extraction in migration 008",
+    async () => {
+      const database = new Database(settings());
+      await database.open();
+      try {
+        await truncate(database);
+        const source = request({
+          session_id: "validation-migration",
+          start_user_message_id: "turn",
+          end_user_message_id: "turn",
+          messages: [{ role: "user", text: "The service uses ModelClient." }],
+        });
+        const job = await database.enqueue(source);
+        const claim = required(
+          await withClient(database, (client) =>
+            database.claimOldestJob(client),
+          ),
+        );
+        expect(
+          await database.publishExtraction(
+            claim,
+            validatedExtractionResult({
+              summary: "The service uses ModelClient.",
+              claims: [],
+            }),
+          ),
+        ).toBe(true);
+        expect(
+          await database.finishFailedAttempt(claim, "resolution failed", {
+            retryAfterSeconds: null,
+          }),
+        ).toBe(true);
+
+        await database.pool.query(`
+          ALTER TABLE segment_targets
+              DROP CONSTRAINT segment_targets_extraction_validation_check,
+              DROP COLUMN extraction_validation_version,
+              DROP COLUMN extraction_validation_fingerprint;
+          DELETE FROM reflection_schema_migrations
+          WHERE name = '008_extraction_validation.sql';
+        `);
+        await database.applyMigrations(MIGRATIONS_DIR);
+
+        const target = required(
+          (
+            await database.pool.query<
+              QueryResultRow & {
+                extraction_result: unknown | null;
+                summary_commit_fingerprint: string | null;
+                extraction_validation_version: number | null;
+                extraction_validation_fingerprint: string | null;
+              }
+            >(
+              `SELECT extraction_result, summary_commit_fingerprint,
+                      extraction_validation_version,
+                      extraction_validation_fingerprint
+               FROM segment_targets
+               WHERE segment_id = $1`,
+              [job.segment_id],
+            )
+          ).rows[0],
+        );
+        expect(target).toEqual({
+          extraction_result: null,
+          summary_commit_fingerprint: null,
+          extraction_validation_version: null,
+          extraction_validation_fingerprint: null,
+        });
+        const requeued = required(
+          (
+            await database.pool.query<
+              QueryResultRow & {
+                status: string;
+                attempts: number;
+                error: string | null;
+              }
+            >(
+              `SELECT status, attempts, error
+               FROM extraction_jobs
+               WHERE id = $1`,
+              [job.id],
+            )
+          ).rows[0],
+        );
+        expect(requeued).toEqual({
+          status: "pending",
+          attempts: 0,
+          error: null,
+        });
+        const freshClaim = required(
+          await withClient(database, (client) =>
+            database.claimOldestJob(client),
+          ),
+        );
+        expect(freshClaim.id).toBe(job.id);
+        expect(freshClaim.extractionResult).toBeNull();
       } finally {
         await database.close();
       }

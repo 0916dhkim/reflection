@@ -1,25 +1,43 @@
-import {
-  parseExtractionResult,
-  type ExtractedClaim,
-  type ExtractionResult,
-  type Resolution,
-} from "@reflection/shared/contracts";
+import { type ExtractedClaim } from "@reflection/shared/contracts";
 import {
   claimIdFor,
   equivalenceKey,
-  newEntityIdFor,
+  newMentionEntityIdFor,
   normalizeName,
-  validateClaimDecisions,
-  validateResolutions,
-  type EntityCandidate,
   type MentionContext,
   type PreparedClaim,
   type PreparedEntity,
   type PreparedSegment,
+  type ValidatedResolutionPlan,
 } from "@reflection/shared/domain";
 
-import { EmbeddingClient, ModelClient } from "./clients.js";
+import {
+  MAX_EMBEDDING_INPUT_BYTES,
+  EmbeddingClient,
+  ModelClient,
+} from "./clients.js";
 import type { ClaimedJob, Database } from "./database.js";
+import type { ValidatedExtractionResult } from "./extraction-validation.js";
+
+const MAX_ENTITY_DESCRIPTION_CODE_POINTS = 2_000;
+
+function truncateCodePoints(value: string, maximum: number): string {
+  if ([...value].length <= maximum) return value;
+  return [...value].slice(0, maximum).join("");
+}
+
+function truncateUtf8Bytes(value: string, maximum: number): string {
+  if (Buffer.byteLength(value, "utf8") <= maximum) return value;
+  const retained: string[] = [];
+  let bytes = 0;
+  for (const character of value) {
+    const characterBytes = Buffer.byteLength(character, "utf8");
+    if (bytes + characterBytes > maximum) break;
+    retained.push(character);
+    bytes += characterBytes;
+  }
+  return retained.join("");
+}
 
 type ExtractionDatabase = Pick<Database, "priorSummaries" | "entityCandidates">;
 type ExtractionModels = Pick<ModelClient, "extract" | "resolve">;
@@ -30,6 +48,7 @@ interface ContextSpec {
   role: string;
   text: string;
   supportingClaim: string;
+  claim: ExtractedClaim;
 }
 
 export class ExtractionEngine {
@@ -47,19 +66,17 @@ export class ExtractionEngine {
     this.#embeddings = embeddings;
   }
 
-  async extract(job: ClaimedJob): Promise<ExtractionResult> {
+  async extract(job: ClaimedJob): Promise<ValidatedExtractionResult> {
     const priorSummaries = await this.#database.priorSummaries(
       job.request.session_id,
       job.segmentId,
     );
-    return parseExtractionResult(
-      await this.#models.extract(job.request, priorSummaries),
-    );
+    return this.#models.extract(job.request, priorSummaries);
   }
 
   async resolve(
     job: ClaimedJob,
-    extracted: ExtractionResult,
+    extracted: ValidatedExtractionResult,
   ): Promise<PreparedSegment> {
     const contextSpecs: ContextSpec[] = [];
     for (const [index, claim] of extracted.claims.entries()) {
@@ -69,6 +86,7 @@ export class ExtractionEngine {
         role: "subject",
         text: claim.subject,
         supportingClaim,
+        claim,
       });
       if (claim.object_entity !== null) {
         contextSpecs.push({
@@ -76,13 +94,17 @@ export class ExtractionEngine {
           role: "object",
           text: claim.object_entity,
           supportingClaim,
+          claim,
         });
       }
     }
 
     const candidateInputs = contextSpecs.map(
       ({ role, text, supportingClaim }) =>
-        `Entity mention: ${text}\nEndpoint role: ${role}\nSupporting claim: ${supportingClaim}\nSegment summary: ${extracted.summary}`,
+        truncateUtf8Bytes(
+          `Entity mention: ${text}\nEndpoint role: ${role}\nSupporting claim: ${supportingClaim}\nSegment summary: ${extracted.summary}`,
+          MAX_EMBEDDING_INPUT_BYTES,
+        ),
     );
     const mentionEmbeddings = await this.#embeddings.embed(
       candidateInputs,
@@ -103,90 +125,81 @@ export class ExtractionEngine {
       supportingClaim: spec.supportingClaim,
       candidates: candidateSets[index]!,
     }));
+    const claimsByMentionId = new Map(
+      contextSpecs.map((spec) => [spec.mentionId, spec.claim]),
+    );
 
-    let triagedClaims: Array<{ index: number; claim: ExtractedClaim }>;
-    let keptContexts: MentionContext[];
-    let validated: ReturnType<typeof validateResolutions>;
+    let plan: ValidatedResolutionPlan = { keptClaims: [], mentions: [] };
     if (contexts.length > 0) {
-      const resolutionResult = await this.#models.resolve(
+      plan = await this.#models.resolve(
         job.request,
         extracted.summary,
         extracted.claims,
         contexts,
       );
-      triagedClaims = validateClaimDecisions(
-        extracted.claims,
-        resolutionResult,
-      );
-      const keptContextIds = new Set<string>();
-      for (const { index, claim } of triagedClaims) {
-        keptContextIds.add(`c${index}.subject`);
-        if (claim.object_entity !== null) {
-          keptContextIds.add(`c${index}.object`);
-        }
-      }
-      keptContexts = contexts.filter((context) =>
-        keptContextIds.has(context.mentionId),
-      );
-      validated = validateResolutions(keptContexts, resolutionResult);
       console.info("claim triage completed", {
         proposed: extracted.claims.length,
-        kept: triagedClaims.length,
-        dropped: extracted.claims.length - triagedClaims.length,
+        kept: plan.keptClaims.length,
+        dropped: extracted.claims.length - plan.keptClaims.length,
       });
-    } else {
-      triagedClaims = [];
-      keptContexts = [];
-      validated = new Map();
     }
 
     const entitiesById = new Map<string, PreparedEntity>();
     const occurrenceEntities = new Map<string, PreparedEntity>();
-    for (const context of keptContexts) {
-      const validatedResolution = validated.get(context.mentionId);
-      if (validatedResolution === undefined) {
-        throw new Error(
-          `missing validated resolution for ${context.mentionId}`,
-        );
-      }
-      const resolution = validatedResolution.resolution;
-      const candidate = ExtractionEngine.#selectedCandidate(
-        context,
-        resolution,
-      );
-
+    for (const {
+      context,
+      resolution,
+      selectedCandidate: candidate,
+    } of plan.mentions) {
       let entityId: string;
       let canonicalName: string;
       let description: string;
       let aliases: readonly string[];
       let isNew: boolean;
       if (candidate === null) {
-        canonicalName = resolution.canonical_name;
-        if (context.candidates.length > 0) {
-          description = resolution.description;
+        if (resolution.same_new_entity_as === null) {
+          canonicalName = context.text;
+          description = truncateCodePoints(
+            `Entity named ${canonicalName} in claim: ${context.supportingClaim}.`,
+            MAX_ENTITY_DESCRIPTION_CODE_POINTS,
+          );
           aliases = ExtractionEngine.#uniqueAliases(
             canonicalName,
             context.text,
-            ...resolution.aliases,
           );
+          entityId = newMentionEntityIdFor(
+            job.segmentId,
+            job.sourceFingerprint,
+            context.mentionId,
+            claimsByMentionId.get(context.mentionId)!,
+          );
+          isNew = true;
         } else {
-          description = `Entity named ${canonicalName}.`;
+          const groupedEntity = occurrenceEntities.get(
+            resolution.same_new_entity_as,
+          );
+          if (groupedEntity === undefined) {
+            throw new Error(
+              `validated new-entity group missing for ${context.mentionId}`,
+            );
+          }
+          entityId = groupedEntity.id;
+          canonicalName = groupedEntity.canonicalName;
+          description = groupedEntity.description;
           aliases = ExtractionEngine.#uniqueAliases(
-            canonicalName,
+            ...groupedEntity.aliases,
             context.text,
           );
+          isNew = groupedEntity.isNew;
         }
-        entityId = newEntityIdFor(job.segmentId, canonicalName);
-        isNew = true;
       } else {
         entityId = candidate.id;
         canonicalName = candidate.canonicalName;
         description = candidate.description;
         aliases = ExtractionEngine.#uniqueAliases(
           canonicalName,
-          context.text,
-          ...resolution.aliases,
           ...candidate.aliases,
+          context.text,
         );
         isNew = false;
       }
@@ -216,11 +229,17 @@ export class ExtractionEngine {
 
     let entities = [...entitiesById.values()];
     const newEntities = entities.filter((entity) => entity.isNew);
-    const claimTexts = triagedClaims.map(({ claim }) =>
-      ExtractionEngine.#claimText(claim),
+    const claimTexts = plan.keptClaims.map(({ claim }) =>
+      truncateUtf8Bytes(
+        ExtractionEngine.#claimText(claim),
+        MAX_EMBEDDING_INPUT_BYTES,
+      ),
     );
-    const entityTexts = newEntities.map(
-      (entity) => `${entity.canonicalName}: ${entity.description}`,
+    const entityTexts = newEntities.map((entity) =>
+      truncateUtf8Bytes(
+        `${entity.canonicalName}: ${entity.description}`,
+        MAX_EMBEDDING_INPUT_BYTES,
+      ),
     );
     const documentEmbeddings = await this.#embeddings.embed(
       [...claimTexts, ...entityTexts],
@@ -228,12 +247,12 @@ export class ExtractionEngine {
     );
     if (
       documentEmbeddings.length !==
-      triagedClaims.length + newEntities.length
+      plan.keptClaims.length + newEntities.length
     ) {
       throw new Error("embedding response did not match prepared documents");
     }
-    const claimEmbeddings = documentEmbeddings.slice(0, triagedClaims.length);
-    const entityEmbeddings = documentEmbeddings.slice(triagedClaims.length);
+    const claimEmbeddings = documentEmbeddings.slice(0, plan.keptClaims.length);
+    const entityEmbeddings = documentEmbeddings.slice(plan.keptClaims.length);
     const embeddingByEntity = new Map(
       newEntities.map((entity, index) => [entity.id, entityEmbeddings[index]!]),
     );
@@ -242,7 +261,7 @@ export class ExtractionEngine {
       embedding: embeddingByEntity.get(entity.id) ?? null,
     }));
 
-    const claims: PreparedClaim[] = triagedClaims.map(
+    const claims: PreparedClaim[] = plan.keptClaims.map(
       ({ index, claim }, embeddingIndex) => {
         const subjectEntity = occurrenceEntities.get(`c${index}.subject`);
         if (subjectEntity === undefined) {
@@ -287,21 +306,6 @@ export class ExtractionEngine {
       claims,
       projectionVersion: job.request.projection_version,
     };
-  }
-
-  static #selectedCandidate(
-    context: MentionContext,
-    resolution: Resolution,
-  ): EntityCandidate | null {
-    if (resolution.candidate_entity_id === null) return null;
-    const candidate = context.candidates.find(
-      (item) =>
-        item.id.toLowerCase() === resolution.candidate_entity_id?.toLowerCase(),
-    );
-    if (candidate === undefined) {
-      throw new Error(`validated candidate missing for ${context.mentionId}`);
-    }
-    return candidate;
   }
 
   static #claimText(claim: ExtractedClaim): string {

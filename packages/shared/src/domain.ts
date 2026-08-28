@@ -140,12 +140,31 @@ export function projectionFingerprintForBoundary(
   return createHash("sha256").update(source, "utf8").digest("hex");
 }
 
-export function newEntityIdFor(
+export function newMentionEntityIdFor(
   segmentId: string,
-  canonicalName: string,
+  sourceFingerprint: string,
+  mentionId: string,
+  claim: Pick<
+    ExtractedClaim,
+    "subject" | "predicate" | "object_entity" | "object_value"
+  >,
 ): string {
+  if ((claim.object_entity === null) === (claim.object_value === null)) {
+    throw new ExtractionValidationError(
+      "new mention identity requires exactly one entity object or literal value",
+    );
+  }
+  const objectKind = claim.object_entity === null ? "literal" : "entity";
+  const objectText = claim.object_entity ?? claim.object_value!;
   return uuidv5(
-    `${segmentId}\0${normalizeName(canonicalName)}`,
+    "reflection-new-mention-v1:" +
+      utf8Frame(segmentId) +
+      utf8Frame(sourceFingerprint) +
+      utf8Frame(mentionId) +
+      utf8Frame(claim.subject) +
+      utf8Frame(claim.predicate) +
+      utf8Frame(objectKind) +
+      utf8Frame(objectText),
     ENTITY_NAMESPACE,
   );
 }
@@ -257,55 +276,26 @@ export function unionCandidates(
   return [...byId.values()];
 }
 
-export function validateResolutions(
-  contexts: readonly MentionContext[],
-  result: ResolutionResult,
-): Map<string, { context: MentionContext; resolution: Resolution }> {
-  const expected = new Map(
-    contexts.map((context) => [context.mentionId, context]),
-  );
-  const actual = new Map(
-    result.resolutions.map((resolution) => [resolution.mention_id, resolution]),
-  );
-  if (actual.size !== result.resolutions.length) {
-    throw new ExtractionValidationError(
-      "entity resolution returned duplicate mention IDs",
-    );
-  }
-  if (
-    actual.size !== expected.size ||
-    [...actual.keys()].some((mentionId) => !expected.has(mentionId))
-  ) {
-    throw new ExtractionValidationError(
-      "entity resolution must return every mention exactly once",
-    );
-  }
-  const validated = new Map<
-    string,
-    { context: MentionContext; resolution: Resolution }
-  >();
-  for (const [mentionId, resolution] of actual) {
-    const context = expected.get(mentionId)!;
-    const allowed = new Set(
-      context.candidates.map((candidate) => candidate.id.toLowerCase()),
-    );
-    if (
-      resolution.candidate_entity_id !== null &&
-      !allowed.has(resolution.candidate_entity_id.toLowerCase())
-    ) {
-      throw new ExtractionValidationError(
-        `entity resolution selected an unknown candidate for ${mentionId}`,
-      );
-    }
-    validated.set(mentionId, { context, resolution });
-  }
-  return validated;
+export interface ValidatedClaimDecision {
+  index: number;
+  claim: ExtractedClaim;
 }
 
-export function validateClaimDecisions(
+export interface ValidatedMentionResolution {
+  context: MentionContext;
+  resolution: Resolution;
+  selectedCandidate: EntityCandidate | null;
+}
+
+export interface ValidatedResolutionPlan {
+  keptClaims: readonly ValidatedClaimDecision[];
+  mentions: readonly ValidatedMentionResolution[];
+}
+
+function validateClaimDecisions(
   proposed: readonly ExtractedClaim[],
   result: ResolutionResult,
-): Array<{ index: number; claim: ExtractedClaim }> {
+): ValidatedClaimDecision[] {
   const expected = new Set(proposed.map((_, index) => `c${index}`));
   const actual = new Map(
     result.claims.map((decision) => [decision.claim_id, decision]),
@@ -326,6 +316,79 @@ export function validateClaimDecisions(
   return proposed.flatMap((claim, index) =>
     actual.get(`c${index}`)!.action === "keep" ? [{ index, claim }] : [],
   );
+}
+
+export function validateResolutionResult(
+  proposed: readonly ExtractedClaim[],
+  contexts: readonly MentionContext[],
+  result: ResolutionResult,
+): ValidatedResolutionPlan {
+  const keptClaims = validateClaimDecisions(proposed, result);
+  const keptMentionIds = new Set<string>();
+  for (const { index, claim } of keptClaims) {
+    keptMentionIds.add(`c${index}.subject`);
+    if (claim.object_entity !== null) keptMentionIds.add(`c${index}.object`);
+  }
+  const keptContexts = contexts.filter((context) =>
+    keptMentionIds.has(context.mentionId),
+  );
+  const expected = new Map(
+    keptContexts.map((context) => [context.mentionId, context]),
+  );
+  const contextIndexes = new Map(
+    keptContexts.map((context, index) => [context.mentionId, index]),
+  );
+  const actual = new Map(
+    result.resolutions.map((resolution) => [resolution.mention_id, resolution]),
+  );
+  if (actual.size !== result.resolutions.length) {
+    throw new ExtractionValidationError(
+      "entity resolution returned duplicate mention IDs",
+    );
+  }
+  if (
+    actual.size !== expected.size ||
+    [...actual.keys()].some((mentionId) => !expected.has(mentionId))
+  ) {
+    throw new ExtractionValidationError(
+      "entity resolution must return every mention exactly once",
+    );
+  }
+  const mentions: ValidatedMentionResolution[] = [];
+  for (const context of keptContexts) {
+    const resolution = actual.get(context.mentionId)!;
+    const selectedCandidate =
+      resolution.candidate_entity_id === null
+        ? null
+        : (context.candidates.find(
+            (candidate) => candidate.id === resolution.candidate_entity_id,
+          ) ?? null);
+    if (resolution.candidate_entity_id !== null && selectedCandidate === null) {
+      throw new ExtractionValidationError(
+        `entity resolution selected an unknown candidate for ${context.mentionId}`,
+      );
+    }
+    if (resolution.same_new_entity_as !== null) {
+      const groupedContext = expected.get(resolution.same_new_entity_as);
+      const groupedResolution = actual.get(resolution.same_new_entity_as);
+      if (
+        resolution.candidate_entity_id !== null ||
+        groupedContext === undefined ||
+        groupedResolution === undefined ||
+        groupedResolution.candidate_entity_id !== null ||
+        groupedResolution.same_new_entity_as !== null ||
+        contextIndexes.get(resolution.same_new_entity_as)! >=
+          contextIndexes.get(context.mentionId)! ||
+        normalizeName(groupedContext.text) !== normalizeName(context.text)
+      ) {
+        throw new ExtractionValidationError(
+          `entity resolution returned an invalid new-entity group for ${context.mentionId}`,
+        );
+      }
+    }
+    mentions.push({ context, resolution, selectedCandidate });
+  }
+  return { keptClaims, mentions };
 }
 
 function clamp(value: number): number {

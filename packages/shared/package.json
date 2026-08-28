@@ -6,7 +6,8 @@
   "exports": {
     "./contracts": "./src/contracts.ts",
     "./domain": "./src/domain.ts",
-    "./segmentation": "./src/segmentation.ts"
+    "./segmentation": "./src/segmentation.ts",
+    "./tool-source": "./src/tool-source.ts"
   },
   "scripts": {
     "test": "vitest run",

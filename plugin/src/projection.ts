@@ -5,16 +5,18 @@ import {
   isModelVisiblePart,
   isNormalUserMessage,
   isProjectionLossWarningMessage,
-  modelVisibleMediaTokens,
-  modelVisibleToolAttachmentTokens,
-  modelVisibleToolInlineDataTokens,
-  modelVisibleToolStateSize,
   PROJECTION_LOSS_WARNING,
   submissionSourceFingerprint,
   textOf,
   type OpenCodeMessage,
   type ReflectionSegment,
 } from "@reflection/shared/segmentation";
+import {
+  modelVisibleMediaTokens,
+  modelVisibleToolAttachmentTokens,
+  modelVisibleToolInlineDataTokens,
+  modelVisibleToolStateSize,
+} from "@reflection/shared/tool-source";
 import type { SegmentSummary } from "@reflection/shared/contracts";
 import { segmentIdForRequest } from "@reflection/shared/domain";
 

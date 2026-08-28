@@ -45,7 +45,7 @@ The worker has two durable phases:
 
 A staged summary can therefore appear in the session manifest while its job is still `running`. This is intentional so a foreground context transform can use the exact summary without waiting for entity resolution. A staged summary does not mean claims are available or the job succeeded. Use `GET /v1/jobs/{id}` for full job state; `GET /v1/segments/{id}` exposes only fully committed summaries and resolved claims.
 
-Interrupted workers recover running jobs. Every attempt has a lease UUID, and staged extraction plus final resolution must still match the lease, generation, source fingerprint, projection version, and exact v1/v2 boundary. Stale work cannot commit after a target changes. Retryable model, network, schema, and resolution failures use the configured attempt budget. Deterministically invalid persisted input and oversized embedding input fail terminally.
+Interrupted workers recover running jobs. Every attempt has a lease UUID, and staged extraction plus final resolution must still match the lease, generation, source fingerprint, projection version, exact v1/v2 boundary, and current deterministic-validation version. Staged output from an older validation policy is re-extracted instead of reused or projected. Stale work cannot commit after a target changes. Retryable model, network, schema, and resolution failures use the configured attempt budget. Deterministically invalid persisted input and oversized embedding input fail terminally.
 
 Extraction and source-aware resolution currently use GPT-5.6 Luna through OpenRouter's OpenAI route with native strict JSON Schema. Voyage `voyage-4-large` supplies 1,024-dimensional embeddings. Source payloads remain only while a target is pending, running, or failed; successful or superseded completion clears duplicated transcript payloads. API responses never return stored source messages.
 
@@ -85,6 +85,8 @@ Content-Type: application/json
 ```
 
 Requests that omit all three source-boundary fields are normalized to legacy v1. New plugin and backfill writers always send the canonical fields explicitly.
+
+When a source span has no visible text, writers render bounded tool state. Identifier validation recognizes only complete tool blocks whose name and state canonically round-trip through the shared renderer, then scans parsed string values rather than JSON escape syntax.
 
 ### Other endpoints
 
@@ -233,7 +235,7 @@ An authoritative dry run reads `manifest_version: 2`, validates deterministic ID
 
 The stop-first Node cutover and production canary are complete. The checklist remains the authoritative procedure for recreating or auditing that boundary; it is not a pending rollout plan.
 
-Migration `006_canonical_source_spans.sql` is a forward-only writer boundary. Migration `007_superseded_job_status.sql` exposes discarded extraction work as `superseded` instead of reporting false success. Use a stop-first deployment; never perform a rolling Python/Node or old/new plugin rollout. Any change to submitted source rendering or fingerprint framing is also a stop-first writer boundary even when its projection version is unchanged: stop backfill and every plugin writer, build both writers from the same revision, install them together, and only then resume. Mixed source renderers can otherwise alternate fingerprints and target generations for the same span.
+Migrations `006_canonical_source_spans.sql` and `008_extraction_validation.sql` are forward-only writer boundaries. Migration 008 rejects extraction writes from an older Node server, and an older server's `/healthz` does not detect that incompatibility. Stop every old API/worker replica before a new replica applies either migration; after migration 008, rollback requires fixing forward or restoring the pre-migration database backup. Migration `007_superseded_job_status.sql` exposes discarded extraction work as `superseded` instead of reporting false success. Use a stop-first deployment; never perform a rolling Python/Node, old/new Node, or old/new plugin rollout. Any change to submitted source rendering or fingerprint framing is also a stop-first writer boundary even when its projection version is unchanged: stop backfill and every plugin writer, build both writers from the same revision, install them together, and only then resume. Mixed source renderers can otherwise alternate fingerprints and target generations for the same span.
 
 1. Build and verify the Node server, `plugin/dist/reflection.js`, and `scripts/backfill.mjs` from the same revision.
 2. Stop the old backfill supervisor and confirm no backfill process remains.

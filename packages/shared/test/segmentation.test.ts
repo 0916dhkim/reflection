@@ -4,14 +4,17 @@ import { sourceFingerprint } from "../src/domain.js";
 import {
   PROJECTION_LOSS_WARNING,
   PROJECTION_LOSS_WARNING_METADATA,
+  canonicalToolFallbackBlocks,
   isModelVisibleMessage,
   isNormalUserMessage,
   isProjectionLossWarningMessage,
+  modelVisibleToolState,
   readSegmentMessages,
   segmentMessages,
   submissionSourceFingerprint,
   textOf,
   modelVisibleCharWeightOf,
+  toolFallbackFrameRanges,
   type CommittedSegmentBoundary,
   type OpenCodeMessage,
 } from "../src/segmentation.js";
@@ -113,6 +116,7 @@ describe("textOf", () => {
         state: {
           status: "completed",
           input: {
+            alpha: "first",
             pattern: "needle",
             note: "metadata: preserved",
             embedded: "prefix data:image/png;base64,INPUT suffix",
@@ -137,8 +141,15 @@ describe("textOf", () => {
     expect(segment.messages).toHaveLength(1);
     const rendered = segment.messages[0]?.text ?? "";
     expect(rendered).toContain('[Tool "grep"]');
-    expect(rendered).toContain('"pattern":"needle"');
-    expect(rendered).toContain('"note":"metadata: preserved"');
+    expect(canonicalToolFallbackBlocks(rendered)).toEqual([
+      expect.objectContaining({
+        state: expect.objectContaining({ output: "match" }),
+      }),
+    ]);
+    expect(rendered).toContain('["pattern","needle"]');
+    expect(rendered).toContain('["[data URL key omitted 1]","key value"]');
+    expect(rendered).toContain('["alpha","first"]');
+    expect(rendered).toContain('["note","metadata: preserved"]');
     expect(rendered).toContain('"output":"match"');
     expect(rendered).toContain("[data URL omitted]");
     expect(rendered).not.toContain("private reasoning");
@@ -196,6 +207,220 @@ describe("textOf", () => {
     );
   });
 
+  it("recognizes renderer output when integer keys reorder redacted keys", () => {
+    const toolStep = assistant("a1", "u1");
+    toolStep.info.finish = "tool-calls";
+    toolStep.parts = [
+      {
+        type: "tool",
+        tool: "read",
+        state: { "0": "zero", " data:text/plain,x": "secret" },
+      },
+    ];
+    const segment = segmentMessages([user("u1", "inspect"), toolStep], 20_000, [
+      v2Boundary("u1", "a1", "a1"),
+    ]).find((candidate) => candidate.startSourceMessageId === "a1");
+    const rendered = segment?.messages[0]?.text ?? "";
+
+    expect(rendered).toContain(
+      '{"[Sanitized tool object]":[["[data URL key omitted 0]","secret"],["0","zero"]]}',
+    );
+    expect(canonicalToolFallbackBlocks(rendered)).toHaveLength(1);
+  });
+
+  it("preserves placeholder-shaped literal tool keys", () => {
+    const toolStep = assistant("a1", "u1");
+    toolStep.info.finish = "tool-calls";
+    toolStep.parts = [
+      {
+        type: "tool",
+        tool: "read",
+        state: { "[data URL key omitted 1]": "literal" },
+      },
+    ];
+    const segment = segmentMessages([user("u1", "inspect"), toolStep], 20_000, [
+      v2Boundary("u1", "a1", "a1"),
+    ]).find((candidate) => candidate.startSourceMessageId === "a1");
+
+    expect(
+      canonicalToolFallbackBlocks(segment?.messages[0]?.text ?? ""),
+    ).toHaveLength(1);
+  });
+
+  it("recognizes renderer output when a redaction collides with a literal key", () => {
+    const state = {
+      a: "ordinary",
+      "[data URL key omitted 0]": "literal",
+      " data:text/plain,x": "collides",
+      "z data:text/plain,x": "late redaction",
+    };
+    const encoded = JSON.stringify(modelVisibleToolState(state));
+
+    expect(
+      canonicalToolFallbackBlocks(`\n[Tool "read"]\n${encoded}\n[/Tool]\n`),
+    ).toHaveLength(1);
+  });
+
+  it("round-trips nested entry-array renderer output at the logical depth limit", () => {
+    let nested: unknown = { value: String.raw`C:\Temp\File` };
+    for (let depth = 0; depth < 5; depth += 1) nested = { child: nested };
+    const encoded = JSON.stringify(
+      modelVisibleToolState({ "data:text/plain,key": nested }),
+    );
+
+    expect(
+      canonicalToolFallbackBlocks(`\n[Tool "read"]\n${encoded}\n[/Tool]\n`),
+    ).toHaveLength(1);
+  });
+
+  it("recognizes legacy flat-key renderer output during mixed-version rollout", () => {
+    const encoded = JSON.stringify({
+      alpha: "first",
+      "[data URL key omitted 1]": "secret",
+      path: String.raw`C:\Temp\OldFile`,
+    });
+
+    expect(
+      canonicalToolFallbackBlocks(`\n[Tool "read"]\n${encoded}\n[/Tool]\n`),
+    ).toHaveLength(1);
+  });
+
+  it("recognizes legacy placeholder collisions without classification search", () => {
+    const rawState = Object.fromEntries([
+      ...Array.from({ length: 18 }, (_, offset) => [
+        `[data URL key omitted ${18 + offset}]`,
+        `literal-${offset}`,
+      ]),
+      ...Array.from({ length: 18 }, (_, offset) => [
+        `data:text/plain,key-${offset}`,
+        `redacted-${offset}`,
+      ]),
+    ]);
+    const legacyState = Object.fromEntries(
+      Object.entries(rawState)
+        .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
+        .map(([key, value], index) => [
+          key.startsWith("data:") ? `[data URL key omitted ${index}]` : key,
+          value,
+        ]),
+    );
+    const encoded = JSON.stringify(legacyState);
+
+    expect(
+      canonicalToolFallbackBlocks(`\n[Tool "read"]\n${encoded}\n[/Tool]\n`),
+    ).toHaveLength(1);
+  });
+
+  it("recognizes nested legacy placeholder collisions", () => {
+    const encoded = JSON.stringify({
+      a: {
+        "[data URL key omitted 2]": 0,
+        "[data URL key omitted 1]": String.raw`C:\Temp\OldFile`,
+      },
+    });
+
+    expect(
+      canonicalToolFallbackBlocks(`\n[Tool "read"]\n${encoded}\n[/Tool]\n`),
+    ).toHaveLength(1);
+  });
+
+  it("recognizes mixed literal and redacted placeholder keys without a count cliff", () => {
+    const state = Object.fromEntries([
+      ...Array.from({ length: 20 }, (_, index) => [
+        `[data URL key omitted ${100 + index}]`,
+        `literal-${index}`,
+      ]),
+      ["a", "ordinary"],
+      ["z data:text/plain,x", "redacted"],
+    ]);
+    const encoded = JSON.stringify(modelVisibleToolState(state));
+
+    expect(
+      canonicalToolFallbackBlocks(`\n[Tool "read"]\n${encoded}\n[/Tool]\n`),
+    ).toHaveLength(1);
+  });
+
+  it("recognizes a deterministic corpus of colliding renderer keys", () => {
+    let randomState = 0x9e3779b9;
+    const random = (): number => {
+      randomState = (Math.imul(randomState, 1_664_525) + 1_013_904_223) >>> 0;
+      return randomState;
+    };
+    for (let sample = 0; sample < 500; sample += 1) {
+      const entries = Array.from({ length: 24 }, (_, index) => {
+        const kind = random() % 3;
+        const prefix = String.fromCodePoint(32 + (random() % 90));
+        const key =
+          kind === 0
+            ? `${prefix}key-${sample}-${index}`
+            : kind === 1
+              ? `[data URL key omitted ${random() % 40}]`
+              : `${prefix} data:text/plain,${sample}-${index}`;
+        return [key, `${sample}-${index}`];
+      });
+      const encoded = JSON.stringify(
+        modelVisibleToolState(Object.fromEntries(entries)),
+      );
+      expect(
+        canonicalToolFallbackBlocks(`\n[Tool "read"]\n${encoded}\n[/Tool]\n`),
+        `sample ${sample}: ${encoded}`,
+      ).toHaveLength(1);
+    }
+  });
+
+  it("scans contract-sized malformed tool blocks without reparsing suffixes", () => {
+    const unit = '\n[Tool "read"]\n{';
+    const malformed = unit.repeat(Math.floor(1_000_000 / unit.length));
+    expect(canonicalToolFallbackBlocks(malformed)).toEqual([]);
+    expect(toolFallbackFrameRanges(malformed)).toEqual([
+      { start: 0, end: malformed.length },
+    ]);
+  });
+
+  it("rejects complete tool frames beyond the renderer budget", () => {
+    const encoded = JSON.stringify({ output: "x".repeat(20_000) });
+    const frame = `\n[Tool "read"]\n${encoded}\n[/Tool]\n`;
+    expect(frame.length).toBeGreaterThan(20_000);
+    expect(canonicalToolFallbackBlocks(frame)).toEqual([]);
+  });
+
+  it("returns complete bounded frames for caller-level aggregate budgeting", () => {
+    const encoded = JSON.stringify({ output: "x".repeat(11_000) });
+    const frame = `\n[Tool "read"]\n${encoded}\n[/Tool]\n`;
+    expect(canonicalToolFallbackBlocks(`${frame}${frame}`)).toHaveLength(2);
+  });
+
+  it("rejects framed tool blocks that are not canonical renderer output", () => {
+    expect(
+      canonicalToolFallbackBlocks(
+        '\n[Tool "read"]\nnot-json\\ntool_admin\n[/Tool]\n',
+      ),
+    ).toEqual([]);
+    expect(
+      canonicalToolFallbackBlocks('\n[Tool "read"]\n{"z":1,"a":2}\n[/Tool]\n'),
+    ).toEqual([]);
+    expect(
+      canonicalToolFallbackBlocks(
+        '\n[Tool "bad\\q"]\n{"a":2,"z":1}\n[/Tool]\n',
+      ),
+    ).toEqual([]);
+    expect(
+      canonicalToolFallbackBlocks(
+        '\n[Tool "data:text/plain,x"]\n{"a":2,"z":1}\n[/Tool]\n',
+      ),
+    ).toEqual([]);
+    expect(
+      canonicalToolFallbackBlocks(
+        `\n[Tool ${JSON.stringify("x".repeat(501))}]\n{"a":2,"z":1}\n[/Tool]\n`,
+      ),
+    ).toEqual([]);
+    expect(
+      canonicalToolFallbackBlocks(
+        '\n[Tool "read"]\n{"[data URL key omitted 0]":"value","":"x"}\n[/Tool]\n',
+      ),
+    ).toEqual([]);
+  });
+
   it("preserves text-only extraction payloads for mixed source messages", () => {
     const mixed = assistant("a1", "u1", "visible answer");
     mixed.parts = [
@@ -243,8 +468,40 @@ describe("textOf", () => {
       v2Boundary("u1", "a1", "a1"),
     );
 
-    expect(rendered?.text).toHaveLength(20_000);
+    expect(rendered?.text.length).toBeLessThanOrEqual(20_000);
     expect(rendered?.text.endsWith("[Tool activity truncated]")).toBe(true);
+    expect(rendered?.text).toContain('[Tool "read"]');
+    expect(rendered?.text).toContain(
+      '"[Tool state omitted: exceeds fallback budget]"',
+    );
+    expect(canonicalToolFallbackBlocks(rendered?.text ?? "")).toHaveLength(1);
+    expect(rendered?.text).not.toContain('"output":"xxx');
+    expect(rendered?.text).not.toContain("unreachable");
+  });
+
+  it("keeps the truncation marker inside the tool budget after prior output", () => {
+    const toolStep = assistant("a1", "u1");
+    toolStep.info.finish = "tool-calls";
+    toolStep.parts = [
+      {
+        type: "tool",
+        tool: "read",
+        state: { status: "completed", output: "x".repeat(19_937) },
+      },
+      {
+        type: "tool",
+        tool: "read",
+        state: { status: "completed", output: "unreachable" },
+      },
+    ];
+    const [rendered] = readSegmentMessages(
+      [user("u1", "inspect"), toolStep],
+      v2Boundary("u1", "a1", "a1"),
+    );
+
+    expect(rendered?.text.length).toBeLessThanOrEqual(20_000);
+    expect(rendered?.text.endsWith("[Tool activity truncated]")).toBe(true);
+    expect(canonicalToolFallbackBlocks(rendered?.text ?? "")).toHaveLength(1);
     expect(rendered?.text).not.toContain("unreachable");
   });
 
@@ -494,6 +751,32 @@ describe("segmentMessages", () => {
         closed: false,
       },
     ]);
+  });
+
+  it("charges entry-array envelope expansion to the segment weight", () => {
+    const message = assistant("a1", "u1");
+    message.info.finish = "tool-calls";
+    message.parts = [
+      {
+        type: "tool",
+        tool: "custom",
+        state: Object.fromEntries(
+          Array.from({ length: 200 }, (_, index) => [
+            `data:text/plain,${index}`,
+            { value: index },
+          ]),
+        ),
+      },
+    ];
+    const [rendered] = readSegmentMessages(
+      [user("u1", "inspect"), message],
+      v2Boundary("u1", "a1", "a1"),
+    );
+    if (!rendered) throw new Error("missing rendered tool source");
+
+    expect(modelVisibleCharWeightOf(message)).toBeGreaterThanOrEqual(
+      rendered.text.length,
+    );
   });
 
   it("reserves model-visible media carried by tool results", () => {

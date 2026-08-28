@@ -361,4 +361,37 @@ describe("model contracts", () => {
       }),
     ).toThrow("does not match");
   });
+
+  it("defaults legacy resolution grouping metadata to null", () => {
+    expect(
+      parseResolutionResult({
+        claims: [],
+        resolutions: [
+          {
+            mention_id: "c0.subject",
+            candidate_entity_id: null,
+          },
+        ],
+      }).resolutions[0],
+    ).toEqual({
+      mention_id: "c0.subject",
+      candidate_entity_id: null,
+      same_new_entity_as: null,
+    });
+  });
+
+  it("rejects unknown resolution fields before applying legacy defaults", () => {
+    expect(() =>
+      parseResolutionResult({
+        claims: [],
+        resolutions: [
+          {
+            mention_id: "c0.subject",
+            candidate_entity_id: null,
+            same_new_entity_ass: null,
+          },
+        ],
+      }),
+    ).toThrow(ContractValidationError);
+  });
 });
