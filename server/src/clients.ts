@@ -498,35 +498,42 @@ function truncateUtf8Bytes(value: string, maximum: number): string {
   return retained.join("");
 }
 
+function compactAsciiJsonByteLength(value: unknown): number {
+  return Buffer.byteLength(compactAsciiJson(value), "utf8");
+}
+
 function resolutionPromptMentions(
   mentions: readonly MentionContext[],
 ): Array<Record<string, unknown>> {
   const candidates = mentions.map((mention) =>
-    mention.candidates.map((candidate) => ({
-      entity_id: candidate.id,
-      canonical_name: truncateUtf8Bytes(candidate.canonicalName, 256),
-      description: "",
-      aliases: [] as string[],
-    })),
+    mention.candidates.map((candidate) => {
+      if (codePointLength(candidate.canonicalName) > 500) {
+        throw new TerminalExtractionValidationError(
+          "entity candidate name exceeds the extraction contract",
+        );
+      }
+      return {
+        entity_id: candidate.id,
+        canonical_name: candidate.canonicalName,
+        description: "",
+        aliases: [] as string[],
+      };
+    }),
   );
-  let candidateBytes = Buffer.byteLength(JSON.stringify(candidates), "utf8");
+  let candidateBytes = compactAsciiJsonByteLength(candidates);
   if (candidateBytes > MAX_RESOLUTION_CANDIDATE_PAYLOAD_BYTES) {
-    throw new Error("entity candidate identities exceed the prompt budget");
+    throw new TerminalExtractionValidationError(
+      "entity candidate identities exceed the prompt budget",
+    );
   }
 
   for (const [mentionIndex, mention] of mentions.entries()) {
     for (const [candidateIndex, candidate] of mention.candidates.entries()) {
       const projected = candidates[mentionIndex]![candidateIndex]!;
       const description = truncateUtf8Bytes(candidate.description, 1_000);
-      const beforeDescription = Buffer.byteLength(
-        JSON.stringify(projected),
-        "utf8",
-      );
+      const beforeDescription = compactAsciiJsonByteLength(projected);
       projected.description = description;
-      const afterDescription = Buffer.byteLength(
-        JSON.stringify(projected),
-        "utf8",
-      );
+      const afterDescription = compactAsciiJsonByteLength(projected);
       if (
         candidateBytes + afterDescription - beforeDescription <=
         MAX_RESOLUTION_CANDIDATE_PAYLOAD_BYTES
@@ -539,12 +546,9 @@ function resolutionPromptMentions(
       for (const alias of candidate.aliases.slice(0, 10)) {
         const boundedAlias = truncateUtf8Bytes(alias, 256);
         if (boundedAlias.length === 0) continue;
-        const beforeAlias = Buffer.byteLength(
-          JSON.stringify(projected),
-          "utf8",
-        );
+        const beforeAlias = compactAsciiJsonByteLength(projected);
         projected.aliases.push(boundedAlias);
-        const afterAlias = Buffer.byteLength(JSON.stringify(projected), "utf8");
+        const afterAlias = compactAsciiJsonByteLength(projected);
         if (
           candidateBytes + afterAlias - beforeAlias <=
           MAX_RESOLUTION_CANDIDATE_PAYLOAD_BYTES
@@ -554,6 +558,23 @@ function resolutionPromptMentions(
           projected.aliases.pop();
         }
       }
+    }
+  }
+
+  for (const mentionCandidates of candidates) {
+    const identities = new Set<string>();
+    for (const candidate of mentionCandidates) {
+      const identity = compactAsciiJson({
+        canonical_name: candidate.canonical_name,
+        description: candidate.description,
+        aliases: candidate.aliases,
+      });
+      if (identities.has(identity)) {
+        throw new TerminalExtractionValidationError(
+          "entity candidates are indistinguishable within the prompt budget",
+        );
+      }
+      identities.add(identity);
     }
   }
 

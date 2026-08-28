@@ -1015,6 +1015,7 @@ describe("ModelClient", () => {
 
   test("bounds persisted candidate metadata in the resolution prompt", async () => {
     const entityId = randomUUID();
+    const canonicalName = `Feature-${"n".repeat(480)}-name-tail`;
     let captured: Record<string, unknown> = {};
     const fetcher: FetchLike = async (_input, init) => {
       captured = requestJson(init);
@@ -1050,7 +1051,7 @@ describe("ModelClient", () => {
           candidates: [
             {
               id: entityId,
-              canonicalName: `Feature-${"n".repeat(10_000)}-name-tail`,
+              canonicalName,
               description: `Description-${"d".repeat(100_000)}-description-tail`,
               aliases: Array.from(
                 { length: 100 },
@@ -1076,9 +1077,7 @@ describe("ModelClient", () => {
       }>;
     };
     const candidate = user.mentions[0]!.candidates[0]!;
-    expect(
-      Buffer.byteLength(candidate.canonical_name, "utf8"),
-    ).toBeLessThanOrEqual(256);
+    expect(candidate.canonical_name).toBe(canonicalName);
     expect(
       Buffer.byteLength(candidate.description, "utf8"),
     ).toBeLessThanOrEqual(1_000);
@@ -1090,12 +1089,184 @@ describe("ModelClient", () => {
     ).toBe(true);
     expect(
       Buffer.byteLength(
-        JSON.stringify(user.mentions.map((mention) => mention.candidates)),
+        compactAsciiJson(user.mentions.map((mention) => mention.candidates)),
         "utf8",
       ),
     ).toBeLessThanOrEqual(MAX_RESOLUTION_CANDIDATE_PAYLOAD_BYTES);
     expect(JSON.stringify(candidate)).not.toContain("description-tail");
     expect(JSON.stringify(candidate)).not.toContain("alias-tail");
+  });
+
+  test("bounds the ASCII-escaped resolution candidate payload", async () => {
+    const candidateIds = Array.from({ length: 10 }, () => randomUUID());
+    const claims: ExtractedClaim[] = Array.from({ length: 25 }, (_, index) => ({
+      subject: `Subject ${index}`,
+      predicate: "relates to",
+      confidence: 0.9,
+      object_entity: `Object ${index}`,
+      object_value: null,
+    }));
+    const candidates = candidateIds.map((id, index) => ({
+      id,
+      canonicalName: `${"实体😀".repeat(20)}-${index}`,
+      description: "é".repeat(500),
+      aliases: [],
+    }));
+    const mentions: MentionContext[] = claims.flatMap((claim, index) => [
+      {
+        mentionId: `c${index}.subject`,
+        role: "subject",
+        text: claim.subject,
+        supportingClaim: `${claim.subject} | ${claim.predicate} | ${claim.object_entity}`,
+        candidates,
+      },
+      {
+        mentionId: `c${index}.object`,
+        role: "object",
+        text: claim.object_entity!,
+        supportingClaim: `${claim.subject} | ${claim.predicate} | ${claim.object_entity}`,
+        candidates,
+      },
+    ]);
+    let captured: Record<string, unknown> = {};
+    const fetcher: FetchLike = async (_input, init) => {
+      captured = requestJson(init);
+      return modelResponse({
+        claims: claims.map((_claim, index) => ({
+          claim_id: `c${index}`,
+          action: "drop",
+          reason: "unsupported",
+        })),
+        resolutions: [],
+      });
+    };
+
+    await new ModelClient(settings(), fetcher, silentLogger).resolve(
+      segmentRequest("No proposed claim is supported."),
+      "No proposed claim is supported.",
+      claims,
+      mentions,
+    );
+
+    const messages = captured.messages as Array<Record<string, string>>;
+    const userContent = messages[2]?.content;
+    if (userContent === undefined) throw new TypeError("missing user message");
+    const user = JSON.parse(userContent) as {
+      mentions: Array<{ candidates: unknown[] }>;
+    };
+    const candidateBytes = Buffer.byteLength(
+      compactAsciiJson(user.mentions.map((mention) => mention.candidates)),
+      "utf8",
+    );
+    expect(candidateBytes).toBeGreaterThan(900_000);
+    expect(candidateBytes).toBeLessThanOrEqual(
+      MAX_RESOLUTION_CANDIDATE_PAYLOAD_BYTES,
+    );
+  });
+
+  test("preserves long candidate identities without lossy truncation", async () => {
+    const firstId = randomUUID();
+    const secondId = randomUUID();
+    const commonPrefix = "P".repeat(180);
+    const commonSuffix = "S".repeat(180);
+    const firstName = `${commonPrefix}ALPHA-MIDDLE${commonSuffix}`;
+    const secondName = `${commonPrefix}BETA-MIDDLE${commonSuffix}`;
+    let captured: Record<string, unknown> = {};
+    const fetcher: FetchLike = async (_input, init) => {
+      captured = requestJson(init);
+      return modelResponse({
+        claims: [{ claim_id: "c0", action: "keep", reason: "supported" }],
+        resolutions: [
+          { mention_id: "c0.subject", candidate_entity_id: firstId },
+        ],
+      });
+    };
+
+    await new ModelClient(settings(), fetcher, silentLogger).resolve(
+      segmentRequest("The alpha entity exists."),
+      "The alpha entity exists.",
+      [
+        {
+          subject: "Alpha entity",
+          predicate: "exists",
+          confidence: 0.9,
+          object_entity: null,
+          object_value: "true",
+        },
+      ],
+      [
+        {
+          mentionId: "c0.subject",
+          role: "subject",
+          text: "Alpha entity",
+          supportingClaim: "Alpha entity | exists | true",
+          candidates: [
+            {
+              id: firstId,
+              canonicalName: firstName,
+              description: "Same description",
+              aliases: [],
+            },
+            {
+              id: secondId,
+              canonicalName: secondName,
+              description: "Same description",
+              aliases: [],
+            },
+          ],
+        },
+      ],
+    );
+
+    const messages = captured.messages as Array<Record<string, string>>;
+    const userContent = messages[2]?.content;
+    if (userContent === undefined) throw new TypeError("missing user message");
+    const user = JSON.parse(userContent) as {
+      mentions: Array<{
+        candidates: Array<{ canonical_name: string }>;
+      }>;
+    };
+    const [first, second] = user.mentions[0]!.candidates;
+    expect(first!.canonical_name).toBe(firstName);
+    expect(second!.canonical_name).toBe(secondName);
+  });
+
+  test("rejects candidates left indistinguishable by the prompt budget", async () => {
+    const fetcher = vi.fn<FetchLike>();
+    const candidate = {
+      canonicalName: "Springfield",
+      description: "A city",
+      aliases: [] as string[],
+    };
+
+    await expect(
+      new ModelClient(settings(), fetcher, silentLogger).resolve(
+        segmentRequest("Springfield exists."),
+        "Springfield exists.",
+        [
+          {
+            subject: "Springfield",
+            predicate: "exists",
+            confidence: 0.9,
+            object_entity: null,
+            object_value: "true",
+          },
+        ],
+        [
+          {
+            mentionId: "c0.subject",
+            role: "subject",
+            text: "Springfield",
+            supportingClaim: "Springfield | exists | true",
+            candidates: [
+              { id: randomUUID(), ...candidate },
+              { id: randomUUID(), ...candidate },
+            ],
+          },
+        ],
+      ),
+    ).rejects.toBeInstanceOf(TerminalExtractionValidationError);
+    expect(fetcher).not.toHaveBeenCalled();
   });
 
   test.each([
@@ -2280,6 +2451,70 @@ describe("ModelClient", () => {
         [],
       ),
     ).resolves.toMatchObject({ summary: "current_balance is 1.2." });
+  });
+
+  test.each([
+    ["ordinary", { status: "completed" }],
+    [
+      "sanitized",
+      {
+        "data:text/plain,secret": "redacted",
+        status: "completed",
+      },
+    ],
+  ])(
+    "rejects a transposed lowercase key from %s canonical tool state",
+    async (_name, state) => {
+      const rendered = `\n[Tool "read"]\n${JSON.stringify(
+        modelVisibleToolState(state),
+      )}\n[/Tool]\n`;
+      const fetcher: FetchLike = async () =>
+        modelResponse({ summary: "Tool sttaus is completed.", claims: [] });
+
+      await expect(
+        new ModelClient(settings(), fetcher, silentLogger).extract(
+          {
+            ...segmentRequest(rendered),
+            messages: [{ role: "assistant", text: rendered }],
+          },
+          [],
+        ),
+      ).rejects.toBeInstanceOf(UpstreamValidationError);
+    },
+  );
+
+  test.each([
+    [
+      "the exact structured key",
+      { status: "completed" },
+      "Tool field `status` is completed.",
+    ],
+    [
+      "nearby ordinary prose",
+      { status: "completed" },
+      "The tool states completion.",
+    ],
+    [
+      "a transposed arbitrary nested key",
+      { input: { from: "value" }, status: "completed" },
+      "The form is available.",
+    ],
+  ])("allows %s in canonical tool output", async (_name, state, summary) => {
+    const rendered = `\n[Tool "read"]\n${JSON.stringify(
+      modelVisibleToolState(state),
+    )}\n[/Tool]\n`;
+    const fetcher: FetchLike = async () =>
+      modelResponse({ summary, claims: [] });
+
+    await expect(
+      new ModelClient(settings(), fetcher, silentLogger).extract(
+        {
+          ...segmentRequest(rendered),
+          messages: [{ role: "assistant", text: rendered }],
+        },
+        [],
+      ),
+    ).resolves.toMatchObject({ summary });
   });
 
   test("rejects JSON-escaped spellings of parsed tool identifiers", async () => {

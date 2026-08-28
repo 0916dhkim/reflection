@@ -79,7 +79,10 @@ function supportIncludes(
   supports: readonly IdentifierSupport[],
   token: string,
 ): boolean {
-  return supports.some((support) => support.exact.has(token));
+  return supports.some(
+    (support) =>
+      support.exact.has(token) || support.structuredToolKeys.has(token),
+  );
 }
 
 function plainSupportIncludes(
@@ -1343,6 +1346,8 @@ export class IdentifierValidationSession {
       this.#scheduler,
       this.#source.plainSkeletons,
       this.#source.sourceTexts,
+      this.#source.structuredToolKeys,
+      this.#source.structuredToolKeyTranspositions,
     );
     const rawPredicateFields: CopiedIdentifierValidationField[] = [];
     for (const claim of claims) {

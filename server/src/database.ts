@@ -1871,14 +1871,18 @@ export class Database {
           )
           SELECT e.id, e.canonical_name, e.description,
                  ARRAY(
-                     SELECT a.alias FROM entity_aliases a
-                     WHERE a.entity_id = e.id ORDER BY a.normalized_alias
+                      SELECT a.alias FROM entity_aliases a
+                      WHERE a.entity_id = e.id
+                      ORDER BY (a.normalized_alias = $2) DESC,
+                               similarity(a.alias, $1) DESC,
+                               a.normalized_alias
+                      LIMIT 10
                  ) AS aliases
           FROM ranked r
           JOIN entities e ON e.id = r.entity_id
           ORDER BY r.match_score DESC
           `,
-          [mention],
+          [mention, normalizeName(mention)],
         )
       ).rows;
       const vectorRows = (
@@ -1900,13 +1904,17 @@ export class Database {
           )
           SELECT n.id, n.canonical_name, n.description,
                  ARRAY(
-                     SELECT a.alias FROM entity_aliases a
-                     WHERE a.entity_id = n.id ORDER BY a.normalized_alias
+                      SELECT a.alias FROM entity_aliases a
+                      WHERE a.entity_id = n.id
+                      ORDER BY (a.normalized_alias = $3) DESC,
+                               similarity(a.alias, $2) DESC,
+                               a.normalized_alias
+                      LIMIT 10
                  ) AS aliases
           FROM nearest n
           ORDER BY n.distance
           `,
-          [queryVector],
+          [queryVector, mention, normalizeName(mention)],
         )
       ).rows;
 
@@ -2136,8 +2144,7 @@ export class Database {
             `
             INSERT INTO entity_aliases (entity_id, alias, normalized_alias)
             VALUES ($1, $2, $3)
-            ON CONFLICT (entity_id, normalized_alias) DO UPDATE
-            SET alias = EXCLUDED.alias
+            ON CONFLICT (entity_id, normalized_alias) DO NOTHING
             `,
             [entity.id, alias, normalizeName(alias)],
           );

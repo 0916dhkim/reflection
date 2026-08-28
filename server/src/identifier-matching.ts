@@ -42,6 +42,7 @@ export interface IdentifierPatternNode {
 
 export interface IdentifierMatchingSupport {
   exact: ReadonlySet<string>;
+  structuredToolKeyTranspositions: ReadonlySet<string>;
   index: IdentifierPatternIndex;
   oversizedTokens: readonly string[];
   boundedExactMatches: Map<string, boolean>;
@@ -691,8 +692,10 @@ export async function nearIdentifierMatches(
   scheduler: CooperativeScheduler,
 ): Promise<Set<string>> {
   const candidatesByHash = new Map<string, IdentifierHashRecord[]>();
+  const matches = new Set<string>();
   for (const value of candidates) {
     if (scheduler.shouldYield()) await scheduler.yield();
+    if (support.structuredToolKeyTranspositions.has(value)) matches.add(value);
     if (codePointLength(value) < 2) continue;
     const record = {
       value,
@@ -704,9 +707,8 @@ export async function nearIdentifierMatches(
       else records.push(record);
     }
   }
-  if (candidatesByHash.size === 0) return new Set();
+  if (candidatesByHash.size === 0) return matches;
 
-  const matches = new Set<string>();
   let componentVariants = 0;
   let componentCharacters = 0;
   const componentBudgetExceeded = (): boolean =>

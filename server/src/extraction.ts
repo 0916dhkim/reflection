@@ -196,11 +196,7 @@ export class ExtractionEngine {
         entityId = candidate.id;
         canonicalName = candidate.canonicalName;
         description = candidate.description;
-        aliases = ExtractionEngine.#uniqueAliases(
-          canonicalName,
-          ...candidate.aliases,
-          context.text,
-        );
+        aliases = ExtractionEngine.#uniqueAliases(context.text);
         isNew = false;
       }
 

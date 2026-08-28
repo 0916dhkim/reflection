@@ -901,6 +901,136 @@ describe.sequential("Database PostgreSQL integration", () => {
   );
 
   test.skipIf(!DATABASE_URL)(
+    "does not rewrite existing aliases and persists newly learned aliases",
+    async () => {
+      const database = new Database(settings());
+      await database.open();
+      try {
+        await truncate(database);
+        const firstRequest = request({
+          session_id: "alias-session",
+          start_user_message_id: "start",
+          end_user_message_id: "end-1",
+          projection_version: 1,
+          messages: [{ role: "user", text: "Reflection uses PostgreSQL." }],
+        });
+        const firstJob = await database.enqueue(firstRequest);
+        const firstClaim = required(
+          await withClient(database, (client) =>
+            database.claimOldestJob(client),
+          ),
+        );
+        const subjectId = randomUUID();
+        const objectId = randomUUID();
+        const firstPrepared = preparedSegment(firstClaim, {
+          endId: "end-1",
+          summary: "Reflection uses PostgreSQL.",
+          subjectId,
+          objectId,
+          entitiesAreNew: true,
+        });
+        await completeResolution(database, firstClaim, {
+          ...firstPrepared,
+          entities: firstPrepared.entities.map((entity) => ({
+            ...entity,
+            aliases:
+              entity.id === objectId
+                ? [
+                    "Postgres",
+                    ...Array.from(
+                      { length: 15 },
+                      (_, index) => `Historical alias ${index}`,
+                    ),
+                  ]
+                : entity.aliases,
+          })),
+        });
+        const initialAlias = required(
+          (
+            await database.pool.query<
+              QueryResultRow & { alias: string; row_version: string }
+            >(
+              `
+              SELECT alias, xmin::text AS row_version
+              FROM entity_aliases
+              WHERE entity_id = $1 AND normalized_alias = 'postgres'
+              `,
+              [objectId],
+            )
+          ).rows[0],
+        );
+        const boundedCandidate = (
+          await database.entityCandidates("Postgres", EMBEDDING)
+        ).find((candidate) => candidate.id === objectId);
+        expect(required(boundedCandidate).aliases).toHaveLength(10);
+        expect(required(boundedCandidate).aliases).toContain("Postgres");
+
+        const secondJob = await database.enqueue(
+          updateRequest(firstRequest, { end_user_message_id: "end-2" }),
+        );
+        const secondClaim = required(
+          await withClient(database, (client) =>
+            database.claimOldestJob(client),
+          ),
+        );
+        expect(secondClaim.id).toBe(secondJob.id);
+        const secondPrepared = preparedSegment(secondClaim, {
+          endId: "end-2",
+          summary: "Reflection still uses PostgreSQL.",
+          subjectId,
+          objectId,
+          entitiesAreNew: false,
+        });
+        await completeResolution(database, secondClaim, {
+          ...secondPrepared,
+          entities: secondPrepared.entities.map((entity) => ({
+            ...entity,
+            aliases: entity.id === objectId ? ["POSTGRES", "PGSQL"] : [],
+          })),
+        });
+
+        const aliases = await database.pool.query<
+          QueryResultRow & {
+            alias: string;
+            normalized_alias: string;
+            row_version: string;
+          }
+        >(
+          `
+          SELECT alias, normalized_alias, xmin::text AS row_version
+          FROM entity_aliases
+          WHERE entity_id = $1
+            AND normalized_alias IN ('pgsql', 'postgres')
+          ORDER BY normalized_alias
+          `,
+          [objectId],
+        );
+        expect(aliases.rows).toEqual([
+          {
+            alias: "PGSQL",
+            normalized_alias: "pgsql",
+            row_version: expect.any(String),
+          },
+          {
+            alias: initialAlias.alias,
+            normalized_alias: "postgres",
+            row_version: initialAlias.row_version,
+          },
+        ]);
+        expect(initialAlias.alias).toBe("Postgres");
+        const learnedAliasCandidate = (
+          await database.entityCandidates("PGSQL", EMBEDDING)
+        ).find((candidate) => candidate.id === objectId);
+        expect(required(learnedAliasCandidate).aliases).toContain("PGSQL");
+        expect(firstJob.segment_id).toBe(secondJob.segment_id);
+      } finally {
+        await database.close();
+      }
+    },
+    30_000,
+  );
+
+  test.skipIf(!DATABASE_URL)(
     "keeps running targets recoverable across replays and projection upgrades",
     async () => {
       const database = new Database(settings());

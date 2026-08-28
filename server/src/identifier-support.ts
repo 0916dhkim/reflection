@@ -5,6 +5,7 @@ import {
 import {
   canonicalToolFallbackFrames,
   MAX_COMPLETE_TOOL_SOURCE_CHARS,
+  SANITIZED_TOOL_OBJECT_KEY,
   toolFallbackFrameRanges,
 } from "@reflection/shared/tool-source";
 import {
@@ -35,6 +36,17 @@ import {
 const MAX_PLAIN_SKELETON_OCCURRENCES = 10_000;
 const MAX_SOURCE_IDENTIFIER_CANDIDATES = 175_000;
 const MAX_SOURCE_PLAIN_SCAN_UNITS = 275_000;
+const STRUCTURED_TOOL_STATE_KEYS = new Set([
+  "attachments",
+  "error",
+  "input",
+  "metadata",
+  "output",
+  "raw",
+  "status",
+  "time",
+  "title",
+]);
 
 interface SourceTextAnalysis {
   text: string;
@@ -47,6 +59,8 @@ export interface IdentifierSupport {
   pathSegmentSequences: readonly (readonly string[])[];
   index: IdentifierPatternIndex;
   oversizedTokens: readonly string[];
+  structuredToolKeys: ReadonlySet<string>;
+  structuredToolKeyTranspositions: ReadonlySet<string>;
   plainSkeletonCounts: ReadonlyMap<string, number>;
   boundedExactMatches: Map<string, boolean>;
   sourceTexts: readonly {
@@ -287,6 +301,8 @@ export async function identifierSupport(
   scheduler: CooperativeScheduler,
   plainSkeletonCounts: ReadonlyMap<string, number> = new Map(),
   sourceTexts: readonly SourceTextAnalysis[] = [],
+  structuredToolKeys: ReadonlySet<string> = new Set(),
+  structuredToolKeyTranspositions: ReadonlySet<string> = new Set(),
 ): Promise<IdentifierSupport> {
   const skeletons = await identifierSkeletons(exact, scheduler);
   const mutableNodes: Array<{
@@ -426,6 +442,8 @@ export async function identifierSupport(
       maxComponentSkeletonLength,
     },
     oversizedTokens,
+    structuredToolKeys,
+    structuredToolKeyTranspositions,
     plainSkeletonCounts,
     boundedExactMatches: new Map(),
     sourceTexts,
@@ -568,6 +586,61 @@ export function copiedSourceSupport(text: string): Set<string> {
   return tokens;
 }
 
+function toolStateRootEntries(value: unknown): Array<[string, unknown]> {
+  const object = asRecord(value);
+  if (object === null) return [];
+  const entries = Object.entries(object);
+  if (
+    entries.length !== 1 ||
+    entries[0]![0] !== SANITIZED_TOOL_OBJECT_KEY ||
+    !Array.isArray(entries[0]![1])
+  ) {
+    return entries;
+  }
+  const decoded: Array<[string, unknown]> = [];
+  let hasRedactedKey = false;
+  for (const [index, entry] of entries[0]![1].entries()) {
+    if (
+      !Array.isArray(entry) ||
+      entry.length !== 2 ||
+      typeof entry[0] !== "string"
+    ) {
+      return entries;
+    }
+    hasRedactedKey ||= entry[0] === `[data URL key omitted ${index}]`;
+    decoded.push([entry[0], entry[1]]);
+  }
+  return hasRedactedKey ? decoded : entries;
+}
+
+function addStructuredToolKeys(
+  value: unknown,
+  keys: Set<string>,
+  transpositions: Set<string>,
+): void {
+  for (const [key] of toolStateRootEntries(value)) {
+    if (!STRUCTURED_TOOL_STATE_KEYS.has(key)) continue;
+    const skeleton = identifierSkeleton(key);
+    if (skeleton === null) continue;
+    keys.add(key);
+    // Bare lowercase words are prose-ambiguous. Adjacent transpositions catch
+    // the high-confidence typo shape without treating ordinary edits as keys.
+    const characters = [...skeleton];
+    for (let index = 0; index + 1 < characters.length; index += 1) {
+      [characters[index], characters[index + 1]] = [
+        characters[index + 1]!,
+        characters[index]!,
+      ];
+      const transposition = characters.join("");
+      if (transposition !== skeleton) transpositions.add(transposition);
+      [characters[index], characters[index + 1]] = [
+        characters[index + 1]!,
+        characters[index]!,
+      ];
+    }
+  }
+}
+
 async function addToolStateSupport(
   value: unknown,
   tokens: Set<string>,
@@ -622,10 +695,14 @@ export async function sourceIdentifierSupport(
   scheduler: CooperativeScheduler,
 ): Promise<{
   identifiers: Set<string>;
+  structuredToolKeys: Set<string>;
+  structuredToolKeyTranspositions: Set<string>;
   plainSkeletons: Map<string, number>;
   sourceTexts: SourceTextAnalysis[];
 }> {
   const identifiers = new Set<string>();
+  const structuredToolKeys = new Set<string>();
+  const structuredToolKeyTranspositions = new Set<string>();
   const sourceTexts: SourceTextAnalysis[] = [];
   const sourceBudget: SourceIdentifierBudget = {
     remaining: MAX_SOURCE_IDENTIFIER_CANDIDATES,
@@ -674,6 +751,11 @@ export async function sourceIdentifierSupport(
           sourceBudget,
         ),
       );
+      addStructuredToolKeys(
+        block.state,
+        structuredToolKeys,
+        structuredToolKeyTranspositions,
+      );
       await addToolStateSupport(
         block.state,
         identifiers,
@@ -706,5 +788,11 @@ export async function sourceIdentifierSupport(
     scheduler,
     { remaining: MAX_SOURCE_PLAIN_SCAN_UNITS },
   );
-  return { identifiers, plainSkeletons, sourceTexts };
+  return {
+    identifiers,
+    structuredToolKeys,
+    structuredToolKeyTranspositions,
+    plainSkeletons,
+    sourceTexts,
+  };
 }

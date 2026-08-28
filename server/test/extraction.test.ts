@@ -414,7 +414,7 @@ describe("ExtractionEngine", () => {
     );
   });
 
-  test("preserves candidate order, exact candidate IDs, and coalesces aliases", async () => {
+  test("preserves candidate order, exact candidate IDs, and coalesces current aliases", async () => {
     const selectedId = randomUUID();
     const otherId = randomUUID();
     const candidates: readonly EntityCandidate[] = [
@@ -512,7 +512,7 @@ describe("ExtractionEngine", () => {
         canonicalName: "PostgreSQL",
         normalizedName: "postgresql",
         description: "A relational database",
-        aliases: ["PostgreSQL", "Postgres", "PGSQL"],
+        aliases: ["Postgres", "PostgreSQL"],
         embedding: null,
         isNew: false,
       },
@@ -593,10 +593,7 @@ describe("ExtractionEngine", () => {
       await engine.extract(claimed),
     );
 
-    expect(prepared.entities[0]?.aliases).toEqual([
-      "AlphaService",
-      "Alpha Service",
-    ]);
+    expect(prepared.entities[0]?.aliases).toEqual(["Alpha Service"]);
     expect(prepared.entities[0]?.aliases).not.toContain("beta service");
   });
 
