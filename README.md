@@ -90,6 +90,7 @@ When a source span has no visible text, writers render bounded tool state. Ident
 
 ### Other endpoints
 
+- `GET /v1/queue` returns historical job and current target counts, due and delayed pending work, bounded running-job ages, sanitized current-target error categories split between retrying and terminal work, and current terminal-job counts over 5-minute, 1-hour, and 24-hour windows. Because retries mutate job rows, the windows are a current-state drain signal rather than append-only attempt history. The endpoint never returns source payloads or raw errors.
 - `GET /v1/jobs/{id}` returns status, attempts, timestamps, exact source boundary, and a bounded error.
 - `POST /v1/jobs/{id}/retry` resets a retryable terminal job and returns `202`.
 - `GET /v1/segments/{uuid}` returns a committed summary and resolved claims without source text.

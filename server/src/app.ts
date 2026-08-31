@@ -7,6 +7,7 @@ import {
   codePointLength,
   JobResponseSchema,
   MAX_SEGMENT_TEXT_CHARS,
+  QueueStatusResponseSchema,
   SearchRequestSchema,
   SearchResponseSchema,
   SegmentCreateSchema,
@@ -47,6 +48,7 @@ export type AppDatabase = Pick<
   | "open"
   | "close"
   | "healthcheck"
+  | "queueStatus"
   | "enqueue"
   | "getJob"
   | "retryFailedJob"
@@ -112,6 +114,7 @@ class HttpError extends Error {
 const API_KEY_HEADER_SCHEMA = {
   type: "object",
   properties: { "x-api-key": { type: "string" } },
+  required: ["x-api-key"],
 } as const;
 const JOB_PARAMS_SCHEMA = {
   type: "object",
@@ -139,6 +142,7 @@ const KNOWN_ROUTES: ReadonlyArray<{
   { pattern: /^\/healthz$/u, methods: ["GET"] },
   { pattern: /^\/openapi\.json$/u, methods: ["GET"] },
   { pattern: /^\/redoc$/u, methods: ["GET"] },
+  { pattern: /^\/v1\/queue$/u, methods: ["GET"] },
   { pattern: /^\/v1\/segments$/u, methods: ["POST"] },
   { pattern: /^\/v1\/jobs\/[^/]+\/retry$/u, methods: ["POST"] },
   { pattern: /^\/v1\/jobs\/[^/]+$/u, methods: ["GET"] },
@@ -337,6 +341,17 @@ function registerRoutes(
           throw new HttpError(401, "invalid API key");
         }
       });
+
+      v1.get(
+        "/queue",
+        {
+          schema: {
+            headers: API_KEY_HEADER_SCHEMA,
+            response: { 200: QueueStatusResponseSchema },
+          },
+        },
+        async () => dependencies.database.queueStatus(),
+      );
 
       v1.post(
         "/segments",

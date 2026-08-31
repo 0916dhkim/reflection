@@ -16,7 +16,7 @@ import {
   type PreparedSegment,
 } from "@reflection/shared/domain";
 import { Client, type PoolClient, type QueryResultRow } from "pg";
-import { describe, expect, test } from "vitest";
+import { describe, expect, test, vi } from "vitest";
 
 import {
   Database,
@@ -220,6 +220,187 @@ async function within<T>(
 }
 
 describe.sequential("Database PostgreSQL integration", () => {
+  test.skipIf(!DATABASE_URL)(
+    "reports bounded queue diagnostics without source payloads or raw errors",
+    async () => {
+      const database = new Database(settings());
+      await database.open();
+      try {
+        await truncate(database);
+        const jobs = [];
+        for (const name of [
+          "due",
+          "delayed",
+          "running",
+          "rate-limited",
+          "invalid",
+          "succeeded",
+          "superseded",
+        ]) {
+          jobs.push(
+            await database.enqueue(
+              request({
+                session_id: "queue-status",
+                start_user_message_id: name,
+                end_user_message_id: name,
+                messages: [{ role: "user", text: name }],
+              }),
+            ),
+          );
+        }
+        const due = required(jobs[0]);
+        const delayed = required(jobs[1]);
+        const running = required(jobs[2]);
+        const rateLimited = required(jobs[3]);
+        const invalid = required(jobs[4]);
+        const succeeded = required(jobs[5]);
+        const superseded = required(jobs[6]);
+
+        await database.pool.query(
+          `UPDATE extraction_jobs
+           SET next_attempt_at = now() + INTERVAL '1 hour',
+               error = 'UpstreamTimeoutError: upstream request timed out'
+           WHERE id = $1`,
+          [delayed.id],
+        );
+        await database.pool.query(
+          `UPDATE extraction_jobs
+           SET status = 'running', lease_id = $2, attempts = 1,
+               started_at = now() - INTERVAL '2 minutes'
+           WHERE id = $1`,
+          [running.id, randomUUID()],
+        );
+        await database.pool.query(
+          `UPDATE extraction_jobs
+           SET status = 'failed', attempts = 3, finished_at = now() - INTERVAL '10 minutes',
+               error = CASE id
+                   WHEN $1 THEN 'UpstreamRequestError: upstream request failed: 429 Too Many Requests'
+                   WHEN $2 THEN 'TerminalExtractionValidationError: source identifier validation budget exceeded'
+               END
+           WHERE id = ANY($3::bigint[])`,
+          [rateLimited.id, invalid.id, [rateLimited.id, invalid.id]],
+        );
+        await database.pool.query(
+          `UPDATE extraction_jobs
+           SET status = 'succeeded', payload = NULL,
+               finished_at = now() - INTERVAL '30 minutes'
+           WHERE id = $1`,
+          [succeeded.id],
+        );
+        await database.pool.query(
+          `UPDATE extraction_jobs
+           SET status = 'superseded', payload = NULL,
+               finished_at = now() - INTERVAL '2 days'
+           WHERE id = $1`,
+          [superseded.id],
+        );
+
+        const status = await database.queueStatus();
+
+        expect(status.job_counts).toEqual({
+          total: 7,
+          pending: 2,
+          running: 1,
+          succeeded: 1,
+          failed: 2,
+          superseded: 1,
+        });
+        expect(status.target_counts).toEqual(status.job_counts);
+        expect(status.pending_due).toBe(1);
+        expect(status.pending_delayed).toBe(1);
+        expect(status.oldest_due_job).toMatchObject({
+          id: due.id,
+          attempts: 0,
+          processing_priority: 0,
+        });
+        expect(status.oldest_due_job?.age_seconds).toBeGreaterThanOrEqual(0);
+        expect(status.running_jobs).toHaveLength(1);
+        expect(status.running_jobs[0]).toMatchObject({
+          id: running.id,
+          attempts: 1,
+          processing_priority: 0,
+        });
+        expect(status.running_jobs[0]?.age_seconds).toBeGreaterThanOrEqual(119);
+        expect(status.running_jobs_truncated).toBe(false);
+        expect(status.failure_categories).toEqual([
+          {
+            category: "TerminalExtractionValidationError",
+            count: 1,
+            pending: 0,
+            failed: 1,
+            latest_finished_at: expect.any(String),
+          },
+          {
+            category: "UpstreamHttp429",
+            count: 1,
+            pending: 0,
+            failed: 1,
+            latest_finished_at: expect.any(String),
+          },
+          {
+            category: "UpstreamTimeoutError",
+            count: 1,
+            pending: 1,
+            failed: 0,
+            latest_finished_at: null,
+          },
+        ]);
+        expect(status.failure_categories_truncated).toBe(false);
+        expect(status.recent_terminal_jobs).toEqual([
+          { window_seconds: 300, succeeded: 0, failed: 0 },
+          { window_seconds: 3_600, succeeded: 1, failed: 2 },
+          { window_seconds: 86_400, succeeded: 1, failed: 2 },
+        ]);
+        expect(JSON.stringify(status)).not.toContain("Too Many Requests");
+        expect(JSON.stringify(status)).not.toContain("messages");
+
+        const writer = new Client({ connectionString: databaseUrl() });
+        await writer.connect();
+        const originalConnect = database.pool.connect.bind(database.pool);
+        const connectSpy = vi.spyOn(database.pool, "connect");
+        connectSpy.mockImplementationOnce((async () => {
+          const client = await originalConnect();
+          const originalQuery = client.query;
+          const runQuery = originalQuery.bind(client) as unknown as (
+            text: string,
+            values?: unknown[],
+          ) => Promise<unknown>;
+          client.query = (async (text: string, values?: unknown[]) => {
+            const result = await runQuery(text, values);
+            if (text.startsWith("BEGIN TRANSACTION")) {
+              client.query = originalQuery;
+              await writer.query(
+                `UPDATE extraction_jobs
+                   SET status = 'running', lease_id = $2, attempts = 1,
+                       started_at = clock_timestamp()
+                   WHERE id = $1`,
+                [due.id, randomUUID()],
+              );
+            }
+            return result;
+          }) as typeof client.query;
+          return client;
+        }) as typeof database.pool.connect);
+        try {
+          const interleaved = await database.queueStatus();
+          const claimed = required(
+            interleaved.running_jobs.find((job) => job.id === due.id),
+          );
+          expect(claimed.age_seconds).toBeGreaterThanOrEqual(0);
+          expect(Date.parse(interleaved.observed_at)).toBeGreaterThanOrEqual(
+            Date.parse(required(claimed.started_at)),
+          );
+        } finally {
+          connectSpy.mockRestore();
+          await writer.end();
+        }
+      } finally {
+        await database.close();
+      }
+    },
+    30_000,
+  );
+
   test.skipIf(!DATABASE_URL)(
     "preserves queue fencing, replacement, retry, and recall semantics",
     async () => {
