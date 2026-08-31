@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import {
   parseSegmentResponse,
   type JobResponse,
+  type QueueStatusResponse,
   type SegmentResponse,
   type SegmentSummary,
 } from "@reflection/shared/contracts";
@@ -56,6 +57,56 @@ function jobResponse(status: JobResponse["status"] = "pending"): JobResponse {
   };
 }
 
+function queueStatusResponse(): QueueStatusResponse {
+  const counts = {
+    total: 4,
+    pending: 1,
+    running: 1,
+    succeeded: 1,
+    failed: 1,
+    superseded: 0,
+  };
+  return {
+    observed_at: "2026-08-31T17:30:00Z",
+    job_counts: counts,
+    target_counts: counts,
+    pending_due: 1,
+    pending_delayed: 0,
+    oldest_due_job: {
+      id: 1,
+      attempts: 0,
+      processing_priority: 50,
+      due_at: "2026-08-31T17:29:00Z",
+      age_seconds: 60,
+    },
+    running_jobs: [
+      {
+        id: 2,
+        attempts: 1,
+        processing_priority: 100,
+        started_at: "2026-08-31T17:28:00Z",
+        age_seconds: 120,
+      },
+    ],
+    running_jobs_truncated: false,
+    failure_categories: [
+      {
+        category: "UpstreamHttp429",
+        count: 1,
+        pending: 0,
+        failed: 1,
+        latest_finished_at: "2026-08-31T17:27:00Z",
+      },
+    ],
+    failure_categories_truncated: false,
+    recent_terminal_jobs: [
+      { window_seconds: 300, succeeded: 1, failed: 1 },
+      { window_seconds: 3_600, succeeded: 1, failed: 1 },
+      { window_seconds: 86_400, succeeded: 1, failed: 1 },
+    ],
+  };
+}
+
 function dependencies(
   overrides: {
     database?: Partial<AppDatabase>;
@@ -67,6 +118,7 @@ function dependencies(
     open: vi.fn(async () => undefined),
     close: vi.fn(async () => undefined),
     healthcheck: vi.fn(async () => undefined),
+    queueStatus: vi.fn(async () => queueStatusResponse()),
     enqueue: vi.fn(async () => jobResponse()),
     getJob: vi.fn(async () => null),
     retryFailedJob: vi.fn(async () => null),
@@ -214,6 +266,39 @@ describe("lifecycle and health", () => {
     });
 
     expect(response.json()).toEqual({ ip: "203.0.113.10" });
+  });
+});
+
+describe("queue diagnostics", () => {
+  test("returns authenticated bounded queue state and documents the route", async () => {
+    const status = queueStatusResponse();
+    const queueStatus = vi.fn<AppDatabase["queueStatus"]>(async () => status);
+    const { app } = appWith(dependencies({ database: { queueStatus } }));
+
+    const unauthorized = await app.inject({
+      method: "GET",
+      url: "/v1/queue",
+    });
+    const response = await app.inject({
+      method: "GET",
+      url: "/v1/queue",
+      headers: API_HEADERS,
+    });
+    const openapi = await app.inject({ method: "GET", url: "/openapi.json" });
+
+    expect(unauthorized.statusCode).toBe(401);
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual(status);
+    expect(response.body).not.toContain("payload");
+    expect(queueStatus).toHaveBeenCalledOnce();
+    const queueOperation = openapi.json().paths["/v1/queue"].get;
+    expect(queueOperation.parameters).toContainEqual(
+      expect.objectContaining({
+        name: "x-api-key",
+        in: "header",
+        required: true,
+      }),
+    );
   });
 });
 

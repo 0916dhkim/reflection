@@ -7,6 +7,7 @@ import {
   parseExtractionResult,
   parseExtractionWireResult,
   parseJobResponse,
+  parseQueueStatusResponse,
   parseResolutionResult,
   parseSearchRequest,
   parseSegmentCreate,
@@ -207,6 +208,67 @@ describe("response contracts", () => {
         ],
       }),
     ).toThrow("exactly one");
+  });
+
+  it("strictly parses bounded queue diagnostics", () => {
+    const counts = {
+      total: 6,
+      pending: 2,
+      running: 1,
+      succeeded: 1,
+      failed: 1,
+      superseded: 1,
+    };
+    const status = {
+      observed_at: "2026-01-01T00:00:00Z",
+      job_counts: counts,
+      target_counts: counts,
+      pending_due: 1,
+      pending_delayed: 1,
+      oldest_due_job: {
+        id: 1,
+        attempts: 0,
+        processing_priority: 50,
+        due_at: "2025-12-31T23:59:00Z",
+        age_seconds: 60,
+      },
+      running_jobs: [
+        {
+          id: 2,
+          attempts: 1,
+          processing_priority: 100,
+          started_at: "2025-12-31T23:58:00Z",
+          age_seconds: 120,
+        },
+      ],
+      running_jobs_truncated: false,
+      failure_categories: [
+        {
+          category: "UpstreamHttp429",
+          count: 1,
+          pending: 0,
+          failed: 1,
+          latest_finished_at: "2025-12-31T23:57:00Z",
+        },
+      ],
+      failure_categories_truncated: false,
+      recent_terminal_jobs: [
+        { window_seconds: 300, succeeded: 0, failed: 1 },
+        { window_seconds: 3_600, succeeded: 1, failed: 1 },
+        { window_seconds: 86_400, succeeded: 1, failed: 1 },
+      ],
+    } as const;
+
+    expect(parseQueueStatusResponse(status)).toEqual(status);
+    expect(() =>
+      parseQueueStatusResponse({
+        ...status,
+        oldest_due_job: { ...status.oldest_due_job, age_seconds: -1 },
+      }),
+    ).toThrow(ContractValidationError);
+    expect(() =>
+      parseQueueStatusResponse({ ...status, raw_errors: ["secret"] }),
+    ).toThrow(ContractValidationError);
   });
 
   it("requires manifest version 2 and explicit mixed boundary versions", () => {

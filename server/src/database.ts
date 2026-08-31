@@ -6,12 +6,15 @@ import {
   PROJECTION_SAFE_VERSION,
   parseExtractionResult,
   parseJobResponse,
+  parseQueueStatusResponse,
   parseSegmentCreate,
   parseSegmentResponse,
   validateClaimObject,
   type ExtractionResult,
   type JobResponse,
   type JobStatus,
+  type JobStatusCounts,
+  type QueueStatusResponse,
   type SegmentBoundary,
   type SegmentCreate,
   type SegmentResponse,
@@ -218,6 +221,50 @@ interface RecallRow extends QueryResultRow {
   seed_similarity?: number | string | null;
 }
 
+interface StatusCountsRow extends QueryResultRow {
+  total: PgBigInt;
+  pending: PgBigInt;
+  running: PgBigInt;
+  succeeded: PgBigInt;
+  failed: PgBigInt;
+  superseded: PgBigInt;
+}
+
+interface QueueAggregateRow extends StatusCountsRow {
+  due: PgBigInt;
+  delayed: PgBigInt;
+  five_minute_succeeded: PgBigInt;
+  five_minute_failed: PgBigInt;
+  hour_succeeded: PgBigInt;
+  hour_failed: PgBigInt;
+  day_succeeded: PgBigInt;
+  day_failed: PgBigInt;
+}
+
+interface DueJobRow extends QueryResultRow {
+  id: PgBigInt;
+  attempts: number;
+  processing_priority: number;
+  due_at: PgTimestamp;
+  age_seconds: number | string;
+}
+
+interface RunningJobRow extends QueryResultRow {
+  id: PgBigInt;
+  attempts: number;
+  processing_priority: number;
+  started_at: PgTimestamp | null;
+  age_seconds: number | string | null;
+}
+
+interface FailureCategoryRow extends QueryResultRow {
+  category: string;
+  count: PgBigInt;
+  pending: PgBigInt;
+  failed: PgBigInt;
+  latest_finished_at: PgTimestamp | null;
+}
+
 function asBigInt(value: PgBigInt, label: string): bigint {
   if (typeof value === "bigint") return value;
   if (typeof value === "number") {
@@ -263,6 +310,25 @@ function asJobStatus(value: string): JobStatus {
     return value;
   }
   throw new Error(`invalid job status: ${value}`);
+}
+
+function nonnegativeNumber(value: number | string, label: string): number {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    throw new TypeError(`invalid nonnegative number for ${label}: ${value}`);
+  }
+  return parsed;
+}
+
+function statusCounts(row: StatusCountsRow, label: string): JobStatusCounts {
+  return {
+    total: checkedBigIntToNumber(row.total, `${label} total`),
+    pending: checkedBigIntToNumber(row.pending, `${label} pending`),
+    running: checkedBigIntToNumber(row.running, `${label} running`),
+    succeeded: checkedBigIntToNumber(row.succeeded, `${label} succeeded`),
+    failed: checkedBigIntToNumber(row.failed, `${label} failed`),
+    superseded: checkedBigIntToNumber(row.superseded, `${label} superseded`),
+  };
 }
 
 function timestamp(value: PgTimestamp): string {
@@ -517,8 +583,13 @@ function extractionResultForPersistence(
 async function transaction<T>(
   client: ReservedClient,
   operation: () => Promise<T>,
+  options: { readonlySnapshot?: boolean } = {},
 ): Promise<T> {
-  await client.query("BEGIN");
+  await client.query(
+    options.readonlySnapshot
+      ? "BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"
+      : "BEGIN",
+  );
   try {
     const result = await operation();
     await client.query("COMMIT");
@@ -632,6 +703,248 @@ export class Database {
     await this.pool.query("SELECT 1");
   }
 
+  async queueStatus(): Promise<QueueStatusResponse> {
+    return this.#withTransaction(
+      async (connection) => {
+        const observationRow = (
+          await connection.query<QueryResultRow & { observed_at: PgTimestamp }>(
+            "SELECT clock_timestamp()::text AS observed_at",
+          )
+        ).rows[0];
+        if (observationRow === undefined) {
+          throw new Error("queue observation timestamp returned no row");
+        }
+        const observedAt = timestamp(observationRow.observed_at);
+        const jobCountsRow = (
+          await connection.query<QueueAggregateRow>(
+            `
+          SELECT COUNT(*) AS total,
+                 COUNT(*) FILTER (WHERE status = 'pending') AS pending,
+                 COUNT(*) FILTER (WHERE status = 'running') AS running,
+                 COUNT(*) FILTER (WHERE status = 'succeeded') AS succeeded,
+                 COUNT(*) FILTER (WHERE status = 'failed') AS failed,
+                 COUNT(*) FILTER (WHERE status = 'superseded') AS superseded,
+                 COUNT(*) FILTER (
+                      WHERE status = 'pending' AND next_attempt_at <= $1::timestamptz
+                 ) AS due,
+                 COUNT(*) FILTER (
+                      WHERE status = 'pending' AND next_attempt_at > $1::timestamptz
+                 ) AS delayed,
+                 COUNT(*) FILTER (
+                     WHERE status = 'succeeded'
+                        AND finished_at >= $1::timestamptz - INTERVAL '5 minutes'
+                 ) AS five_minute_succeeded,
+                 COUNT(*) FILTER (
+                     WHERE status = 'failed'
+                        AND finished_at >= $1::timestamptz - INTERVAL '5 minutes'
+                 ) AS five_minute_failed,
+                 COUNT(*) FILTER (
+                     WHERE status = 'succeeded'
+                        AND finished_at >= $1::timestamptz - INTERVAL '1 hour'
+                 ) AS hour_succeeded,
+                 COUNT(*) FILTER (
+                     WHERE status = 'failed'
+                        AND finished_at >= $1::timestamptz - INTERVAL '1 hour'
+                 ) AS hour_failed,
+                 COUNT(*) FILTER (
+                     WHERE status = 'succeeded'
+                        AND finished_at >= $1::timestamptz - INTERVAL '1 day'
+                 ) AS day_succeeded,
+                 COUNT(*) FILTER (
+                     WHERE status = 'failed'
+                        AND finished_at >= $1::timestamptz - INTERVAL '1 day'
+                 ) AS day_failed
+          FROM extraction_jobs
+          `,
+            [observedAt],
+          )
+        ).rows[0];
+        const targetCountsRow = (
+          await connection.query<StatusCountsRow>(
+            `
+          SELECT COUNT(*) AS total,
+                 COUNT(*) FILTER (WHERE jobs.status = 'pending') AS pending,
+                 COUNT(*) FILTER (WHERE jobs.status = 'running') AS running,
+                 COUNT(*) FILTER (WHERE jobs.status = 'succeeded') AS succeeded,
+                 COUNT(*) FILTER (WHERE jobs.status = 'failed') AS failed,
+                 COUNT(*) FILTER (WHERE jobs.status = 'superseded') AS superseded
+          FROM segment_targets AS targets
+          JOIN extraction_jobs AS jobs ON jobs.id = targets.job_id
+          `,
+          )
+        ).rows[0];
+        const oldestDueRow = (
+          await connection.query<DueJobRow>(
+            `
+          SELECT id, attempts, processing_priority,
+                 next_attempt_at::text AS due_at,
+                 EXTRACT(EPOCH FROM ($1::timestamptz - next_attempt_at))::double precision
+                     AS age_seconds
+          FROM extraction_jobs
+          WHERE status = 'pending' AND next_attempt_at <= $1::timestamptz
+          ORDER BY next_attempt_at, id
+          LIMIT 1
+          `,
+            [observedAt],
+          )
+        ).rows[0];
+        const runningRows = (
+          await connection.query<RunningJobRow>(
+            `
+          SELECT id, attempts, processing_priority,
+                 started_at::text AS started_at,
+                 CASE WHEN started_at IS NULL THEN NULL
+                       ELSE EXTRACT(EPOCH FROM ($1::timestamptz - started_at))::double precision
+                 END AS age_seconds
+          FROM extraction_jobs
+          WHERE status = 'running'
+          ORDER BY started_at NULLS FIRST, id
+          LIMIT 101
+          `,
+            [observedAt],
+          )
+        ).rows;
+        const failureRows = (
+          await connection.query<FailureCategoryRow>(
+            `
+          WITH categorized AS (
+              SELECT CASE
+                         WHEN jobs.error IS NULL OR btrim(jobs.error) = ''
+                         THEN 'UnknownError'
+                         WHEN jobs.error ~ '^UpstreamRequestError: upstream request failed: [0-9]{3}( |$)'
+                         THEN 'UpstreamHttp' || substring(
+                             jobs.error FROM '^UpstreamRequestError: upstream request failed: ([0-9]{3})'
+                         )
+                         WHEN jobs.error ~ '^[A-Za-z][A-Za-z0-9]{0,63}Error(:|$)'
+                         THEN substring(
+                             jobs.error FROM '^([A-Za-z][A-Za-z0-9]{0,63}Error)'
+                         )
+                         ELSE 'UnclassifiedError'
+                     END AS category,
+                     jobs.status,
+                     jobs.finished_at
+              FROM segment_targets AS targets
+              JOIN extraction_jobs AS jobs ON jobs.id = targets.job_id
+              WHERE jobs.status = 'failed'
+                 OR (
+                     jobs.status = 'pending'
+                     AND jobs.error IS NOT NULL
+                     AND btrim(jobs.error) <> ''
+                 )
+          )
+          SELECT category, COUNT(*) AS count,
+                 COUNT(*) FILTER (WHERE status = 'pending') AS pending,
+                 COUNT(*) FILTER (WHERE status = 'failed') AS failed,
+                 MAX(finished_at)::text AS latest_finished_at
+          FROM categorized
+          GROUP BY category
+          ORDER BY count DESC, category
+          LIMIT 51
+          `,
+          )
+        ).rows;
+        if (jobCountsRow === undefined || targetCountsRow === undefined) {
+          throw new Error("queue status aggregation returned no row");
+        }
+
+        const visibleRunningRows = runningRows.slice(0, 100);
+        const visibleFailureRows = failureRows.slice(0, 50);
+        return parseQueueStatusResponse({
+          observed_at: observedAt,
+          job_counts: statusCounts(jobCountsRow, "job count"),
+          target_counts: statusCounts(targetCountsRow, "target count"),
+          pending_due: checkedBigIntToNumber(
+            jobCountsRow.due,
+            "pending due count",
+          ),
+          pending_delayed: checkedBigIntToNumber(
+            jobCountsRow.delayed,
+            "pending delayed count",
+          ),
+          oldest_due_job:
+            oldestDueRow === undefined
+              ? null
+              : {
+                  id: checkedBigIntToNumber(
+                    oldestDueRow.id,
+                    "oldest due job id",
+                  ),
+                  attempts: oldestDueRow.attempts,
+                  processing_priority: oldestDueRow.processing_priority,
+                  due_at: timestamp(oldestDueRow.due_at),
+                  age_seconds: nonnegativeNumber(
+                    oldestDueRow.age_seconds,
+                    "oldest due job age",
+                  ),
+                },
+          running_jobs: visibleRunningRows.map((row) => ({
+            id: checkedBigIntToNumber(row.id, "running job id"),
+            attempts: row.attempts,
+            processing_priority: row.processing_priority,
+            started_at: nullableTimestamp(row.started_at),
+            age_seconds:
+              row.age_seconds === null
+                ? null
+                : nonnegativeNumber(row.age_seconds, "running job age"),
+          })),
+          running_jobs_truncated:
+            runningRows.length > visibleRunningRows.length,
+          failure_categories: visibleFailureRows.map((row) => ({
+            category: row.category,
+            count: checkedBigIntToNumber(row.count, "failure category count"),
+            pending: checkedBigIntToNumber(
+              row.pending,
+              "failure category pending count",
+            ),
+            failed: checkedBigIntToNumber(
+              row.failed,
+              "failure category failed count",
+            ),
+            latest_finished_at: nullableTimestamp(row.latest_finished_at),
+          })),
+          failure_categories_truncated:
+            failureRows.length > visibleFailureRows.length,
+          recent_terminal_jobs: [
+            {
+              window_seconds: 300,
+              succeeded: checkedBigIntToNumber(
+                jobCountsRow.five_minute_succeeded,
+                "five-minute succeeded count",
+              ),
+              failed: checkedBigIntToNumber(
+                jobCountsRow.five_minute_failed,
+                "five-minute failed count",
+              ),
+            },
+            {
+              window_seconds: 3_600,
+              succeeded: checkedBigIntToNumber(
+                jobCountsRow.hour_succeeded,
+                "hour succeeded count",
+              ),
+              failed: checkedBigIntToNumber(
+                jobCountsRow.hour_failed,
+                "hour failed count",
+              ),
+            },
+            {
+              window_seconds: 86_400,
+              succeeded: checkedBigIntToNumber(
+                jobCountsRow.day_succeeded,
+                "day succeeded count",
+              ),
+              failed: checkedBigIntToNumber(
+                jobCountsRow.day_failed,
+                "day failed count",
+              ),
+            },
+          ],
+        });
+      },
+      { readonlySnapshot: true },
+    );
+  }
+
   static async #lockSegment(
     connection: ReservedClient,
     segmentId: string,
@@ -655,9 +968,10 @@ export class Database {
 
   async #withTransaction<T>(
     operation: (connection: PoolClient) => Promise<T>,
+    options: { readonlySnapshot?: boolean } = {},
   ): Promise<T> {
     return this.#withConnection((connection) =>
-      transaction(connection, () => operation(connection)),
+      transaction(connection, () => operation(connection), options),
     );
   }
 

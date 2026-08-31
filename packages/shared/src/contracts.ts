@@ -295,6 +295,92 @@ export function parseJobResponse(value: unknown): JobResponse {
   );
 }
 
+export const JobStatusCountsSchema = Type.Object(
+  {
+    total: Type.Integer({ minimum: 0 }),
+    pending: Type.Integer({ minimum: 0 }),
+    running: Type.Integer({ minimum: 0 }),
+    succeeded: Type.Integer({ minimum: 0 }),
+    failed: Type.Integer({ minimum: 0 }),
+    superseded: Type.Integer({ minimum: 0 }),
+  },
+  { additionalProperties: false },
+);
+export type JobStatusCounts = Static<typeof JobStatusCountsSchema>;
+
+const QueuePendingJobSchema = Type.Object(
+  {
+    id: Type.Integer(),
+    attempts: Type.Integer({ minimum: 0 }),
+    processing_priority: Type.Integer({ minimum: 0, maximum: 100 }),
+    due_at: DateTimeSchema,
+    age_seconds: Type.Number({ minimum: 0 }),
+  },
+  { additionalProperties: false },
+);
+
+const QueueRunningJobSchema = Type.Object(
+  {
+    id: Type.Integer(),
+    attempts: Type.Integer({ minimum: 0 }),
+    processing_priority: Type.Integer({ minimum: 0, maximum: 100 }),
+    started_at: Nullable(DateTimeSchema),
+    age_seconds: Nullable(Type.Number({ minimum: 0 })),
+  },
+  { additionalProperties: false },
+);
+
+const QueueFailureCategorySchema = Type.Object(
+  {
+    category: Type.String({ minLength: 1, maxLength: 80 }),
+    count: Type.Integer({ minimum: 1 }),
+    pending: Type.Integer({ minimum: 0 }),
+    failed: Type.Integer({ minimum: 0 }),
+    latest_finished_at: Nullable(DateTimeSchema),
+  },
+  { additionalProperties: false },
+);
+
+const QueueTerminalWindowSchema = Type.Object(
+  {
+    window_seconds: Type.Union([
+      Type.Literal(300),
+      Type.Literal(3_600),
+      Type.Literal(86_400),
+    ]),
+    succeeded: Type.Integer({ minimum: 0 }),
+    failed: Type.Integer({ minimum: 0 }),
+  },
+  { additionalProperties: false },
+);
+
+export const QueueStatusResponseSchema = Type.Object(
+  {
+    observed_at: DateTimeSchema,
+    job_counts: JobStatusCountsSchema,
+    target_counts: JobStatusCountsSchema,
+    pending_due: Type.Integer({ minimum: 0 }),
+    pending_delayed: Type.Integer({ minimum: 0 }),
+    oldest_due_job: Nullable(QueuePendingJobSchema),
+    running_jobs: Type.Array(QueueRunningJobSchema, { maxItems: 100 }),
+    running_jobs_truncated: Type.Boolean(),
+    failure_categories: Type.Array(QueueFailureCategorySchema, {
+      maxItems: 50,
+    }),
+    failure_categories_truncated: Type.Boolean(),
+    recent_terminal_jobs: Type.Array(QueueTerminalWindowSchema, {
+      minItems: 3,
+      maxItems: 3,
+    }),
+  },
+  { additionalProperties: false },
+);
+export type QueueStatusResponse = Static<typeof QueueStatusResponseSchema>;
+
+export function parseQueueStatusResponse(value: unknown): QueueStatusResponse {
+  return parse("queue status response", QueueStatusResponseSchema, value);
+}
+
 export const ClaimDataSchema = Type.Object(
   {
     subject: Type.String(),
