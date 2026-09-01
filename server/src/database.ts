@@ -1727,38 +1727,83 @@ export class Database {
       const pending = (
         await connection.query<ClaimedJobRow>(
           `
+          WITH eligible_jobs AS (
+              SELECT jobs.id,
+                     jobs.session_id,
+                     targets.updated_at AS target_updated_at,
+                     ROW_NUMBER() OVER (
+                         PARTITION BY jobs.session_id
+                         ORDER BY targets.updated_at NULLS LAST, jobs.id ASC
+                     ) AS session_rank,
+                     MAX(COALESCE(targets.processing_priority, jobs.processing_priority)) OVER (
+                         PARTITION BY jobs.session_id
+                     ) AS session_urgency
+              FROM extraction_jobs AS jobs
+              LEFT JOIN segment_targets AS targets
+                ON targets.segment_id = jobs.segment_id
+               AND targets.job_id = jobs.id
+               AND targets.source_generation = jobs.source_generation
+               AND targets.source_fingerprint = jobs.source_fingerprint
+               AND targets.projection_version = jobs.projection_version
+               AND targets.end_user_message_id = jobs.end_user_message_id
+               AND targets.source_boundary_version = jobs.source_boundary_version
+               AND targets.start_source_message_id
+                   IS NOT DISTINCT FROM jobs.start_source_message_id
+               AND targets.end_source_message_id
+                   IS NOT DISTINCT FROM jobs.end_source_message_id
+              WHERE jobs.status = 'pending'
+                AND jobs.next_attempt_at <= now()
+                AND (targets.segment_id IS NOT NULL OR jobs.source_fingerprint IS NULL)
+                AND NOT (jobs.session_id = ANY($1::text[]))
+                AND NOT EXISTS (
+                    SELECT 1
+                    FROM extraction_jobs AS running
+                    WHERE running.segment_id = jobs.segment_id
+                      AND running.status = 'running'
+                )
+          ),
+          candidate AS (
+              SELECT id
+              FROM eligible_jobs
+              WHERE session_rank = 1
+              ORDER BY session_urgency DESC,
+                       target_updated_at NULLS LAST,
+                       id ASC
+              LIMIT 1
+          )
           SELECT jobs.id, jobs.segment_id, jobs.session_id,
-                  jobs.start_user_message_id, jobs.end_user_message_id,
-                  jobs.source_boundary_version, jobs.start_source_message_id,
-                  jobs.end_source_message_id, jobs.projection_version,
-                  jobs.payload, jobs.source_generation, jobs.source_fingerprint,
-                  CASE
-                      WHEN targets.extraction_result IS NOT NULL
-                       AND ${summaryHasContentSql(
-                         "targets.extraction_result->>'summary'",
-                       )}
-                       AND targets.extraction_validation_version =
-                           ${EXTRACTION_VALIDATION_VERSION}
-                       AND targets.extraction_validation_fingerprint =
-                           reflection_extraction_validation_fingerprint(
-                               targets.extraction_result,
-                               targets.extraction_validation_version,
-                               targets.source_fingerprint
-                           )
-                       AND targets.summary_commit_fingerprint =
-                           reflection_projection_fingerprint(
-                               targets.segment_id,
-                               targets.source_boundary_version,
-                               targets.end_user_message_id,
-                               targets.end_source_message_id,
-                               targets.extraction_result->>'summary',
-                               targets.projection_version
-                           )
-                      THEN targets.extraction_result
-                      ELSE NULL
-                  END AS extraction_result,
-                  jobs.processing_priority
-          FROM extraction_jobs AS jobs
+                 jobs.start_user_message_id, jobs.end_user_message_id,
+                 jobs.source_boundary_version, jobs.start_source_message_id,
+                 jobs.end_source_message_id, jobs.projection_version,
+                 jobs.payload, jobs.source_generation, jobs.source_fingerprint,
+                 CASE
+                     WHEN targets.extraction_result IS NOT NULL
+                      AND ${summaryHasContentSql(
+                        "targets.extraction_result->>'summary'",
+                      )}
+                      AND targets.extraction_validation_version =
+                          ${EXTRACTION_VALIDATION_VERSION}
+                      AND targets.extraction_validation_fingerprint =
+                          reflection_extraction_validation_fingerprint(
+                              targets.extraction_result,
+                              targets.extraction_validation_version,
+                              targets.source_fingerprint
+                          )
+                      AND targets.summary_commit_fingerprint =
+                          reflection_projection_fingerprint(
+                              targets.segment_id,
+                              targets.source_boundary_version,
+                              targets.end_user_message_id,
+                              targets.end_source_message_id,
+                              targets.extraction_result->>'summary',
+                              targets.projection_version
+                          )
+                     THEN targets.extraction_result
+                     ELSE NULL
+                 END AS extraction_result,
+                 jobs.processing_priority
+          FROM candidate
+          JOIN extraction_jobs AS jobs ON jobs.id = candidate.id
           LEFT JOIN segment_targets AS targets
             ON targets.segment_id = jobs.segment_id
            AND targets.job_id = jobs.id
@@ -1772,18 +1817,6 @@ export class Database {
            AND targets.end_source_message_id
                IS NOT DISTINCT FROM jobs.end_source_message_id
           WHERE jobs.status = 'pending'
-            AND jobs.next_attempt_at <= now()
-            AND (targets.segment_id IS NOT NULL OR jobs.source_fingerprint IS NULL)
-            AND NOT (jobs.session_id = ANY($1::text[]))
-            AND NOT EXISTS (
-                SELECT 1
-                FROM extraction_jobs AS running
-                WHERE running.segment_id = jobs.segment_id
-                  AND running.status = 'running'
-            )
-          ORDER BY COALESCE(targets.processing_priority, jobs.processing_priority) DESC,
-                   targets.updated_at, jobs.id
-          LIMIT 1
           FOR UPDATE OF jobs
         `,
           [Array.from(excludedSessionIds)],

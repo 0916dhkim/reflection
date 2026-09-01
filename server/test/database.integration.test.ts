@@ -1771,8 +1771,8 @@ describe.sequential("Database PostgreSQL integration", () => {
           processing_priority: 100,
           messages: [{ role: "assistant", text: "foreground sibling" }],
         });
-        const lowJob = await database.enqueue(lowPriority);
         const foregroundJob = await database.enqueue(foreground);
+        const lowJob = await database.enqueue(lowPriority);
         expect(lowJob.segment_id).not.toBe(foregroundJob.segment_id);
         expect(lowJob.start_user_message_id).toBe("turn");
         expect(foregroundJob).toMatchObject({
@@ -3924,5 +3924,400 @@ describe.sequential("Database PostgreSQL integration", () => {
       }
     },
     30_000,
+  );
+
+  test.skipIf(!DATABASE_URL)(
+    "inherits urgency across session jobs while maintaining FIFO head selection and preserving explicit priority",
+    async () => {
+      const database = new Database(settings());
+      await database.open();
+      try {
+        await truncate(database);
+
+        const backgroundJob = await database.enqueue(
+          request({
+            session_id: "session-bg",
+            start_user_message_id: "bg-1",
+            end_user_message_id: "bg-1-end",
+            projection_version: 1,
+            processing_priority: 0,
+            messages: [{ role: "user", text: "background job" }],
+          }),
+        );
+        const urgentHead = await database.enqueue(
+          request({
+            session_id: "session-urgent",
+            start_user_message_id: "urg-1",
+            end_user_message_id: "urg-1-end",
+            projection_version: 1,
+            processing_priority: 0,
+            messages: [{ role: "user", text: "urgent session head" }],
+          }),
+        );
+        const urgentTail = await database.enqueue(
+          request({
+            session_id: "session-urgent",
+            start_user_message_id: "urg-2",
+            end_user_message_id: "urg-2-end",
+            projection_version: 1,
+            processing_priority: 100,
+            messages: [{ role: "user", text: "urgent session tail" }],
+          }),
+        );
+
+        const claim1 = required(
+          await withClient(database, (client) =>
+            database.claimOldestJob(client),
+          ),
+        );
+        expect(claim1.id).toBe(urgentHead.id);
+        expect(claim1.request.session_id).toBe("session-urgent");
+        expect(claim1.request.processing_priority).toBe(0);
+
+        const [persistedJob, persistedTarget] = await Promise.all([
+          database.pool.query<{ processing_priority: number }>(
+            "SELECT processing_priority FROM extraction_jobs WHERE id = $1",
+            [urgentHead.id],
+          ),
+          database.pool.query<{ processing_priority: number }>(
+            "SELECT processing_priority FROM segment_targets WHERE segment_id = $1",
+            [urgentHead.segment_id],
+          ),
+        ]);
+        expect(required(persistedJob.rows[0]).processing_priority).toBe(0);
+        expect(required(persistedTarget.rows[0]).processing_priority).toBe(0);
+
+        await completeResolution(
+          database,
+          claim1,
+          emptyPrepared(claim1, "Urgent head summary"),
+        );
+
+        const claim2 = required(
+          await withClient(database, (client) =>
+            database.claimOldestJob(client),
+          ),
+        );
+        expect(claim2.id).toBe(urgentTail.id);
+        expect(claim2.request.session_id).toBe("session-urgent");
+        expect(claim2.request.processing_priority).toBe(100);
+
+        await completeResolution(
+          database,
+          claim2,
+          emptyPrepared(claim2, "Urgent tail summary"),
+        );
+
+        const claim3 = required(
+          await withClient(database, (client) =>
+            database.claimOldestJob(client),
+          ),
+        );
+        expect(claim3.id).toBe(backgroundJob.id);
+        expect(claim3.request.session_id).toBe("session-bg");
+        expect(claim3.request.processing_priority).toBe(0);
+
+        await completeResolution(
+          database,
+          claim3,
+          emptyPrepared(claim3, "Background job summary"),
+        );
+
+        const claim4 = await withClient(database, (client) =>
+          database.claimOldestJob(client),
+        );
+        expect(claim4).toBeNull();
+      } finally {
+        await database.close();
+      }
+    },
+    20_000,
+  );
+
+  test.skipIf(!DATABASE_URL)(
+    "breaks ties deterministically across session heads with equal inherited urgency using FIFO ordering",
+    async () => {
+      const database = new Database(settings());
+      await database.open();
+      try {
+        await truncate(database);
+
+        const sessionC1 = await database.enqueue(
+          request({
+            session_id: "session-C",
+            start_user_message_id: "c1",
+            end_user_message_id: "c1-end",
+            projection_version: 1,
+            processing_priority: 100,
+            messages: [{ role: "user", text: "session C head" }],
+          }),
+        );
+        const sessionD1 = await database.enqueue(
+          request({
+            session_id: "session-D",
+            start_user_message_id: "d1",
+            end_user_message_id: "d1-end",
+            projection_version: 1,
+            processing_priority: 0,
+            messages: [{ role: "user", text: "session D head" }],
+          }),
+        );
+        const sessionD2 = await database.enqueue(
+          request({
+            session_id: "session-D",
+            start_user_message_id: "d2",
+            end_user_message_id: "d2-end",
+            projection_version: 1,
+            processing_priority: 100,
+            messages: [{ role: "user", text: "session D tail" }],
+          }),
+        );
+        const sessionE1 = await database.enqueue(
+          request({
+            session_id: "session-E",
+            start_user_message_id: "e1",
+            end_user_message_id: "e1-end",
+            projection_version: 1,
+            processing_priority: 100,
+            messages: [{ role: "user", text: "session E head" }],
+          }),
+        );
+
+        const claim1 = required(
+          await withClient(database, (client) =>
+            database.claimOldestJob(client),
+          ),
+        );
+        expect(claim1.id).toBe(sessionC1.id);
+        expect(claim1.request.session_id).toBe("session-C");
+
+        const claim2 = required(
+          await withClient(database, (client) =>
+            database.claimOldestJob(client),
+          ),
+        );
+        expect(claim2.id).toBe(sessionD1.id);
+        expect(claim2.request.session_id).toBe("session-D");
+
+        await completeResolution(
+          database,
+          claim2,
+          emptyPrepared(claim2, "Session D1 summary"),
+        );
+
+        const claim3 = required(
+          await withClient(database, (client) =>
+            database.claimOldestJob(client),
+          ),
+        );
+        expect(claim3.id).toBe(sessionD2.id);
+        expect(claim3.request.session_id).toBe("session-D");
+
+        const claim4 = required(
+          await withClient(database, (client) =>
+            database.claimOldestJob(client),
+          ),
+        );
+        expect(claim4.id).toBe(sessionE1.id);
+        expect(claim4.request.session_id).toBe("session-E");
+
+        const claim5 = await withClient(database, (client) =>
+          database.claimOldestJob(client),
+        );
+        expect(claim5).toBeNull();
+      } finally {
+        await database.close();
+      }
+    },
+    20_000,
+  );
+
+  test.skipIf(!DATABASE_URL)(
+    "does not transfer urgency from excluded sessions and selects head when unblocked",
+    async () => {
+      const database = new Database(settings());
+      await database.open();
+      try {
+        await truncate(database);
+
+        const urgentExcludedHead = await database.enqueue(
+          request({
+            session_id: "session-excluded",
+            start_user_message_id: "ex-1",
+            end_user_message_id: "ex-1-end",
+            projection_version: 1,
+            processing_priority: 0,
+            messages: [{ role: "user", text: "excluded urgent head" }],
+          }),
+        );
+        const urgentExcludedTail = await database.enqueue(
+          request({
+            session_id: "session-excluded",
+            start_user_message_id: "ex-2",
+            end_user_message_id: "ex-2-end",
+            projection_version: 1,
+            processing_priority: 100,
+            messages: [{ role: "user", text: "excluded urgent tail" }],
+          }),
+        );
+        const normalJob = await database.enqueue(
+          request({
+            session_id: "session-normal",
+            start_user_message_id: "norm-1",
+            end_user_message_id: "norm-1-end",
+            projection_version: 1,
+            processing_priority: 0,
+            messages: [{ role: "user", text: "normal work" }],
+          }),
+        );
+
+        const claimNormal = required(
+          await withClient(database, (client) =>
+            database.claimOldestJob(client, ["session-excluded"]),
+          ),
+        );
+        expect(claimNormal.id).toBe(normalJob.id);
+        expect(claimNormal.request.session_id).toBe("session-normal");
+        expect(claimNormal.request.processing_priority).toBe(0);
+
+        const claimBlocked = await withClient(database, (client) =>
+          database.claimOldestJob(client, ["session-excluded"]),
+        );
+        expect(claimBlocked).toBeNull();
+
+        const claimExcluded = required(
+          await withClient(database, (client) =>
+            database.claimOldestJob(client, []),
+          ),
+        );
+        expect(claimExcluded.id).toBe(urgentExcludedHead.id);
+        expect(claimExcluded.request.session_id).toBe("session-excluded");
+        expect(claimExcluded.request.processing_priority).toBe(0);
+
+        const [persistedJob, persistedTarget] = await Promise.all([
+          database.pool.query<{ processing_priority: number }>(
+            "SELECT processing_priority FROM extraction_jobs WHERE id = $1",
+            [urgentExcludedHead.id],
+          ),
+          database.pool.query<{ processing_priority: number }>(
+            "SELECT processing_priority FROM segment_targets WHERE segment_id = $1",
+            [urgentExcludedHead.segment_id],
+          ),
+        ]);
+        expect(required(persistedJob.rows[0]).processing_priority).toBe(0);
+        expect(required(persistedTarget.rows[0]).processing_priority).toBe(0);
+      } finally {
+        await database.close();
+      }
+    },
+    20_000,
+  );
+
+  test.skipIf(!DATABASE_URL)(
+    "does not confer urgency from delayed future jobs until they become due",
+    async () => {
+      const database = new Database(settings());
+      await database.open();
+      try {
+        await truncate(database);
+
+        const backgroundJob = await database.enqueue(
+          request({
+            session_id: "session-bg",
+            start_user_message_id: "bg-1",
+            end_user_message_id: "bg-1-end",
+            projection_version: 1,
+            processing_priority: 0,
+            messages: [{ role: "user", text: "background job" }],
+          }),
+        );
+        const delayedHead = await database.enqueue(
+          request({
+            session_id: "session-delayed",
+            start_user_message_id: "del-1",
+            end_user_message_id: "del-1-end",
+            projection_version: 1,
+            processing_priority: 0,
+            messages: [{ role: "user", text: "delayed session head" }],
+          }),
+        );
+        const delayedTail = await database.enqueue(
+          request({
+            session_id: "session-delayed",
+            start_user_message_id: "del-2",
+            end_user_message_id: "del-2-end",
+            projection_version: 1,
+            processing_priority: 100,
+            messages: [{ role: "user", text: "delayed session tail" }],
+          }),
+        );
+
+        await database.pool.query(
+          "UPDATE extraction_jobs SET next_attempt_at = now() + INTERVAL '1 hour' WHERE id = $1",
+          [delayedTail.id],
+        );
+
+        const claim1 = required(
+          await withClient(database, (client) =>
+            database.claimOldestJob(client),
+          ),
+        );
+        expect(claim1.id).toBe(backgroundJob.id);
+        expect(claim1.request.session_id).toBe("session-bg");
+
+        await completeResolution(
+          database,
+          claim1,
+          emptyPrepared(claim1, "Background job summary"),
+        );
+
+        const claim2 = required(
+          await withClient(database, (client) =>
+            database.claimOldestJob(client),
+          ),
+        );
+        expect(claim2.id).toBe(delayedHead.id);
+        expect(claim2.request.session_id).toBe("session-delayed");
+
+        await completeResolution(
+          database,
+          claim2,
+          emptyPrepared(claim2, "Delayed head summary"),
+        );
+
+        const claim3 = await withClient(database, (client) =>
+          database.claimOldestJob(client),
+        );
+        expect(claim3).toBeNull();
+
+        await database.pool.query(
+          "UPDATE extraction_jobs SET next_attempt_at = now() - INTERVAL '1 second' WHERE id = $1",
+          [delayedTail.id],
+        );
+
+        const claim4 = required(
+          await withClient(database, (client) =>
+            database.claimOldestJob(client),
+          ),
+        );
+        expect(claim4.id).toBe(delayedTail.id);
+        expect(claim4.request.session_id).toBe("session-delayed");
+        expect(claim4.request.processing_priority).toBe(100);
+
+        await completeResolution(
+          database,
+          claim4,
+          emptyPrepared(claim4, "Delayed tail summary"),
+        );
+
+        const claim5 = await withClient(database, (client) =>
+          database.claimOldestJob(client),
+        );
+        expect(claim5).toBeNull();
+      } finally {
+        await database.close();
+      }
+    },
+    20_000,
   );
 });
