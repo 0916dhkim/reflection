@@ -86,7 +86,7 @@ Content-Type: application/json
 
 Requests that omit all three source-boundary fields are normalized to legacy v1. New plugin and backfill writers always send the canonical fields explicitly.
 
-When a source span has no visible text, writers render bounded tool state. Identifier validation recognizes only complete tool blocks whose name and state canonically round-trip through the shared renderer, then scans parsed string values rather than JSON escape syntax.
+When a source span has no visible text, writers submit bounded renderer-canonical tool fallback text.
 
 ### Other endpoints
 

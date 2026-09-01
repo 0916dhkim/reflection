@@ -11,7 +11,7 @@ import {
   segmentIdForRequest,
   type MentionContext,
 } from "@reflection/shared/domain";
-import { modelVisibleToolState } from "@reflection/shared/segmentation";
+import { modelVisibleToolState } from "@reflection/shared/tool-source";
 import { describe, expect, test, vi } from "vitest";
 
 import {
@@ -32,6 +32,7 @@ import {
   type FetchLike,
 } from "../src/clients.js";
 import type { Settings } from "../src/config.js";
+import { EXTRACTION_VALIDATION_VERSION } from "../src/extraction-validation.js";
 
 const silentLogger: ClientLogger = {
   info: vi.fn(),
@@ -583,29 +584,6 @@ describe("ModelClient", () => {
     });
   });
 
-  test("rejects identifier changes hidden by predicate normalization", async () => {
-    const fetcher: FetchLike = async () =>
-      modelResponse({
-        summary: "Summary",
-        claims: [
-          {
-            subject: "Reflection",
-            predicate: "uses_Modelclient",
-            confidence: 0.9,
-            object_kind: "literal",
-            object_text: "configuration",
-          },
-        ],
-      });
-
-    await expect(
-      new ModelClient(settings(), fetcher, silentLogger).extract(
-        segmentRequest("Reflection uses ModelClient configuration."),
-        [],
-      ),
-    ).rejects.toBeInstanceOf(UpstreamValidationError);
-  });
-
   test("allows deterministic normalization of an exact whole predicate", async () => {
     const fetcher: FetchLike = async () =>
       modelResponse({
@@ -656,12 +634,6 @@ describe("ModelClient", () => {
     });
   });
 
-  const oversizedIdentifier =
-    `head-${"a".repeat(3_332)}` +
-    "b".repeat(3_332) +
-    "c".repeat(3_332) +
-    "d".repeat(3_000);
-
   test.each([
     ["uses ModelClient", "Reflection uses ModelClient.", "uses model client"],
     [
@@ -703,160 +675,6 @@ describe("ModelClient", () => {
       });
     },
   );
-
-  test("allows ordinary articles beside identifiers with many components", async () => {
-    const token = ["a", ...Array(100).fill("bb")].join("-");
-    const summary = `A record preserves ${token} exactly.`;
-    const fetcher: FetchLike = async () =>
-      modelResponse({ summary, claims: [] });
-
-    await expect(
-      new ModelClient(settings(), fetcher, silentLogger).extract(
-        segmentRequest(`Identifier ${token} exists.`),
-        [],
-      ),
-    ).resolves.toMatchObject({ summary });
-  });
-
-  test("allows an isolated lowercase prose word that is also an identifier component", async () => {
-    const summary = "The client is configured.";
-    const fetcher: FetchLike = async () =>
-      modelResponse({ summary, claims: [] });
-
-    await expect(
-      new ModelClient(settings(), fetcher, silentLogger).extract(
-        segmentRequest("ModelClient is configured."),
-        [],
-      ),
-    ).resolves.toMatchObject({ summary });
-  });
-
-  test("rejects an identifier component used as a claim subject", async () => {
-    const fetcher: FetchLike = async () =>
-      modelResponse({
-        summary: "A component is configured.",
-        claims: [
-          {
-            subject: "client",
-            predicate: "is configured",
-            confidence: 0.9,
-            object_kind: "literal",
-            object_text: "true",
-          },
-        ],
-      });
-
-    await expect(
-      new ModelClient(settings(), fetcher, silentLogger).extract(
-        segmentRequest("ModelClient is configured."),
-        [],
-      ),
-    ).rejects.toBeInstanceOf(UpstreamValidationError);
-  });
-
-  test("does not combine unrelated plain source words into a structured identity", async () => {
-    const fetcher: FetchLike = async () =>
-      modelResponse({
-        summary: "Feature uses ModelClient.",
-        claims: [
-          {
-            subject: "client / model",
-            predicate: "exists",
-            confidence: 0.9,
-            object_kind: "literal",
-            object_text: "true",
-          },
-        ],
-      });
-
-    await expect(
-      new ModelClient(settings(), fetcher, silentLogger).extract(
-        segmentRequest("Feature uses ModelClient. The client selects a model."),
-        [],
-      ),
-    ).rejects.toBeInstanceOf(UpstreamValidationError);
-  });
-
-  test("allows natural predicate articles beside identifier components", async () => {
-    const fetcher: FetchLike = async () =>
-      modelResponse({
-        summary: "AClient depends on Storage.",
-        claims: [
-          {
-            subject: "AClient",
-            predicate: "has_a_dependency_on",
-            confidence: 0.9,
-            object_kind: "entity",
-            object_text: "Storage",
-          },
-        ],
-      });
-
-    await expect(
-      new ModelClient(settings(), fetcher, silentLogger).extract(
-        segmentRequest("AClient has a dependency on Storage."),
-        [],
-      ),
-    ).resolves.toMatchObject({
-      claims: [{ predicate: "has a dependency on" }],
-    });
-  });
-
-  test.each([
-    ["ModelClient", "uses_ModelClient_Model_Client"],
-    ["fake-package", "uses_fake-package_fake_package"],
-    ["input/output", "uses_input/output_input_output"],
-    ["HTTPServer", "uses_HTTPServer_HTTP_Server"],
-  ])(
-    "does not reuse normalized support for fabricated %s occurrences",
-    async (source, predicate) => {
-      const fetcher: FetchLike = async () =>
-        modelResponse({
-          summary: "Summary",
-          claims: [
-            {
-              subject: "Reflection",
-              predicate,
-              confidence: 0.9,
-              object_kind: "literal",
-              object_text: "true",
-            },
-          ],
-        });
-
-      await expect(
-        new ModelClient(settings(), fetcher, silentLogger).extract(
-          segmentRequest(source),
-          [],
-        ),
-      ).rejects.toBeInstanceOf(UpstreamValidationError);
-    },
-  );
-
-  test("shares plain occurrence budgets across predicate components", async () => {
-    const fetcher: FetchLike = async () =>
-      modelResponse({
-        summary: "Summary",
-        claims: [
-          {
-            subject: "Feature",
-            predicate: "uses ModelClient fakepackage fakepackage",
-            confidence: 0.9,
-            object_kind: "literal",
-            object_text: "true",
-          },
-        ],
-      });
-
-    await expect(
-      new ModelClient(settings(), fetcher, silentLogger).extract(
-        segmentRequest(
-          "ModelClient is configured. fake-package-name differs from fakepackage.",
-        ),
-        [],
-      ),
-    ).rejects.toBeInstanceOf(UpstreamValidationError);
-  });
 
   test("rejects empty extraction summaries", async () => {
     const fetcher: FetchLike = async () =>
@@ -1503,121 +1321,6 @@ describe("ModelClient", () => {
     });
   });
 
-  test.each(["ModelClient", "fake-package", "HTTPServer"])(
-    "allows complete compound path segment %s as a referent",
-    async (segment) => {
-      const summary = `The ${segment} path component exists.`;
-      const fetcher: FetchLike = async () =>
-        modelResponse({ summary, claims: [] });
-
-      await expect(
-        new ModelClient(settings(), fetcher, silentLogger).extract(
-          segmentRequest(`Path /etc/${segment}/config exists.`),
-          [],
-        ),
-      ).resolves.toMatchObject({ summary });
-    },
-  );
-
-  test.each(["user, admin", "user; admin", "user / admin"])(
-    "rejects reordered path components separated as %s",
-    async (subject) => {
-      const fetcher: FetchLike = async () =>
-        modelResponse({
-          summary: "A synthesized entity exists.",
-          claims: [
-            {
-              subject,
-              predicate: "exists",
-              confidence: 0.9,
-              object_kind: "literal",
-              object_text: "true",
-            },
-          ],
-        });
-
-      await expect(
-        new ModelClient(settings(), fetcher, silentLogger).extract(
-          segmentRequest("Path /safe/admin/user exists."),
-          [],
-        ),
-      ).rejects.toBeInstanceOf(UpstreamValidationError);
-    },
-  );
-
-  test.each([
-    [
-      "Endpoint literal is <https://example.com/api)>",
-      "https://example.com/api)",
-      "https://example.com/api",
-    ],
-    [
-      "Endpoint literal is 'https://example.com/api)'",
-      "https://example.com/api)",
-      "https://example.com/api",
-    ],
-    [
-      "Endpoint literal is ‘https://example.com/api)’",
-      "https://example.com/api)",
-      "https://example.com/api",
-    ],
-    [
-      "Endpoint literal is 'https://example.com/api)'.",
-      "https://example.com/api)",
-      "https://example.com/api",
-    ],
-    [
-      "Endpoint literal is ‘https://example.com/api)’,",
-      "https://example.com/api)",
-      "https://example.com/api",
-    ],
-    [
-      "Endpoint literal is (https://example.com/api))",
-      "https://example.com/api)",
-      "https://example.com/api",
-    ],
-    [
-      "Endpoint literal is {https://example.com/api}}",
-      "https://example.com/api}",
-      "https://example.com/api",
-    ],
-  ])(
-    "preserves URI punctuation inside explicit delimiters",
-    async (source, exactObjectText, changedObjectText) => {
-      const result = (objectText: string) => ({
-        summary: "The endpoint literal was recorded.",
-        claims: [
-          {
-            subject: "Endpoint",
-            predicate: "records",
-            confidence: 0.9,
-            object_kind: "literal" as const,
-            object_text: objectText,
-          },
-        ],
-      });
-      const exactFetcher: FetchLike = async () =>
-        modelResponse(result(exactObjectText));
-      const changedFetcher: FetchLike = async () =>
-        modelResponse(result(changedObjectText));
-
-      await expect(
-        new ModelClient(settings(), exactFetcher, silentLogger).extract(
-          segmentRequest(source),
-          [],
-        ),
-      ).resolves.toMatchObject({
-        claims: [{ object_value: exactObjectText }],
-      });
-      await expect(
-        new ModelClient(settings(), changedFetcher, silentLogger).extract(
-          segmentRequest(source),
-          [],
-        ),
-      ).rejects.toBeInstanceOf(UpstreamValidationError);
-    },
-  );
-
   test("rejects resolutions for dropped claims", async () => {
     const fetcher: FetchLike = async () =>
       modelResponse({
@@ -1707,538 +1410,267 @@ describe("ModelClient", () => {
     });
   });
 
-  test("rejects altered copied source identifiers", async () => {
-    const fetcher: FetchLike = async () =>
+  test("accepts structurally valid extractions even when copied identifiers are altered or fabricated", async () => {
+    const fetcher = vi.fn<FetchLike>(async () =>
       modelResponse({
-        summary: "Snapshot tool_example12",
+        summary:
+          "Fabricated @scope/altered-pkg release 9.9.9 uses ModelClinet.",
         claims: [
           {
-            subject: "Snapshot tool_example12",
-            predicate: "reports",
-            confidence: 0.99,
+            subject: "ModelClinet",
+            predicate: "targets_csharp",
+            confidence: 0.9,
             object_kind: "literal",
-            object_text: "value",
+            object_text: "true",
+          },
+          {
+            subject: "tool_fabricated_12",
+            predicate: "connects_to",
+            confidence: 0.85,
+            object_kind: "entity",
+            object_text: "RemoteServer99",
+          },
+          {
+            subject: "Service",
+            predicate: "runs_on_port",
+            confidence: 0.75,
+            object_kind: "literal",
+            object_text: "127.0.0.1:9999",
           },
         ],
-      });
+      }),
+    );
 
     await expect(
       new ModelClient(settings(), fetcher, silentLogger).extract(
-        segmentRequest("Snapshot tool_example123"),
+        segmentRequest(
+          "Source discusses ModelClient with C++ and tool_example123.",
+        ),
         [],
       ),
-    ).rejects.toBeInstanceOf(UpstreamValidationError);
+    ).resolves.toEqual({
+      summary: "Fabricated @scope/altered-pkg release 9.9.9 uses ModelClinet.",
+      claims: [
+        {
+          subject: "ModelClinet",
+          predicate: "targets csharp",
+          confidence: 0.9,
+          object_entity: null,
+          object_value: "true",
+        },
+        {
+          subject: "tool_fabricated_12",
+          predicate: "connects to",
+          confidence: 0.85,
+          object_entity: "RemoteServer99",
+          object_value: null,
+        },
+        {
+          subject: "Service",
+          predicate: "runs on port",
+          confidence: 0.75,
+          object_entity: null,
+          object_value: "127.0.0.1:9999",
+        },
+      ],
+    });
+    expect(fetcher).toHaveBeenCalledTimes(1);
   });
 
   test.each([
+    ["ModelClient", "ModelClinet"],
     ["@scope/pkg", "scope/pkg"],
     ["foo@1.2.3", "foo@9.9.9"],
     ["--feature-flag", "--fabricated-flag"],
-    ["gh:org/repo", "gh:evil/repo"],
     ["2026-08-26", "2025-08-26"],
-    ["10-20", "10-30"],
     ["1.2.3", "9.9.9"],
     ["127.0.0.1", "10.0.0.1"],
-    ["ModelClient", "ModelClinet"],
-    ["ModelClient", "Modelclient"],
-    ["ModelClient", "modelclient"],
-    ["ModelClient", "Model Client"],
-    ["HTTPServerURL", "Httpserverurl"],
-    ["HTTP2Server", "HTTP3Server"],
-    ["1.2.3", "1.2"],
-    ["fake-package", "fake package"],
-    ["fake-package", "fakepackage"],
-    ["release-1.2.3", "release-1.9.9"],
-    ["artifact-1.2.3.tar.gz", "artifact-1.9.9.tar.gz"],
-    ["127.0.0.1:5432", "127.0.0.1:9999"],
-    ["https://example.com/api'good", "https://example.com/api'evil"],
-    [String.raw`C:\foo\bar'good`, String.raw`C:\foo\bar'evil`],
-    ["https://example.com/api'", "https://example.com/api"],
-    ["https://example.com/api", "https://example.com/api'"],
-    [String.raw`C:\foo\bar'`, String.raw`C:\foo\bar`],
-    [String.raw`C:\foo\bar`, String.raw`C:\foo\bar'`],
     ["C++", "C#"],
     [".NET", ".Net"],
     ["`println!`", "`print!`"],
-    ["v2", "v 2"],
-    ["x86", "x 86"],
-    ["S3", "S 3"],
-    ["$x", "x"],
-    ["@x", "x"],
-    ["_x", "x"],
-    ["#1", "1"],
-    ["C++", "C"],
-    ["C#", "C"],
-    ["C++", "C sharp"],
-    ["C#", "C plus plus"],
-    ["C++", "cplusplus"],
-    [".NET", "dotnet"],
-    ["Issue #1 has 1 blocker.", "Issue 1 has 1 blocker."],
-    ["Variable $x is multiplied by x.", "Variable x is multiplied by x."],
-    ["C++ interoperates with C.", "C interoperates with C."],
-    ["ModelClient", "Model\nClient"],
-    ["fake-package", "fake\npackage"],
-    ["input/output", "input\noutput"],
-    ["tool_fabricated_id", "tool\nfabricated id"],
-    ["fake-package.", "fake package."],
-    ["tool_fabricated_id.", "tool fabricated id."],
-    ["input/output.", "input output."],
-    ["alpha.beta.", "alpha beta."],
-    ["modelClient", "model\u200bClient"],
-    ["modelClient", "model\u0301Client"],
-    [
-      "frontend-feature-flag-rollout-worker-retry-backoff-default-value",
-      "frontend feature flag rollout worker retry backoff default value",
-    ],
-    [
-      Array.from({ length: 513 }, (_, index) => `p${index}`).join("-"),
-      Array.from({ length: 513 }, (_, index) => `p${index}`).join(" "),
-    ],
-    [
-      `${"a".repeat(500)}-${"b".repeat(501)}`,
-      `${"a".repeat(500)} ${"b".repeat(501)}`,
-    ],
-    [
-      Array.from({ length: 4_000 }, () => "ﬃ").join("-"),
-      Array.from({ length: 4_000 }, () => "ﬃ").join(" "),
-    ],
-    [`a${"-".repeat(10_000)}b`, "a b"],
-    [`a-${"b".repeat(9_999)}`, `a ${"b".repeat(9_999)}`],
-    ["fake-package-name", "fake package"],
-    ["fake-package-name", "package name"],
-    ["ModelClientFactory", "Model Client"],
-    ["input/output/schema", "input output"],
-    ["alpha.beta.gamma", "alpha beta"],
-    ["fake-package-name", "fakepackage"],
-    ["ModelClientFactory", "modelclient"],
-    ["input/output/schema", "inputoutput"],
-    ["HTTPServerURL", "httpserver"],
-    [`a-${"b".repeat(10_000)}`, `a ${"b".repeat(9_999)}`],
-    ["fake-package-name", "fakename"],
-    ["fake-package-name", "packagefake"],
-    ["fake-package-name", "packagepackage"],
-    ["ModelClientFactory", "modelfactory"],
-    ["ModelClientFactory", "clientmodel"],
-    ["input/output/schema", "inputschema"],
-    ["input/output/schema", "outputinput"],
-    ["HTTPServerURL", "httpurl"],
-    ["foo-bar-foo", "foofoo"],
-    [oversizedIdentifier, "b".repeat(100)],
-    [oversizedIdentifier, "d".repeat(100)],
-    ["frontendfeatureflagrollout-zz", "frontend feature flag rollout"],
-    [`head-${"x".repeat(9_995)}가z`, "가z"],
-    ["x", "$x"],
-    ["ModelClient", "modelclinet"],
-    ["ModelClientFactory", "modelclinet"],
-    ["ModelClientFactory", "clinet"],
-    ["v2", "vs"],
-    ["v2 is configured.", "Version v is configured."],
-    [oversizedIdentifier, `${"b".repeat(50)}e${"b".repeat(49)}`],
-    ["StraßeAPI", "strasseapi"],
-    ["CaféClient", "cafeclient"],
-    [`head-${"x".repeat(9_994)}ΣBtail`, "σbtail"],
-    ["ModelClient", "ModelClient]evil"],
-    ["ModelClient", "evil]ModelClient"],
-    ["ModelClient", "ModelClient<evil"],
-    ["/safe/path", "/safe/path<evil"],
-    ["https://example.com/api", "https://example.com/api]evil"],
-    [String.raw`C:\foo\bar`, String.raw`C:\foo\bar<evil`],
-    ["release-1.2.3", "release-1.2.3]evil"],
-    [
-      "deadbeef-dead-4abc-8abc-123456789012",
-      "deadbeef-dead-4abc-8abc-123456789012]evil",
-    ],
-    ["74cff22", "74cff22]evil"],
-    ["`foobar`", "`foobaz`"],
-    ["--verbose", "--verbosity"],
-    ["--verbose", "-x"],
-    ["ModelClient", "ModelClient/"],
-    ["ModelClient", "ModelClient-"],
-    ["74cff22", "_74cff22"],
-    ["C++", "++"],
-    ["/safe/fake-package", "fakepackage"],
-    ["/safe/ModelClient", "model client"],
-    ["/safe/acpi", "ACPI"],
-    ["/safe/foo-bar", "fo"],
-    ["/safe/foo-bar", "bra"],
-    ["/safe/foo-x", "x."],
-    ["/safe/path", "path safe"],
-    ["/safe/path", "safe safe"],
+    ["fake-package", "fakepackage"],
+    ["file:///fabricated/path", "file:///fabricated/path"],
   ])(
-    "rejects an altered complete identifier: %s -> %s",
+    "accepts structurally valid extraction with altered identifier %s -> %s",
     async (source, output) => {
-      const fetcher: FetchLike = async () =>
-        modelResponse({ summary: `Identifier ${output}`, claims: [] });
+      const fetcher = vi.fn<FetchLike>(async () =>
+        modelResponse({ summary: `Identifier ${output}`, claims: [] }),
+      );
 
       await expect(
         new ModelClient(settings(), fetcher, silentLogger).extract(
           segmentRequest(`Identifier ${source}`),
           [],
         ),
-      ).rejects.toBeInstanceOf(UpstreamValidationError);
+      ).resolves.toEqual({
+        summary: `Identifier ${output}`,
+        claims: [],
+      });
+      expect(fetcher).toHaveBeenCalledTimes(1);
     },
   );
 
-  test.each(["DEPLOYMENT_TOKEN", "ReadSegmentMessages", "Makefile"])(
-    "rejects an unsupported source-valid identifier class: %s",
-    async (identifier) => {
-      const fetcher: FetchLike = async () =>
-        modelResponse({ summary: `Uses ${identifier}.`, claims: [] });
-
-      await expect(
-        new ModelClient(settings(), fetcher, silentLogger).extract(
-          segmentRequest("Uses an ordinary deployment helper."),
-          [],
-        ),
-      ).rejects.toBeInstanceOf(UpstreamValidationError);
-    },
-  );
-
-  test("accepts a source-grounded extensionless build filename", async () => {
-    const fetcher: FetchLike = async () =>
-      modelResponse({ summary: "The build uses Makefile.", claims: [] });
-
-    await expect(
-      new ModelClient(settings(), fetcher, silentLogger).extract(
-        segmentRequest("Configure the build with Makefile."),
-        [],
-      ),
-    ).resolves.toMatchObject({ summary: "The build uses Makefile." });
-  });
-
-  test("bounds component phrase matches across the complete result", async () => {
-    const source = Array.from(
-      { length: 150 },
-      (_, index) => `@${"a".repeat(index + 2)}`,
-    ).join(" ");
-    const output = Array(800).fill("a").join(" ");
+  test("normalizes absolute paths to backticked source filenames", async () => {
     const logger: ClientLogger = { info: vi.fn(), warn: vi.fn() };
     const fetcher: FetchLike = async () =>
       modelResponse({
-        summary: "Summary",
+        summary: "Created /etc/acpi/events/brightness-down configuration.",
         claims: [
           {
-            subject: "Feature",
-            predicate: "records",
-            confidence: 0.9,
-            object_kind: "literal",
-            object_text: output,
+            subject: "/var/log/syslog.log",
+            predicate: "references",
+            confidence: 0.95,
+            object_kind: "entity",
+            object_text: "/home/user/workspace/config.json",
           },
           {
-            subject: "Setting",
-            predicate: "records",
-            confidence: 0.9,
+            subject: "system",
+            predicate: "loaded",
+            confidence: 0.8,
             object_kind: "literal",
-            object_text: output,
+            object_text: "/opt/app/service.ts",
           },
         ],
       });
 
-    await expect(
-      new ModelClient(settings(), fetcher, logger).extract(
-        segmentRequest(source),
-        [],
-      ),
-    ).rejects.toBeInstanceOf(UpstreamValidationError);
+    const source = [
+      "created `/etc/acpi/events/brightness-up` and `brightness-down`.",
+      "check `syslog.log` and `config.json` alongside `service.ts`.",
+    ].join("\n");
+
+    const result = await new ModelClient(settings(), fetcher, logger).extract(
+      segmentRequest(source),
+      [],
+    );
+
+    expect(result).toEqual({
+      summary: "Created brightness-down configuration.",
+      claims: [
+        {
+          subject: "syslog.log",
+          predicate: "references",
+          confidence: 0.95,
+          object_entity: "config.json",
+          object_value: null,
+        },
+        {
+          subject: "system",
+          predicate: "loaded",
+          confidence: 0.8,
+          object_entity: null,
+          object_value: "service.ts",
+        },
+      ],
+    });
     expect(logger.warn).toHaveBeenCalledWith(
-      "extraction altered source identifiers",
-      expect.objectContaining({ validationBudgetExceeded: true }),
+      "normalized extracted paths to source filenames",
+      {
+        model: "openai/gpt-5.6-luna",
+        paths: 4,
+      },
     );
   });
 
-  test("retains accumulated plain phrase support at the scan budget", async () => {
-    const identifiers = Array.from(
-      { length: 499 },
-      (_, index) => `@${"a".repeat(index + 2)}`,
-    ).join(" ");
-    const phrase = (words: number): string => Array(words).fill("a").join(" ");
-    const output = phrase(500);
-    const extract = (source: string) => {
-      const fetcher: FetchLike = async () =>
-        modelResponse({ summary: output, claims: [] });
-      return new ModelClient(settings(), fetcher, silentLogger).extract(
-        segmentRequest(source),
-        [],
-      );
-    };
-
-    await expect(
-      extract(`${identifiers} ${phrase(2_200)}`),
-    ).resolves.toMatchObject({ summary: output });
-    await expect(
-      extract(`${identifiers} ${phrase(2_300)}`),
-    ).resolves.toMatchObject({ summary: output });
-  });
-
-  test("bounds exact component checks for contract-sized identifiers", async () => {
-    const source = `a-${"a".repeat(9_998)}`;
-    const objectText = "a".repeat(9_999);
+  test("preserves exact absolute paths present in source", async () => {
     const fetcher: FetchLike = async () =>
       modelResponse({
-        summary: "Summary",
+        summary: "Used /var/log/syslog.log.",
         claims: [
           {
-            subject: "Feature",
+            subject: "system",
             predicate: "records",
             confidence: 0.9,
-            object_kind: "literal",
-            object_text: objectText,
-          },
-        ],
-      });
-
-    await expect(
-      new ModelClient(settings(), fetcher, silentLogger).extract(
-        segmentRequest(source),
-        [],
-      ),
-    ).rejects.toBeInstanceOf(UpstreamValidationError);
-  }, 2_000);
-
-  test("meters repeated exact-containment scans across dense source spans", async () => {
-    const candidates = "abcdefghijklmnopqrstuvwxy";
-    const source = `records ${Array.from(
-      { length: 16_000 },
-      (_, index) => `${candidates}-${String(index).padStart(5, "0")}`,
-    ).join(" ")} ${[...candidates].join(" ")}`;
-    const logger: ClientLogger = { info: vi.fn(), warn: vi.fn() };
-    let validationYielded = false;
-    let validationHeartbeat: ReturnType<typeof setTimeout> | undefined;
-    const fetcher: FetchLike = async () => {
-      validationHeartbeat = setTimeout(() => {
-        validationYielded = true;
-      }, 0);
-      return modelResponse({
-        summary: "Summary",
-        claims: [...candidates].map((candidate) => ({
-          subject: `${candidates}-00000`,
-          predicate: "records",
-          confidence: 0.9,
-          object_kind: "literal",
-          object_text: candidate,
-        })),
-      });
-    };
-
-    try {
-      await expect(
-        new ModelClient(settings(), fetcher, logger).extract(
-          segmentRequest(source),
-          [],
-        ),
-      ).rejects.toBeInstanceOf(UpstreamValidationError);
-    } finally {
-      clearTimeout(validationHeartbeat);
-    }
-    expect(validationYielded).toBe(true);
-    expect(logger.warn).toHaveBeenCalledWith(
-      "extraction altered source identifiers",
-      expect.objectContaining({ validationBudgetExceeded: true }),
-    );
-  }, 2_000);
-
-  test("bounds shared-component intersections across a validation batch", async () => {
-    const source = Array.from(
-      { length: 10_000 },
-      (_, index) => `@common-${String(index).padStart(5, "0")}`,
-    ).join(" ");
-    const output = "common".repeat(1_500);
-    const logger: ClientLogger = { info: vi.fn(), warn: vi.fn() };
-    const fetcher: FetchLike = async () =>
-      modelResponse({
-        summary: "Summary",
-        claims: [
-          {
-            subject: "Feature",
-            predicate: "records",
-            confidence: 0.9,
-            object_kind: "literal",
-            object_text: output,
-          },
-        ],
-      });
-
-    await expect(
-      new ModelClient(settings(), fetcher, logger).extract(
-        segmentRequest(source),
-        [],
-      ),
-    ).rejects.toBeInstanceOf(UpstreamValidationError);
-    expect(logger.warn).toHaveBeenCalledWith(
-      "extraction altered source identifiers",
-      expect.objectContaining({ validationBudgetExceeded: true }),
-    );
-  }, 2_000);
-
-  test("bounds source indexing before building identifier tries", async () => {
-    const source = Array.from(
-      { length: 100_000 },
-      (_, index) => `@item-${String(index).padStart(6, "0")}`,
-    ).join(" ");
-    const logger: ClientLogger = { info: vi.fn(), warn: vi.fn() };
-    const fetcher = vi.fn<FetchLike>(async () =>
-      modelResponse({ summary: "Summary", claims: [] }),
-    );
-
-    await expect(
-      new ModelClient(settings(), fetcher, logger).extract(
-        segmentRequest(source),
-        [],
-      ),
-    ).rejects.toBeInstanceOf(TerminalExtractionValidationError);
-    expect(fetcher).not.toHaveBeenCalled();
-    expect(logger.warn).toHaveBeenCalledWith(
-      "source identifier budget exceeded",
-      expect.objectContaining({ validationBudgetExceeded: true }),
-    );
-  }, 2_000);
-
-  test.each([
-    ["foo-x", "x"],
-    ["A/B", "A"],
-    ["v2", "v"],
-    ["S3", "S"],
-  ])(
-    "rejects a bare one-character truncation of %s",
-    async (source, summary) => {
-      const fetcher: FetchLike = async () =>
-        modelResponse({ summary, claims: [] });
-
-      await expect(
-        new ModelClient(settings(), fetcher, silentLogger).extract(
-          segmentRequest(source),
-          [],
-        ),
-      ).rejects.toBeInstanceOf(UpstreamValidationError);
-    },
-  );
-
-  test("rejects one-character truncations in literal claim objects", async () => {
-    const fetcher: FetchLike = async () =>
-      modelResponse({
-        summary: "The identifier is truncated.",
-        claims: [
-          {
-            subject: "Feature",
-            predicate: "records",
-            confidence: 0.9,
-            object_kind: "literal",
-            object_text: "x.",
-          },
-        ],
-      });
-
-    await expect(
-      new ModelClient(settings(), fetcher, silentLogger).extract(
-        segmentRequest("Feature records foo-x."),
-        [],
-      ),
-    ).rejects.toBeInstanceOf(UpstreamValidationError);
-  });
-
-  test("allows possessives and wrappers around exact identifiers", async () => {
-    const summary = "`ModelClient`'s documentation names [ModelClient].";
-    const fetcher: FetchLike = async () =>
-      modelResponse({ summary, claims: [] });
-
-    await expect(
-      new ModelClient(settings(), fetcher, silentLogger).extract(
-        segmentRequest("ModelClient documentation names ModelClient."),
-        [],
-      ),
-    ).resolves.toMatchObject({ summary });
-  });
-
-  test("treats every Unicode whitespace character as a word boundary", async () => {
-    const summary = "ModelClient\u0085remains available.";
-    const fetcher: FetchLike = async () =>
-      modelResponse({ summary, claims: [] });
-
-    await expect(
-      new ModelClient(settings(), fetcher, silentLogger).extract(
-        segmentRequest("ModelClient was selected."),
-        [],
-      ),
-    ).resolves.toMatchObject({ summary });
-  });
-
-  test.each([
-    ["𐐨feature", "feature"],
-    ["feature𐐨", "feature"],
-    ["a𐐨feature", "𐐨feature"],
-    ["feature𐐨a", "feature𐐨"],
-  ])(
-    "does not split astral Unicode word %s at candidate %s",
-    async (sourceWord, objectText) => {
-      const fetcher: FetchLike = async () =>
-        modelResponse({
-          summary: "Summary",
-          claims: [
-            {
-              subject: "System",
-              predicate: "records",
-              confidence: 0.9,
-              object_kind: "literal",
-              object_text: objectText,
-            },
-          ],
-        });
-
-      await expect(
-        new ModelClient(settings(), fetcher, silentLogger).extract(
-          segmentRequest(
-            `System records ${sourceWord}; structured-${objectText}-token is indexed.`,
-          ),
-          [],
-        ),
-      ).rejects.toBeInstanceOf(UpstreamValidationError);
-    },
-  );
-
-  test("does not lose component provenance after many unrelated identifiers", async () => {
-    const source = `${Array.from(
-      { length: 50_001 },
-      (_, index) => `item${index}-token${index}`,
-    ).join(" ")} zz-yy`;
-    const fetcher: FetchLike = async () =>
-      modelResponse({ summary: "Identifier zzzz", claims: [] });
-    let sourceIndexingYielded = false;
-    const sourceIndexingHeartbeat = setTimeout(() => {
-      sourceIndexingYielded = true;
-    }, 0);
-
-    try {
-      await expect(
-        new ModelClient(settings(), fetcher, silentLogger).extract(
-          segmentRequest(source),
-          [],
-        ),
-      ).rejects.toBeInstanceOf(UpstreamValidationError);
-    } finally {
-      clearTimeout(sourceIndexingHeartbeat);
-    }
-    expect(sourceIndexingYielded).toBe(true);
-  });
-
-  test("accepts bounded source-equivalent identifier notation", async () => {
-    const fetcher: FetchLike = async () =>
-      modelResponse({
-        summary: "PR #13368 references commit 74cff22.",
-        claims: [
-          {
-            subject: "acpi events",
-            predicate: "include",
-            confidence: 0.99,
             object_kind: "literal",
             object_text: "/etc/acpi/events/brightness-down",
           },
         ],
       });
-    const source = [
-      "https://github.com/ideogram-ai/ui/pull/13368",
-      "created `/etc/acpi/events/brightness-up` and `brightness-down`.",
-      `\n[Tool "bash"]\n${JSON.stringify({ output: "commits:\n74cff22 Skip delayed jobs" })}\n[/Tool]\n`,
-    ].join("\n");
+
+    const source =
+      "Found /var/log/syslog.log and `/etc/acpi/events/brightness-down`.";
+
+    await expect(
+      new ModelClient(settings(), fetcher, silentLogger).extract(
+        segmentRequest(source),
+        [],
+      ),
+    ).resolves.toEqual({
+      summary: "Used /var/log/syslog.log.",
+      claims: [
+        {
+          subject: "system",
+          predicate: "records",
+          confidence: 0.9,
+          object_entity: null,
+          object_value: "/etc/acpi/events/brightness-down",
+        },
+      ],
+    });
+  });
+
+  test("preserves unsupported paths when the basename does not occur backticked in source", async () => {
+    const fetcher: FetchLike = async () =>
+      modelResponse({
+        summary: "Created /unsupported/path/custom-file.ts.",
+        claims: [],
+      });
+
+    await expect(
+      new ModelClient(settings(), fetcher, silentLogger).extract(
+        segmentRequest("Source mentions custom-file.ts without backticks."),
+        [],
+      ),
+    ).resolves.toEqual({
+      summary: "Created /unsupported/path/custom-file.ts.",
+      claims: [],
+    });
+  });
+
+  test("does not treat protocol-relative URIs as absolute paths", async () => {
+    const fetcher: FetchLike = async () =>
+      modelResponse({
+        summary: "Service connects to //example.com/api endpoint.",
+        claims: [],
+      });
+
+    await expect(
+      new ModelClient(settings(), fetcher, silentLogger).extract(
+        segmentRequest("Connect to //example.com/api; file is `api`."),
+        [],
+      ),
+    ).resolves.toEqual({
+      summary: "Service connects to //example.com/api endpoint.",
+      claims: [],
+    });
+  });
+
+  test("does not preserve candidate /workspace/app.ts when source contains only /workspace/app.tsx", async () => {
+    const fetcher: FetchLike = async () =>
+      modelResponse({
+        summary: "Found /workspace/app.ts in the project.",
+        claims: [],
+      });
+
+    await expect(
+      new ModelClient(settings(), fetcher, silentLogger).extract(
+        segmentRequest("Inspected /workspace/app.tsx; file is `app.ts`."),
+        [],
+      ),
+    ).resolves.toEqual({
+      summary: "Found app.ts in the project.",
+      claims: [],
+    });
+  });
+
+  test("canonical assistant tool frame authorizes normalization", async () => {
+    const fetcher: FetchLike = async () =>
+      modelResponse({
+        summary: "Used /var/folders/service.ts successfully.",
+        claims: [],
+      });
+
+    const state = modelVisibleToolState({ output: "loaded `service.ts`" });
+    const source = `\n[Tool "read"]\n${JSON.stringify(state)}\n[/Tool]\n`;
 
     await expect(
       new ModelClient(settings(), fetcher, silentLogger).extract(
@@ -2249,106 +1681,46 @@ describe("ModelClient", () => {
         [],
       ),
     ).resolves.toEqual({
-      summary: "PR #13368 references commit 74cff22.",
-      claims: [
-        {
-          subject: "acpi events",
-          predicate: "include",
-          confidence: 0.99,
-          object_entity: null,
-          object_value: "brightness-down",
-        },
-      ],
+      summary: "Used service.ts successfully.",
+      claims: [],
     });
   });
 
-  test("accepts identifiers from collision-free sanitized tool objects", async () => {
-    const path = String.raw`C:\Temp\File`;
-    const state = Object.fromEntries([
-      ...Array.from({ length: 18 }, (_, index) => [
-        `[data URL key omitted ${index}]`,
-        `literal-${index}`,
-      ]),
-      ...Array.from({ length: 18 }, (_, index) => [
-        `data:text/plain,key-${index}`,
-        `redacted-${index}`,
-      ]),
-      ["output", `Found ${path}`],
-    ]);
-    const encoded = JSON.stringify(modelVisibleToolState(state));
-    const source = `\n[Tool "read"]\n${encoded}\n[/Tool]\n`;
-    const summary = `Found ${path}`;
+  test("incomplete or noncanonical assistant tool frames cannot authorize normalization", async () => {
     const fetcher: FetchLike = async () =>
-      modelResponse({ summary, claims: [] });
+      modelResponse({
+        summary: "Found /workspace/file.ts in unclosed tool output.",
+        claims: [],
+      });
+
+    const unclosed = `Feature records a path.\n[Tool "bash"]\n{"output":"\`file.ts\`"`;
 
     await expect(
       new ModelClient(settings(), fetcher, silentLogger).extract(
         {
-          ...segmentRequest(source),
-          messages: [{ role: "assistant", text: source }],
+          ...segmentRequest(unclosed),
+          messages: [{ role: "assistant", text: unclosed }],
         },
         [],
       ),
-    ).resolves.toMatchObject({ summary });
-  });
-
-  test("does not decode user-shaped sanitized-object envelopes", async () => {
-    const state = {
-      input: {
-        "[Sanitized tool object]": {
-          "999:@scope/pkg": "value",
-        },
-      },
-      output: "ok",
-      status: "completed",
-    };
-    const encoded = JSON.stringify(modelVisibleToolState(state));
-    const source = `\n[Tool "read"]\n${encoded}\n[/Tool]\n`;
-    const fetcher: FetchLike = async () =>
-      modelResponse({ summary: "Identifier @scope/pkg", claims: [] });
-
-    await expect(
-      new ModelClient(settings(), fetcher, silentLogger).extract(
-        {
-          ...segmentRequest(source),
-          messages: [{ role: "assistant", text: source }],
-        },
-        [],
-      ),
-    ).rejects.toBeInstanceOf(UpstreamValidationError);
-  });
-
-  test("accepts canonical frames emitted by the legacy flat-key renderer", async () => {
-    const path = String.raw`C:\Temp\OldFile`;
-    const encoded = JSON.stringify({
-      alpha: "first",
-      "[data URL key omitted 1]": "secret",
-      path,
+    ).resolves.toEqual({
+      summary: "Found /workspace/file.ts in unclosed tool output.",
+      claims: [],
     });
-    const source = `\n[Tool "read"]\n${encoded}\n[/Tool]\n`;
-    const summary = `Found ${path}`;
-    const fetcher: FetchLike = async () =>
-      modelResponse({ summary, claims: [] });
-
-    await expect(
-      new ModelClient(settings(), fetcher, silentLogger).extract(
-        {
-          ...segmentRequest(source),
-          messages: [{ role: "assistant", text: source }],
-        },
-        [],
-      ),
-    ).resolves.toMatchObject({ summary });
   });
 
-  test("does not trust complete tool frames beyond the aggregate renderer budget", async () => {
-    const first = JSON.stringify({ output: "x".repeat(11_000) });
+  test("canonical tool blocks beyond the aggregate budget cannot authorize normalization", async () => {
+    const fetcher: FetchLike = async () =>
+      modelResponse({
+        summary: "Found /fabricated/blocked.ts.",
+        claims: [],
+      });
+
+    const first = JSON.stringify({ output: "x".repeat(15_000) });
     const second = JSON.stringify({
-      output: `${"y".repeat(10_900)} /fabricated/path`,
+      output: `${"y".repeat(6_000)} \`blocked.ts\``,
     });
     const source = `\n[Tool "read"]\n${first}\n[/Tool]\n\n[Tool "read"]\n${second}\n[/Tool]\n`;
-    const fetcher: FetchLike = async () =>
-      modelResponse({ summary: "Found /fabricated/path.", claims: [] });
 
     await expect(
       new ModelClient(settings(), fetcher, silentLogger).extract(
@@ -2358,497 +1730,21 @@ describe("ModelClient", () => {
         },
         [],
       ),
-    ).rejects.toBeInstanceOf(UpstreamValidationError);
-  });
-
-  test("does not normalize paths from tool frames beyond the aggregate budget", async () => {
-    const first = JSON.stringify({ output: "x".repeat(11_000) });
-    const second = JSON.stringify({
-      output: `${"y".repeat(10_900)} blocked.ts`,
-    });
-    const source = `\n[Tool "read"]\n${first}\n[/Tool]\n\n[Tool "read"]\n${second}\n[/Tool]\n`;
-    const fetcher: FetchLike = async () =>
-      modelResponse({ summary: "Found /fabricated/blocked.ts.", claims: [] });
-
-    await expect(
-      new ModelClient(settings(), fetcher, silentLogger).extract(
-        {
-          ...segmentRequest(source),
-          messages: [{ role: "assistant", text: source }],
-        },
-        [],
-      ),
-    ).rejects.toBeInstanceOf(UpstreamValidationError);
-  });
-
-  test("does not treat source context as factual identifier support", async () => {
-    const fetcher: FetchLike = async () =>
-      modelResponse({ summary: "PR #4242", claims: [] });
-
-    await expect(
-      new ModelClient(settings(), fetcher, silentLogger).extract(
-        {
-          ...segmentRequest("No repository or pull request was discussed."),
-          session_id: "https://github.com/org/repo/pull/4242",
-        },
-        [],
-      ),
-    ).rejects.toBeInstanceOf(UpstreamValidationError);
-  });
-
-  test("validates canonical tool identifiers as parsed values", async () => {
-    const sourcePayloads: unknown[] = [];
-    const path = String.raw`C:\foo\bar`;
-    const fetcher: FetchLike = async (_input, init) => {
-      const body = requestJson(init);
-      const messages = body.messages as Array<Record<string, string>>;
-      const userContent = messages[2]?.content;
-      if (userContent === undefined)
-        throw new TypeError("missing user message");
-      const user = JSON.parse(userContent) as Record<string, unknown>;
-      sourcePayloads.push(user.source_messages);
-      return modelResponse({
-        summary: `Commit 74cff22 used path ${path} successfully.`,
-        claims: [],
-      });
-    };
-    const rendered = `\n[Tool "bash"]\n${JSON.stringify({
-      "[data URL key omitted 0]": 2,
-      output: `commit:\n74cff22\npath: ${path}`,
-    })}\n[/Tool]\n`;
-    const client = new ModelClient(settings(), fetcher, silentLogger);
-
-    await expect(
-      client.extract(
-        {
-          ...segmentRequest(rendered),
-          messages: [{ role: "assistant", text: rendered }],
-        },
-        [],
-      ),
-    ).resolves.toMatchObject({
-      summary: `Commit 74cff22 used path ${path} successfully.`,
-    });
-    expect(sourcePayloads).toEqual([[{ role: "assistant", text: rendered }]]);
-  });
-
-  test("validates canonical tool keys and numeric scalars", async () => {
-    const rendered = `\n[Tool "account"]\n${JSON.stringify({
-      current_balance: { amount: 1.2 },
-    })}\n[/Tool]\n`;
-    const fetcher: FetchLike = async () =>
-      modelResponse({
-        summary: "current_balance is 1.2.",
-        claims: [],
-      });
-
-    await expect(
-      new ModelClient(settings(), fetcher, silentLogger).extract(
-        {
-          ...segmentRequest(rendered),
-          messages: [{ role: "assistant", text: rendered }],
-        },
-        [],
-      ),
-    ).resolves.toMatchObject({ summary: "current_balance is 1.2." });
-  });
-
-  test.each([
-    ["ordinary", { status: "completed" }],
-    [
-      "sanitized",
-      {
-        "data:text/plain,secret": "redacted",
-        status: "completed",
-      },
-    ],
-  ])(
-    "rejects a transposed lowercase key from %s canonical tool state",
-    async (_name, state) => {
-      const rendered = `\n[Tool "read"]\n${JSON.stringify(
-        modelVisibleToolState(state),
-      )}\n[/Tool]\n`;
-      const fetcher: FetchLike = async () =>
-        modelResponse({ summary: "Tool sttaus is completed.", claims: [] });
-
-      await expect(
-        new ModelClient(settings(), fetcher, silentLogger).extract(
-          {
-            ...segmentRequest(rendered),
-            messages: [{ role: "assistant", text: rendered }],
-          },
-          [],
-        ),
-      ).rejects.toBeInstanceOf(UpstreamValidationError);
-    },
-  );
-
-  test.each([
-    [
-      "the exact structured key",
-      { status: "completed" },
-      "Tool field `status` is completed.",
-    ],
-    [
-      "nearby ordinary prose",
-      { status: "completed" },
-      "The tool states completion.",
-    ],
-    [
-      "a transposed arbitrary nested key",
-      { input: { from: "value" }, status: "completed" },
-      "The form is available.",
-    ],
-  ])("allows %s in canonical tool output", async (_name, state, summary) => {
-    const rendered = `\n[Tool "read"]\n${JSON.stringify(
-      modelVisibleToolState(state),
-    )}\n[/Tool]\n`;
-    const fetcher: FetchLike = async () =>
-      modelResponse({ summary, claims: [] });
-
-    await expect(
-      new ModelClient(settings(), fetcher, silentLogger).extract(
-        {
-          ...segmentRequest(rendered),
-          messages: [{ role: "assistant", text: rendered }],
-        },
-        [],
-      ),
-    ).resolves.toMatchObject({ summary });
-  });
-
-  test("rejects JSON-escaped spellings of parsed tool identifiers", async () => {
-    const path = String.raw`C:\foo\bar`;
-    const rendered = `\n[Tool "bash"]\n${JSON.stringify({ output: path })}\n[/Tool]\n`;
-    const fetcher: FetchLike = async () =>
-      modelResponse({
-        summary: `Used ${String.raw`C:\\foo\\bar`} successfully.`,
-        claims: [],
-      });
-
-    await expect(
-      new ModelClient(settings(), fetcher, silentLogger).extract(
-        {
-          ...segmentRequest(rendered),
-          messages: [{ role: "assistant", text: rendered }],
-        },
-        [],
-      ),
-    ).rejects.toBeInstanceOf(UpstreamValidationError);
-  });
-
-  test("accepts the canonical tool name as identifier support", async () => {
-    const rendered =
-      '\n[Tool "memory_search"]\n{"result":"records"}\n[/Tool]\n';
-    const fetcher: FetchLike = async () =>
-      modelResponse({ summary: "memory_search found records.", claims: [] });
-
-    await expect(
-      new ModelClient(settings(), fetcher, silentLogger).extract(
-        {
-          ...segmentRequest(rendered),
-          messages: [{ role: "assistant", text: rendered }],
-        },
-        [],
-      ),
-    ).resolves.toMatchObject({ summary: "memory_search found records." });
-  });
-
-  test("does not decode an incomplete tool-like assistant fragment", async () => {
-    const fetcher: FetchLike = async () =>
-      modelResponse({ summary: "Commit 74cff22 was used.", claims: [] });
-    const rendered = `\n[Tool "bash"]\n${JSON.stringify({ output: "commit:\n74cff22" })}\n`;
-
-    await expect(
-      new ModelClient(settings(), fetcher, silentLogger).extract(
-        {
-          ...segmentRequest(rendered),
-          messages: [{ role: "assistant", text: rendered }],
-        },
-        [],
-      ),
-    ).rejects.toBeInstanceOf(UpstreamValidationError);
-  });
-
-  test("quarantines JSON escape syntax in an incomplete tool frame", async () => {
-    const path = String.raw`C:\foo\bar`;
-    const rendered =
-      `Feature records a path.\n[Tool "bash"]\n` +
-      `${JSON.stringify({ output: path })}\n`;
-    const fetcher: FetchLike = async () =>
-      modelResponse({
-        summary: `Used ${String.raw`C:\\foo\\bar`} successfully.`,
-        claims: [],
-      });
-
-    await expect(
-      new ModelClient(settings(), fetcher, silentLogger).extract(
-        {
-          ...segmentRequest(rendered),
-          messages: [{ role: "assistant", text: rendered }],
-        },
-        [],
-      ),
-    ).rejects.toBeInstanceOf(UpstreamValidationError);
-  });
-
-  test("uses identifiers from nested current tool envelopes", async () => {
-    const path = String.raw`C:\Temp\File`;
-    let nested: unknown = { value: path };
-    for (let depth = 0; depth < 5; depth += 1) nested = { child: nested };
-    const state = modelVisibleToolState({ "data:text/plain,key": nested });
-    const rendered = `\n[Tool "read"]\n${JSON.stringify(state)}\n[/Tool]\n`;
-    const fetcher: FetchLike = async () =>
-      modelResponse({ summary: `Used ${path} successfully.`, claims: [] });
-
-    await expect(
-      new ModelClient(settings(), fetcher, silentLogger).extract(
-        {
-          ...segmentRequest(rendered),
-          messages: [{ role: "assistant", text: rendered }],
-        },
-        [],
-      ),
-    ).resolves.toMatchObject({ summary: `Used ${path} successfully.` });
-  });
-
-  test("does not rewrite a fabricated URL as a source filename", async () => {
-    const fetcher: FetchLike = async () =>
-      modelResponse({ summary: "See https://evil.example/foo", claims: [] });
-
-    await expect(
-      new ModelClient(settings(), fetcher, silentLogger).extract(
-        segmentRequest("The filename is `foo`."),
-        [],
-      ),
-    ).rejects.toBeInstanceOf(UpstreamValidationError);
-  });
-
-  test("rejects punctuation added inside a source URI", async () => {
-    const fetcher: FetchLike = async () =>
-      modelResponse({
-        summary: "See https://example.com/api!v2 for details.",
-        claims: [],
-      });
-
-    await expect(
-      new ModelClient(settings(), fetcher, silentLogger).extract(
-        segmentRequest("See https://example.com/api for details."),
-        [],
-      ),
-    ).rejects.toBeInstanceOf(UpstreamValidationError);
-  });
-
-  test.each(["https://example.com/alpha'good", String.raw`C:\Temp\alpha'good`])(
-    "rejects an unquoted word attached to %s",
-    async (identifier) => {
-      const fetcher: FetchLike = async () =>
-        modelResponse({
-          summary: `Endpoint ${identifier} was used.`,
-          claims: [],
-        });
-
-      await expect(
-        new ModelClient(settings(), fetcher, silentLogger).extract(
-          segmentRequest(`The endpoint was ${identifier} during the run.`),
-          [],
-        ),
-      ).rejects.toBeInstanceOf(UpstreamValidationError);
-    },
-  );
-
-  test("accepts explicitly quoted URI punctuation", async () => {
-    const identifier = "https://example.com/alpha'good";
-    const summary = `Endpoint '${identifier}' was used.`;
-    const fetcher: FetchLike = async () =>
-      modelResponse({ summary, claims: [] });
-
-    await expect(
-      new ModelClient(settings(), fetcher, silentLogger).extract(
-        segmentRequest(`The endpoint '${identifier}' was used.`),
-        [],
-      ),
-    ).resolves.toMatchObject({ summary });
-  });
-
-  test("ignores terminal sentence punctuation around a source URI", async () => {
-    const summary = "See https://example.com/api for details.";
-    const fetcher: FetchLike = async () =>
-      modelResponse({ summary, claims: [] });
-
-    await expect(
-      new ModelClient(settings(), fetcher, silentLogger).extract(
-        segmentRequest("See https://example.com/api.)"),
-        [],
-      ),
-    ).resolves.toMatchObject({ summary });
-  });
-
-  test.each([
-    [
-      "See https://example.com/api.",
-      "See https://example.com/api? for details.",
-    ],
-    [
-      "Use https://example.com/a(b) exactly.",
-      "Use https://example.com/a(b exactly.",
-    ],
-  ])("preserves identity-bearing URI punctuation", async (source, summary) => {
-    const fetcher: FetchLike = async () =>
-      modelResponse({ summary, claims: [] });
-
-    await expect(
-      new ModelClient(settings(), fetcher, silentLogger).extract(
-        segmentRequest(source),
-        [],
-      ),
-    ).rejects.toBeInstanceOf(UpstreamValidationError);
-  });
-
-  test.each([
-    [
-      'Endpoint literal is "https://example.com/api".',
-      "https://example.com/api.",
-    ],
-    [
-      'Endpoint literal is "https://example.com/api)".',
-      "https://example.com/api",
-    ],
-  ])(
-    "preserves URI punctuation in literal fields",
-    async (source, objectText) => {
-      const fetcher: FetchLike = async () =>
-        modelResponse({
-          summary: "The endpoint literal was recorded.",
-          claims: [
-            {
-              subject: "Endpoint",
-              predicate: "records",
-              confidence: 0.9,
-              object_kind: "literal",
-              object_text: objectText,
-            },
-          ],
-        });
-
-      await expect(
-        new ModelClient(settings(), fetcher, silentLogger).extract(
-          segmentRequest(source),
-          [],
-        ),
-      ).rejects.toBeInstanceOf(UpstreamValidationError);
-    },
-  );
-
-  test("rejects unsupported lowercase slug and path punctuation", async () => {
-    const fetcher: FetchLike = async () =>
-      modelResponse({
-        summary: "Use fake-package at dir/fabricated.",
-        claims: [],
-      });
-
-    await expect(
-      new ModelClient(settings(), fetcher, silentLogger).extract(
-        segmentRequest("Use the package at the configured directory."),
-        [],
-      ),
-    ).rejects.toBeInstanceOf(UpstreamValidationError);
-  });
-
-  test("rejects newly introduced slash shorthand", async () => {
-    const fetcher: FetchLike = async () =>
-      modelResponse({ summary: "input/output", claims: [] });
-
-    await expect(
-      new ModelClient(settings(), fetcher, silentLogger).extract(
-        segmentRequest("input and output"),
-        [],
-      ),
-    ).rejects.toBeInstanceOf(UpstreamValidationError);
-  });
-
-  test("does not treat a protocol-relative URI as an absolute path", async () => {
-    const fetcher: FetchLike = async () =>
-      modelResponse({ summary: "Use example.", claims: [] });
-
-    await expect(
-      new ModelClient(settings(), fetcher, silentLogger).extract(
-        segmentRequest("Use //example.com/api exactly."),
-        [],
-      ),
-    ).rejects.toBeInstanceOf(UpstreamValidationError);
-  });
-
-  test("allows ordinary terminal exclamation punctuation", async () => {
-    const fetcher: FetchLike = async () =>
-      modelResponse({
-        summary: "The deployment completed successfully!",
-        claims: [],
-      });
-
-    await expect(
-      new ModelClient(settings(), fetcher, silentLogger).extract(
-        segmentRequest(
-          "The println! macro ran. The deployment completed successfully.",
-        ),
-        [],
-      ),
-    ).resolves.toMatchObject({
-      summary: "The deployment completed successfully!",
+    ).resolves.toEqual({
+      summary: "Found /fabricated/blocked.ts.",
+      claims: [],
     });
   });
 
-  test("allows ordinary bang punctuation to be removed or followed by prose", async () => {
-    const summary = [
-      "Great. Food. ready. Great! Function behavior is stable.",
-      "The function is ready. The second function is stable!",
-      "The deployment is ready! (all checks passed).",
-      "Excellent! Function behavior is stable.",
-      "Amazing! Is this function stable?",
-      "Excellent! Was this macro behavior expected?",
-    ].join(" ");
-    const fetcher: FetchLike = async () =>
-      modelResponse({ summary, claims: [] });
-
-    await expect(
-      new ModelClient(settings(), fetcher, silentLogger).extract(
-        segmentRequest(
-          [
-            "Great! Food! ready! Function behavior is stable.",
-            "The function is ready! The second function is stable.",
-            "The deployment is ready (all checks passed).",
-            "Excellent. Function behavior is stable.",
-            "Amazing. Is this function stable?",
-            "Excellent. Was this macro behavior expected?",
-          ].join(" "),
-        ),
-        [],
-      ),
-    ).resolves.toMatchObject({ summary });
-  });
-
-  test("allows an exact spaced bang invocation", async () => {
-    const text = "Call `println !()` exactly.";
-    const fetcher: FetchLike = async () =>
-      modelResponse({ summary: text, claims: [] });
-
-    await expect(
-      new ModelClient(settings(), fetcher, silentLogger).extract(
-        segmentRequest(text),
-        [],
-      ),
-    ).resolves.toMatchObject({ summary: text });
-  });
-
-  test("allows a bare bang word grounded by contextual prose", async () => {
+  test("rejects invalid normalized extraction schema", async () => {
     const fetcher: FetchLike = async () =>
       modelResponse({
-        summary: "The macro is println!.",
+        summary: "Summary",
         claims: [
           {
-            subject: "println!",
-            predicate: "was_selected",
-            confidence: 0.9,
+            subject: "Reflection",
+            predicate: "uses",
+            confidence: 1.5,
             object_kind: "literal",
             object_text: "true",
           },
@@ -2857,335 +1753,14 @@ describe("ModelClient", () => {
 
     await expect(
       new ModelClient(settings(), fetcher, silentLogger).extract(
-        segmentRequest("The macro is println!."),
-        [],
-      ),
-    ).resolves.toMatchObject({ claims: [{ subject: "println!" }] });
-  });
-
-  test.each(["`format!`", "format !()"])(
-    "does not ground hard bang syntax from a plain word: %s",
-    async (subject) => {
-      const fetcher: FetchLike = async () =>
-        modelResponse({
-          summary: "The output format was selected.",
-          claims: [
-            {
-              subject,
-              predicate: "was_selected",
-              confidence: 0.9,
-              object_kind: "literal",
-              object_text: "true",
-            },
-          ],
-        });
-
-      await expect(
-        new ModelClient(settings(), fetcher, silentLogger).extract(
-          segmentRequest("The output format was selected."),
-          [],
-        ),
-      ).rejects.toBeInstanceOf(UpstreamValidationError);
-    },
-  );
-
-  test("rejects a fabricated bare bang identifier in a structured field", async () => {
-    const fetcher: FetchLike = async () =>
-      modelResponse({
-        summary: "The macro is println!.",
-        claims: [
-          {
-            subject: "format!",
-            predicate: "was_selected",
-            confidence: 0.9,
-            object_kind: "literal",
-            object_text: "true",
-          },
-        ],
-      });
-
-    await expect(
-      new ModelClient(settings(), fetcher, silentLogger).extract(
-        segmentRequest("The macro is println!."),
+        segmentRequest("source"),
         [],
       ),
     ).rejects.toBeInstanceOf(UpstreamValidationError);
   });
 
-  test.each([
-    "EvilClient!",
-    "tool_fabricated_id!",
-    "HTTP2Server!",
-    "fake-package!",
-    "fabricated!()",
-    "fabricated !()",
-    "`format!` macro",
-    "The macro is format!",
-    "The function is save!",
-    "Run the command deploy!",
-    "Macro: format!",
-    "format! is a macro",
-    "The selected macro was format!",
-    "format!, a macro",
-    "format! is a Macro",
-    "format! is our macro",
-    "format! serves as a macro",
-    "The macro named by the compiler format! was used",
-    `The macro ${"selected by compiler analysis ".repeat(5)}format! was used`,
-    "format! is the formatting macro",
-    "format! is an async macro",
-    "format! was the macro",
-    "format! remains our macro",
-    "format! acts as a macro",
-    "format! was selected as the macro",
-    "format!, the selected macro",
-    "format! — a macro",
-    "format!: a macro",
-    "format! Macro",
-    "format! is one of the macros",
-    "The macros include format!",
-    "format! is among these functions",
-    "Commands include deploy!",
-    "Format! is one of the macros",
-    "Format! remains our macro",
-    "Format! acts as a macro",
-    "Format! was selected as the macro",
-    "Format!, the selected macro",
-    "Format! — a macro",
-    "Format!: a macro",
-    "FORMAT! is one of the macros",
-  ])(
-    "rejects an identifier cloaked by terminal bang punctuation: %s",
-    async (output) => {
-      const fetcher: FetchLike = async () =>
-        modelResponse({ summary: output, claims: [] });
-
-      await expect(
-        new ModelClient(settings(), fetcher, silentLogger).extract(
-          segmentRequest("No named implementation was selected."),
-          [],
-        ),
-      ).rejects.toBeInstanceOf(UpstreamValidationError);
-    },
-  );
-
-  test.each([
-    "Issue #1 has 1 blocker.",
-    "Variable $x is multiplied by x.",
-    "C++ interoperates with C.",
-    "ModelClient is the model client.",
-    "fake-package differs from fake package.",
-    "C++ means C plus plus.",
-    "ModelClient differs from the model. Client behavior is separate.",
-  ])(
-    "allows exact symbolic and plain occurrences together: %s",
-    async (text) => {
-      const fetcher: FetchLike = async () =>
-        modelResponse({ summary: text, claims: [] });
-
-      await expect(
-        new ModelClient(settings(), fetcher, silentLogger).extract(
-          segmentRequest(text),
-          [],
-        ),
-      ).resolves.toMatchObject({ summary: text });
-    },
-  );
-
-  test.each([
-    ["Result: a11y is supported.", "A result: a11y is supported."],
-    ["AClient is configured.", "A configured instance uses AClient."],
-    ["A/B is configured.", "A choice uses A/B."],
-    ["iPhone is configured.", "I think iPhone is configured."],
-    [`The result is ready. @${"a".repeat(10_001)}`, "An outcome is ready."],
-  ])(
-    "allows ordinary one-character prose near identifiers",
-    async (source, summary) => {
-      const fetcher: FetchLike = async () =>
-        modelResponse({ summary, claims: [] });
-
-      await expect(
-        new ModelClient(settings(), fetcher, silentLogger).extract(
-          segmentRequest(source),
-          [],
-        ),
-      ).resolves.toMatchObject({ summary });
-    },
-  );
-
-  test.each([
-    [
-      `ModelClient ${Array(224).fill("a").join(" ")}`,
-      Array(224).fill("a").join(" "),
-    ],
-    [
-      `${Array.from({ length: 1_000 }, (_, index) => `ModelClient${index}`).join(" ")} ${Array(11).fill("a").join(" ")}`,
-      Array(11).fill("a").join(" "),
-    ],
-  ])(
-    "does not reject grounded prose when semantic work is large",
-    async (source, summary) => {
-      const fetcher: FetchLike = async () =>
-        modelResponse({ summary, claims: [] });
-
-      await expect(
-        new ModelClient(settings(), fetcher, silentLogger).extract(
-          segmentRequest(source),
-          [],
-        ),
-      ).resolves.toMatchObject({ summary });
-    },
-  );
-
-  test("does not make plain support depend on source position", async () => {
-    const identifiers = Array.from(
-      { length: 499 },
-      (_, index) => `@${"a".repeat(index + 2)}`,
-    ).join(" ");
-    const burner = {
-      role: "user" as const,
-      text: `${identifiers} @bb ${Array(2_300).fill("a").join(" ")}`,
-    };
-    const support = { role: "assistant" as const, text: "b b" };
-    const summary = support.text;
-    const fetcher: FetchLike = async () =>
-      modelResponse({ summary, claims: [] });
-
-    for (const messages of [
-      [burner, support],
-      [support, burner],
-      [{ role: "user" as const, text: `${support.text} ${burner.text}` }],
-      [{ role: "user" as const, text: `${burner.text} ${support.text}` }],
-    ]) {
-      await expect(
-        new ModelClient(settings(), fetcher, silentLogger).extract(
-          { ...segmentRequest(messages[0]!.text), messages },
-          [],
-        ),
-      ).resolves.toMatchObject({ summary });
-    }
-  });
-
-  test.each([315, 316])(
-    "matches a %i-word plain form without a comparison cliff",
-    async (wordCount) => {
-      const identifier = `@${"a".repeat(wordCount)}`;
-      const summary = Array(wordCount).fill("a").join(" ");
-      const fetcher: FetchLike = async () =>
-        modelResponse({ summary, claims: [] });
-
-      await expect(
-        new ModelClient(settings(), fetcher, silentLogger).extract(
-          segmentRequest(`${identifier} ${summary}`),
-          [],
-        ),
-      ).resolves.toMatchObject({ summary });
-    },
-  );
-
-  test("matches a common component beyond the former posting-list limit", async () => {
-    const identifiers = Array.from(
-      { length: 50_001 },
-      (_, index) => `aa-bb${index}`,
-    ).join(" ");
-    const summary = "aabb";
-    const fetcher: FetchLike = async () =>
-      modelResponse({ summary, claims: [] });
-
-    await expect(
-      new ModelClient(settings(), fetcher, silentLogger).extract(
-        segmentRequest(`${identifiers} ${summary}`),
-        [],
-      ),
-    ).resolves.toMatchObject({ summary });
-  });
-
-  test("allows source-grounded symbolic text repeated in separate fields", async () => {
-    const text = "Issue #1 has 1 blocker.";
-    const fetcher: FetchLike = async () =>
-      modelResponse({
-        summary: text,
-        claims: [
-          {
-            subject: text,
-            predicate: "has_blocker_count",
-            confidence: 0.9,
-            object_kind: "literal",
-            object_text: "1 blocker",
-          },
-        ],
-      });
-
-    await expect(
-      new ModelClient(settings(), fetcher, silentLogger).extract(
-        segmentRequest(text),
-        [],
-      ),
-    ).resolves.toMatchObject({ summary: text });
-  });
-
-  test("supports GitHub references in diff-prefixed URLs", async () => {
-    const fetcher: FetchLike = async () =>
-      modelResponse({ summary: "PR #13368", claims: [] });
-
-    await expect(
-      new ModelClient(settings(), fetcher, silentLogger).extract(
-        segmentRequest("+https://github.com/org/repo/pull/13368"),
-        [],
-      ),
-    ).resolves.toMatchObject({ summary: "PR #13368" });
-  });
-
-  test("rejects case-altered UUIDs instead of de-identifying them", async () => {
-    const sourceId = "deadbeef-dead-4abc-8abc-123456789012";
-    const fetcher: FetchLike = async () =>
-      modelResponse({
-        summary: `Stored as ${sourceId.toUpperCase()}.`,
-        claims: [],
-      });
-
-    await expect(
-      new ModelClient(settings(), fetcher, silentLogger).extract(
-        segmentRequest(`Stored as ${sourceId}.`),
-        [],
-      ),
-    ).rejects.toBeInstanceOf(UpstreamValidationError);
-  });
-
-  test("rejects unsupported mixed-case and Unicode separators", async () => {
-    const fetcher: FetchLike = async () =>
-      modelResponse({
-        summary: "Use Fake-package at Dir／file.ts.",
-        claims: [],
-      });
-
-    await expect(
-      new ModelClient(settings(), fetcher, silentLogger).extract(
-        segmentRequest("Use fake-package from file.ts."),
-        [],
-      ),
-    ).rejects.toBeInstanceOf(UpstreamValidationError);
-  });
-
-  test.each([
-    "file:///fabricated/path",
-    "file:/fabricated/path",
-    "file:C:/fabricated/path",
-    "ftp://127.0.0.1/Fabricated",
-    "ftp:/127.0.0.1/Fabricated",
-    "https:example.com/Fabricated",
-    "alpha．beta",
-    "#4242\u0301",
-  ])("rejects unsupported URI or Unicode identifier %s", async (identifier) => {
-    const fetcher: FetchLike = async () =>
-      modelResponse({ summary: `Fabricated ${identifier}`, claims: [] });
-
-    await expect(
-      new ModelClient(settings(), fetcher, silentLogger).extract(
-        segmentRequest("Source says #4242 and alpha beta."),
-        [],
-      ),
-    ).rejects.toBeInstanceOf(UpstreamValidationError);
+  test("exposes extraction validation version 2", () => {
+    expect(EXTRACTION_VALIDATION_VERSION).toBe(2);
   });
 
   test("enforces a wall-clock timeout across the complete response body", async () => {
