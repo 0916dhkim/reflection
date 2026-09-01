@@ -4,6 +4,8 @@ import {
   activeModel,
   estimateTokens,
   projectMessages as projectMessagesImplementation,
+  projectionSummaryFingerprint,
+  toProjectionArchivedSegment,
   type ProjectMessagesInput,
   type StoredSegmentSummary,
 } from "../src/projection.js";
@@ -1733,5 +1735,63 @@ describe("projectMessages request estimate", () => {
     expect(result.reset).toBe(true);
     expect(result.messages.length).toBeLessThan(messages.length);
     expect(estimateTokens(result.messages)).toBeLessThan(CONTEXT_LIMIT);
+  });
+});
+
+describe("Projection checkpoint helpers and controls", () => {
+  it("computes deterministic summary fingerprints", () => {
+    const messages = longSession(4);
+    const segments = segmentMessages(messages);
+    const firstSegment = segments[0]!;
+    const archivedMeta = [
+      toProjectionArchivedSegment(SESSION_ID, firstSegment),
+    ];
+    const sumList = summaries(messages);
+
+    const fp1 = projectionSummaryFingerprint(archivedMeta, sumList);
+    const fp2 = projectionSummaryFingerprint(
+      archivedMeta,
+      [...sumList].reverse(),
+    );
+    expect(fp1).toBe(fp2);
+    expect(fp1).toMatch(/^[0-9a-f]{64}$/);
+
+    // Mismatched summary text changes fingerprint
+    const modifiedSumList: StoredSegmentSummary[] = [
+      { ...sumList[0]!, summary: "Different text" },
+    ];
+    const fpModified = projectionSummaryFingerprint(
+      archivedMeta,
+      modifiedSumList,
+    );
+    expect(fpModified).not.toBe(fp1);
+
+    // Missing summary changes fingerprint
+    const emptySumList: StoredSegmentSummary[] = [];
+    const fpEmpty = projectionSummaryFingerprint(archivedMeta, emptySumList);
+    expect(fpEmpty).not.toBe(fp1);
+  });
+
+  it("applies checkpoint without re-hashing prefix when skipPrefixFingerprint is enabled", async () => {
+    const messages = longSession(16);
+    const first = await projectMessages({
+      messages,
+      contextLimit: CONTEXT_LIMIT,
+      loadSummaries: async () => summaries(messages),
+    });
+    expect(first.reset).toBe(true);
+    expect(first.state.checkpoint).toBeDefined();
+
+    // With skipPrefixFingerprint: true, it applies checkpoint without throwing
+    const next = await projectMessages({
+      messages,
+      contextLimit: CONTEXT_LIMIT,
+      previous: first.state,
+      skipPrefixFingerprint: true,
+      loadSummaries: async () => summaries(messages),
+    });
+
+    expect(next.reset).toBe(false);
+    expect(next.state.checkpoint).toEqual(first.state.checkpoint);
   });
 });

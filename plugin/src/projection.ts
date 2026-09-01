@@ -31,13 +31,25 @@ const MAX_TOOL_ATTACHMENTS = 10;
 
 export type StoredSegmentSummary = SegmentSummary;
 
+export interface ProjectionArchivedSegment {
+  id: string;
+  sourceFingerprint: string;
+  startUserMessageId: string;
+  endUserMessageId: string;
+  sourceBoundaryVersion: 1 | 2;
+  startSourceMessageId: string | null;
+  endSourceMessageId: string | null;
+}
+
 export interface ProjectionCheckpoint {
   tailStartMessageId: string;
   archivedPrefixFingerprint: string;
-  canonicalSourceFingerprint?: string;
+  canonicalSourceFingerprint: string;
   summaryText: string;
   createdAtMessageId: string;
   lossy?: boolean;
+  archivedSegments: ProjectionArchivedSegment[];
+  summaryFingerprint: string;
 }
 
 export interface ProjectionSessionState {
@@ -144,7 +156,9 @@ function contributesModelContent(
   return part.type === "file" || part.type === "tool";
 }
 
-function latestUserMessage(messages: readonly OpenCodeMessage[]) {
+export function latestUserMessage(
+  messages: readonly OpenCodeMessage[],
+): OpenCodeMessage | undefined {
   for (let index = messages.length - 1; index >= 0; index -= 1) {
     const message = messages[index];
     if (message && isNormalUserMessage(message)) return message;
@@ -168,7 +182,7 @@ export function activeModel(messages: readonly OpenCodeMessage[]): {
   };
 }
 
-function isNewUserTurn(messages: readonly OpenCodeMessage[]): boolean {
+export function isNewUserTurn(messages: readonly OpenCodeMessage[]): boolean {
   const latest = messages.at(-1);
   return latest !== undefined && isNormalUserMessage(latest);
 }
@@ -197,14 +211,16 @@ function latestVisibleAssistantIsCompleted(
 function applyCheckpoint(
   messages: readonly OpenCodeMessage[],
   checkpoint: ProjectionCheckpoint,
+  options?: { skipPrefixFingerprint?: boolean },
 ): OpenCodeMessage[] | null {
   const tailIndex = messages.findIndex(
     (message) => message.info.id === checkpoint.tailStartMessageId,
   );
   if (tailIndex < 0) return null;
   if (
+    !options?.skipPrefixFingerprint &&
     archivedPrefixFingerprint(messages.slice(0, tailIndex)) !==
-    checkpoint.archivedPrefixFingerprint
+      checkpoint.archivedPrefixFingerprint
   ) {
     return null;
   }
@@ -759,6 +775,53 @@ export function projectionSourcesFingerprint(input: {
   return createHash("sha256").update(JSON.stringify(source)).digest("hex");
 }
 
+export function toProjectionArchivedSegment(
+  sessionId: string,
+  segment: ReflectionSegment,
+): ProjectionArchivedSegment {
+  const common = {
+    id: segmentIdentity(sessionId, segment),
+    startUserMessageId: segment.startUserMessageId,
+    endUserMessageId: segment.endUserMessageId,
+    sourceFingerprint: submissionSourceFingerprint(sessionId, segment),
+  };
+  return segment.sourceBoundaryVersion === 1
+    ? {
+        ...common,
+        sourceBoundaryVersion: 1,
+        startSourceMessageId: null,
+        endSourceMessageId: null,
+      }
+    : {
+        ...common,
+        sourceBoundaryVersion: 2,
+        startSourceMessageId: segment.startSourceMessageId,
+        endSourceMessageId: segment.endSourceMessageId,
+      };
+}
+
+export function projectionSummaryFingerprint(
+  archivedSegments: readonly ProjectionArchivedSegment[],
+  summaries: readonly StoredSegmentSummary[],
+): string {
+  const entries = archivedSegments.map((segment) => {
+    const matched = summaries.find(
+      (summary) =>
+        summary.id === segment.id &&
+        summary.start_user_message_id === segment.startUserMessageId &&
+        summary.end_user_message_id === segment.endUserMessageId &&
+        summary.source_boundary_version === segment.sourceBoundaryVersion &&
+        summary.start_source_message_id === segment.startSourceMessageId &&
+        summary.end_source_message_id === segment.endSourceMessageId,
+    );
+    return {
+      id: segment.id,
+      summary: matched ? matched.summary : null,
+    };
+  });
+  return createHash("sha256").update(JSON.stringify(entries)).digest("hex");
+}
+
 interface TailCandidate {
   tailIndex: number;
   archivedSegments: ReflectionSegment[];
@@ -843,6 +906,7 @@ export interface ProjectMessagesInput {
   outputLimit?: number;
   previous?: ProjectionSessionState;
   validateCheckpoint?: (checkpoint: ProjectionCheckpoint) => Promise<boolean>;
+  skipPrefixFingerprint?: boolean;
   loadCanonicalSegments: () => Promise<readonly ReflectionSegment[]>;
   loadSummaries: (
     requiredSegments: readonly ReflectionSegment[],
@@ -865,7 +929,9 @@ export async function projectMessages(
     checkpoint = undefined;
   }
   let projected = checkpoint
-    ? applyCheckpoint(input.messages, checkpoint)
+    ? applyCheckpoint(input.messages, checkpoint, {
+        skipPrefixFingerprint: input.skipPrefixFingerprint,
+      })
     : [...input.messages];
   if (!projected) {
     checkpoint = undefined;
@@ -999,6 +1065,13 @@ export async function projectMessages(
       inheritedContext: inherited.entries,
       initialOmissions: omissions,
     });
+    const archivedSegmentsMeta = candidate.archivedSegments.map((segment) =>
+      toProjectionArchivedSegment(sessionId, segment),
+    );
+    const summaryFp = projectionSummaryFingerprint(
+      archivedSegmentsMeta,
+      summaries,
+    );
     const nextCheckpoint: ProjectionCheckpoint = {
       tailStartMessageId: tailStart.info.id,
       archivedPrefixFingerprint: archivedPrefixFingerprint(
@@ -1008,6 +1081,8 @@ export async function projectMessages(
         sessionId,
         archivedSegments: candidate.archivedSegments,
       }),
+      archivedSegments: archivedSegmentsMeta,
+      summaryFingerprint: summaryFp,
       createdAtMessageId: input.messages.at(-1)?.info.id ?? tailStart.info.id,
       summaryText: built.text,
       lossy: built.lossy || undefined,
