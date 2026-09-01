@@ -36,6 +36,7 @@ function settings(overrides: Partial<Settings> = {}): Settings {
     databasePoolMinSize: 1,
     databasePoolMaxSize: 8,
     workerPollSeconds: 60,
+    workerConcurrency: 4,
     workerMaxAttempts: 3,
     workerRetryBackoffSeconds: 0.25,
     workerLockId: 7_320_260_818_001,
@@ -55,12 +56,30 @@ function extractionResult(summary = "summary"): ValidatedExtractionResult {
   } as ExtractionResult as ValidatedExtractionResult;
 }
 
+function extractionResultWithClaims(
+  summary = "summary",
+  claimsCount = 1,
+): ValidatedExtractionResult {
+  const claims = Array.from({ length: claimsCount }, (_, i) => ({
+    subject: `Subject${i}`,
+    predicate: "is",
+    confidence: 0.9,
+    object_entity: null,
+    object_value: `Value${i}`,
+  }));
+  return {
+    summary,
+    claims,
+  } as ExtractionResult as ValidatedExtractionResult;
+}
+
 function job(
   attempts: number,
   staged: ValidatedExtractionResult | null = null,
+  options: { id?: number; sessionId?: string } = {},
 ): ClaimedJob {
   const request = {
-    session_id: "session",
+    session_id: options.sessionId ?? "session",
     start_user_message_id: "start",
     end_user_message_id: "end",
     source_boundary_version: 1 as const,
@@ -71,7 +90,7 @@ function job(
     messages: [{ role: "user" as const, text: "text" }],
   };
   return {
-    id: 1,
+    id: options.id ?? 1,
     segmentId: randomUUID(),
     leaseId: randomUUID(),
     sourceGeneration: 1n,
@@ -361,7 +380,7 @@ describe("ExtractionWorker", () => {
         extract: vi.fn(async () => extractionResult()),
         resolve: vi.fn(),
       }),
-      settings({ workerPollSeconds: 60 }),
+      settings({ workerPollSeconds: 60, workerConcurrency: 1 }),
       logger,
     );
 
@@ -425,5 +444,582 @@ describe("ExtractionWorker", () => {
       output,
     );
     expect(connection.release).toHaveBeenCalledOnce();
+  });
+
+  test("dispatches up to configured concurrency across distinct sessions concurrently", async () => {
+    const job1 = job(1, null, { id: 1, sessionId: "s1" });
+    const job2 = job(1, null, { id: 2, sessionId: "s2" });
+    const job3 = job(1, null, { id: 3, sessionId: "s3" });
+    const job4 = job(1, null, { id: 4, sessionId: "s4" });
+
+    const queue = [job1, job2, job3, job4];
+    const extractStarted: number[] = [];
+    const extractDeferred = new Map<
+      number,
+      { resolve: (value?: void) => void; promise: Promise<void> }
+    >();
+    for (const j of queue) {
+      extractDeferred.set(j.id, deferred<void>());
+    }
+
+    const connection = {
+      query: vi.fn(async (sql: string) => ({
+        rows: sql.includes("pg_try_advisory_lock")
+          ? [{ acquired: true }]
+          : [{ unlocked: true }],
+      })),
+      release: vi.fn(),
+    };
+
+    const claimOldestJob = vi.fn(
+      async (_conn: unknown, excluded: readonly string[] = []) => {
+        const idx = queue.findIndex(
+          (j) => !excluded.includes(j.request.session_id),
+        );
+        if (idx === -1) return null;
+        return queue.splice(idx, 1)[0] ?? null;
+      },
+    );
+
+    const database = workerDatabase({
+      pool: { connect: vi.fn(async () => connection) },
+      recoverRunningJobs: vi.fn(async () => 0),
+      claimOldestJob,
+      publishExtraction: vi.fn(async () => true),
+      commitResolution: vi.fn(async () => true),
+    });
+
+    const engine = workerEngine({
+      extract: vi.fn(async (claimed: ClaimedJob) => {
+        extractStarted.push(claimed.id);
+        await extractDeferred.get(claimed.id)!.promise;
+        return extractionResult();
+      }),
+      resolve: vi.fn(async (claimed: ClaimedJob) => prepared(claimed)),
+    });
+
+    const worker = new ExtractionWorker(
+      database,
+      engine,
+      settings({ workerConcurrency: 3 }),
+      logger,
+    );
+
+    worker.start();
+    await waitUntil(() => extractStarted.length === 3);
+
+    expect(extractStarted).toEqual([1, 2, 3]);
+
+    extractDeferred.get(1)!.resolve();
+    await waitUntil(() => extractStarted.length === 4);
+    expect(extractStarted).toEqual([1, 2, 3, 4]);
+
+    extractDeferred.get(2)!.resolve();
+    extractDeferred.get(3)!.resolve();
+    extractDeferred.get(4)!.resolve();
+
+    await worker.stop();
+  });
+
+  test("does not concurrently claim or dispatch work for the same session", async () => {
+    const jobA1 = job(1, null, { id: 1, sessionId: "session-A" });
+    const jobA2 = job(1, null, { id: 2, sessionId: "session-A" });
+    const jobB = job(1, null, { id: 3, sessionId: "session-B" });
+
+    const queue = [jobA1, jobA2, jobB];
+    const maxOverlapPerSession = new Map<string, number>();
+    const currentPerSession = new Map<string, number>();
+
+    const jobA1Extract = deferred<void>();
+    const jobBExtract = deferred<void>();
+    const jobA2Extract = deferred<void>();
+
+    const connection = {
+      query: vi.fn(async (sql: string) => ({
+        rows: sql.includes("pg_try_advisory_lock")
+          ? [{ acquired: true }]
+          : [{ unlocked: true }],
+      })),
+      release: vi.fn(),
+    };
+
+    const claimOldestJob = vi.fn(
+      async (_conn: unknown, excluded: readonly string[] = []) => {
+        const idx = queue.findIndex(
+          (j) => !excluded.includes(j.request.session_id),
+        );
+        if (idx === -1) return null;
+        return queue.splice(idx, 1)[0] ?? null;
+      },
+    );
+
+    const database = workerDatabase({
+      pool: { connect: vi.fn(async () => connection) },
+      recoverRunningJobs: vi.fn(async () => 0),
+      claimOldestJob,
+      publishExtraction: vi.fn(async () => true),
+      commitResolution: vi.fn(async () => true),
+    });
+
+    const engine = workerEngine({
+      extract: vi.fn(async (claimed: ClaimedJob) => {
+        const ses = claimed.request.session_id;
+        const cur = (currentPerSession.get(ses) ?? 0) + 1;
+        currentPerSession.set(ses, cur);
+        maxOverlapPerSession.set(
+          ses,
+          Math.max(maxOverlapPerSession.get(ses) ?? 0, cur),
+        );
+
+        if (claimed.id === 1) await jobA1Extract.promise;
+        if (claimed.id === 3) await jobBExtract.promise;
+        if (claimed.id === 2) await jobA2Extract.promise;
+
+        currentPerSession.set(ses, (currentPerSession.get(ses) ?? 1) - 1);
+        return extractionResult();
+      }),
+      resolve: vi.fn(async (claimed: ClaimedJob) => prepared(claimed)),
+    });
+
+    const worker = new ExtractionWorker(
+      database,
+      engine,
+      settings({ workerConcurrency: 4 }),
+      logger,
+    );
+
+    worker.start();
+    await waitUntil(() => claimOldestJob.mock.calls.length >= 2);
+
+    expect(maxOverlapPerSession.get("session-A")).toBe(1);
+
+    jobA1Extract.resolve();
+    jobBExtract.resolve();
+
+    await waitUntil(() => currentPerSession.get("session-A") === 1);
+    jobA2Extract.resolve();
+
+    await worker.stop();
+
+    expect(maxOverlapPerSession.get("session-A")).toBe(1);
+    expect(maxOverlapPerSession.get("session-B")).toBe(1);
+  });
+
+  test("serializes claim-bearing resolutions while extractions overlap", async () => {
+    const jobA = job(1, null, { id: 1, sessionId: "session-A" });
+    const jobB = job(1, null, { id: 2, sessionId: "session-B" });
+
+    const queue = [jobA, jobB];
+    const extractA = deferred<void>();
+    const extractB = deferred<void>();
+    const resolveA = deferred<void>();
+    const resolveB = deferred<void>();
+
+    const resolveEvents: string[] = [];
+    let concurrentResolutions = 0;
+    let maxConcurrentResolutions = 0;
+
+    const connection = {
+      query: vi.fn(async (sql: string) => ({
+        rows: sql.includes("pg_try_advisory_lock")
+          ? [{ acquired: true }]
+          : [{ unlocked: true }],
+      })),
+      release: vi.fn(),
+    };
+
+    const claimOldestJob = vi.fn(
+      async (_conn: unknown, excluded: readonly string[] = []) => {
+        const idx = queue.findIndex(
+          (j) => !excluded.includes(j.request.session_id),
+        );
+        if (idx === -1) return null;
+        return queue.splice(idx, 1)[0] ?? null;
+      },
+    );
+
+    const database = workerDatabase({
+      pool: { connect: vi.fn(async () => connection) },
+      recoverRunningJobs: vi.fn(async () => 0),
+      claimOldestJob,
+      publishExtraction: vi.fn(async () => true),
+      commitResolution: vi.fn(async (claimed: ClaimedJob) => {
+        resolveEvents.push(`commit-${claimed.id}`);
+        concurrentResolutions -= 1;
+        return true;
+      }),
+    });
+
+    const engine = workerEngine({
+      extract: vi.fn(async (claimed: ClaimedJob) => {
+        if (claimed.id === 1) await extractA.promise;
+        if (claimed.id === 2) await extractB.promise;
+        return extractionResultWithClaims("summary", 2);
+      }),
+      resolve: vi.fn(async (claimed: ClaimedJob) => {
+        concurrentResolutions += 1;
+        maxConcurrentResolutions = Math.max(
+          maxConcurrentResolutions,
+          concurrentResolutions,
+        );
+        resolveEvents.push(`resolve-start-${claimed.id}`);
+        if (claimed.id === 1) await resolveA.promise;
+        if (claimed.id === 2) await resolveB.promise;
+        resolveEvents.push(`resolve-end-${claimed.id}`);
+        return prepared(claimed);
+      }),
+    });
+
+    const worker = new ExtractionWorker(
+      database,
+      engine,
+      settings({ workerConcurrency: 2 }),
+      logger,
+    );
+
+    worker.start();
+
+    extractA.resolve();
+    extractB.resolve();
+
+    await waitUntil(() => resolveEvents.includes("resolve-start-1"));
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    expect(resolveEvents).not.toContain("resolve-start-2");
+    expect(maxConcurrentResolutions).toBe(1);
+
+    resolveA.resolve();
+    await waitUntil(() => resolveEvents.includes("commit-1"));
+
+    await waitUntil(() => resolveEvents.includes("resolve-start-2"));
+    resolveB.resolve();
+    await waitUntil(() => resolveEvents.includes("commit-2"));
+
+    await worker.stop();
+
+    expect(maxConcurrentResolutions).toBe(1);
+    expect(resolveEvents).toEqual([
+      "resolve-start-1",
+      "resolve-end-1",
+      "commit-1",
+      "resolve-start-2",
+      "resolve-end-2",
+      "commit-2",
+    ]);
+  });
+
+  test("allows claim-free resolutions to proceed concurrently without serialization", async () => {
+    const jobA = job(1, null, { id: 1, sessionId: "session-A" });
+    const jobB = job(1, null, { id: 2, sessionId: "session-B" });
+
+    const queue = [jobA, jobB];
+    const resolveA = deferred<void>();
+    const resolveB = deferred<void>();
+
+    let concurrentResolutions = 0;
+    let maxConcurrentResolutions = 0;
+
+    const connection = {
+      query: vi.fn(async (sql: string) => ({
+        rows: sql.includes("pg_try_advisory_lock")
+          ? [{ acquired: true }]
+          : [{ unlocked: true }],
+      })),
+      release: vi.fn(),
+    };
+
+    const claimOldestJob = vi.fn(
+      async (_conn: unknown, excluded: readonly string[] = []) => {
+        const idx = queue.findIndex(
+          (j) => !excluded.includes(j.request.session_id),
+        );
+        if (idx === -1) return null;
+        return queue.splice(idx, 1)[0] ?? null;
+      },
+    );
+
+    const database = workerDatabase({
+      pool: { connect: vi.fn(async () => connection) },
+      recoverRunningJobs: vi.fn(async () => 0),
+      claimOldestJob,
+      publishExtraction: vi.fn(async () => true),
+      commitResolution: vi.fn(async () => {
+        concurrentResolutions -= 1;
+        return true;
+      }),
+    });
+
+    const engine = workerEngine({
+      extract: vi.fn(async () => extractionResult("summary")),
+      resolve: vi.fn(async (claimed: ClaimedJob) => {
+        concurrentResolutions += 1;
+        maxConcurrentResolutions = Math.max(
+          maxConcurrentResolutions,
+          concurrentResolutions,
+        );
+        if (claimed.id === 1) await resolveA.promise;
+        if (claimed.id === 2) await resolveB.promise;
+        return prepared(claimed);
+      }),
+    });
+
+    const worker = new ExtractionWorker(
+      database,
+      engine,
+      settings({ workerConcurrency: 2 }),
+      logger,
+    );
+
+    worker.start();
+
+    await waitUntil(() => concurrentResolutions === 2);
+    expect(maxConcurrentResolutions).toBe(2);
+
+    resolveA.resolve();
+    resolveB.resolve();
+
+    await worker.stop();
+  });
+
+  test("graceful stop waits for all concurrent work before unlock and release", async () => {
+    const jobA = job(1, null, { id: 1, sessionId: "session-A" });
+    const jobB = job(1, null, { id: 2, sessionId: "session-B" });
+
+    const queue = [jobA, jobB];
+    const resolveA = deferred<void>();
+    const resolveB = deferred<void>();
+
+    const events: string[] = [];
+
+    const connection = {
+      query: vi.fn(async (sql: string) => {
+        if (sql.includes("pg_try_advisory_lock")) {
+          events.push("lock");
+          return { rows: [{ acquired: true }] };
+        }
+        if (sql.includes("pg_advisory_unlock")) {
+          events.push("unlock");
+          return { rows: [{ unlocked: true }] };
+        }
+        return { rows: [] };
+      }),
+      release: vi.fn(() => events.push("release")),
+    };
+
+    const claimOldestJob = vi.fn(
+      async (_conn: unknown, excluded: readonly string[] = []) => {
+        const idx = queue.findIndex(
+          (j) => !excluded.includes(j.request.session_id),
+        );
+        if (idx === -1) return null;
+        return queue.splice(idx, 1)[0] ?? null;
+      },
+    );
+
+    const database = workerDatabase({
+      pool: { connect: vi.fn(async () => connection) },
+      recoverRunningJobs: vi.fn(async () => 0),
+      claimOldestJob,
+      publishExtraction: vi.fn(async () => true),
+      commitResolution: vi.fn(async (claimed: ClaimedJob) => {
+        events.push(`commit-${claimed.id}`);
+        return true;
+      }),
+    });
+
+    const engine = workerEngine({
+      extract: vi.fn(async () => extractionResult()),
+      resolve: vi.fn(async (claimed: ClaimedJob) => {
+        events.push(`resolve-${claimed.id}`);
+        if (claimed.id === 1) await resolveA.promise;
+        if (claimed.id === 2) await resolveB.promise;
+        return prepared(claimed);
+      }),
+    });
+
+    const worker = new ExtractionWorker(
+      database,
+      engine,
+      settings({ workerConcurrency: 2 }),
+      logger,
+    );
+
+    worker.start();
+    await waitUntil(
+      () => events.includes("resolve-1") && events.includes("resolve-2"),
+    );
+
+    let stopped = false;
+    const stopping = worker.stop().then(() => {
+      stopped = true;
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(stopped).toBe(false);
+    expect(events).not.toContain("unlock");
+    expect(events).not.toContain("release");
+
+    resolveA.resolve();
+    resolveB.resolve();
+
+    await stopping;
+    expect(stopped).toBe(true);
+    expect(events).toContain("commit-1");
+    expect(events).toContain("commit-2");
+    expect(events.indexOf("commit-1")).toBeLessThan(events.indexOf("unlock"));
+    expect(events.indexOf("commit-2")).toBeLessThan(events.indexOf("unlock"));
+    expect(events.indexOf("unlock")).toBeLessThan(events.indexOf("release"));
+  });
+
+  test("obeys configured worker concurrency limit", async () => {
+    const jobs = Array.from({ length: 5 }, (_, i) =>
+      job(1, null, { id: i + 1, sessionId: `session-${i + 1}` }),
+    );
+    const queue = [...jobs];
+    const extractStarted: number[] = [];
+    const extractDefers = jobs.map(() => deferred<void>());
+
+    const connection = {
+      query: vi.fn(async (sql: string) => ({
+        rows: sql.includes("pg_try_advisory_lock")
+          ? [{ acquired: true }]
+          : [{ unlocked: true }],
+      })),
+      release: vi.fn(),
+    };
+
+    const claimOldestJob = vi.fn(
+      async (_conn: unknown, excluded: readonly string[] = []) => {
+        const idx = queue.findIndex(
+          (j) => !excluded.includes(j.request.session_id),
+        );
+        if (idx === -1) return null;
+        return queue.splice(idx, 1)[0] ?? null;
+      },
+    );
+
+    const database = workerDatabase({
+      pool: { connect: vi.fn(async () => connection) },
+      recoverRunningJobs: vi.fn(async () => 0),
+      claimOldestJob,
+      publishExtraction: vi.fn(async () => true),
+      commitResolution: vi.fn(async () => true),
+    });
+
+    const engine = workerEngine({
+      extract: vi.fn(async (claimed: ClaimedJob) => {
+        extractStarted.push(claimed.id);
+        await extractDefers[claimed.id - 1]!.promise;
+        return extractionResult();
+      }),
+      resolve: vi.fn(async (claimed: ClaimedJob) => prepared(claimed)),
+    });
+
+    const worker = new ExtractionWorker(
+      database,
+      engine,
+      settings({ workerConcurrency: 2 }),
+      logger,
+    );
+
+    worker.start();
+    await waitUntil(() => extractStarted.length === 2);
+
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(extractStarted).toHaveLength(2);
+
+    extractDefers[0]!.resolve();
+    await waitUntil(() => extractStarted.length === 3);
+
+    extractDefers[1]!.resolve();
+    await waitUntil(() => extractStarted.length === 4);
+
+    extractDefers[2]!.resolve();
+    extractDefers[3]!.resolve();
+    await waitUntil(() => extractStarted.length === 5);
+    extractDefers[4]!.resolve();
+
+    await worker.stop();
+  });
+
+  test("waits for in-flight tasks before unlocking and releasing when claim throws", async () => {
+    const job1 = job(1, null, { id: 1, sessionId: "session-1" });
+    const resolve1 = deferred<void>();
+    const events: string[] = [];
+
+    let claimCount = 0;
+    const connection = {
+      query: vi.fn(async (sql: string) => {
+        if (sql.includes("pg_try_advisory_lock")) {
+          events.push("lock");
+          return { rows: [{ acquired: true }] };
+        }
+        if (sql.includes("pg_advisory_unlock")) {
+          events.push("unlock");
+          return { rows: [{ unlocked: true }] };
+        }
+        return { rows: [] };
+      }),
+      release: vi.fn(() => events.push("release")),
+    };
+
+    const claimOldestJob = vi.fn(async () => {
+      claimCount += 1;
+      if (claimCount === 1) {
+        return job1;
+      }
+      throw new Error("simulated database failure during claim");
+    });
+
+    const database = workerDatabase({
+      pool: {
+        connect: vi.fn(async () => connection),
+      },
+      recoverRunningJobs: vi.fn(async () => 0),
+      claimOldestJob,
+      publishExtraction: vi.fn(async () => true),
+      commitResolution: vi.fn(async (claimed: ClaimedJob) => {
+        events.push(`commit-${claimed.id}`);
+        return true;
+      }),
+    });
+
+    const engine = workerEngine({
+      extract: vi.fn(async () => extractionResult()),
+      resolve: vi.fn(async (claimed: ClaimedJob) => {
+        events.push(`resolve-start-${claimed.id}`);
+        await resolve1.promise;
+        events.push(`resolve-end-${claimed.id}`);
+        return prepared(claimed);
+      }),
+    });
+
+    const worker = new ExtractionWorker(
+      database,
+      engine,
+      settings({ workerConcurrency: 2, workerPollSeconds: 60 }),
+      logger,
+    );
+
+    worker.start();
+
+    await waitUntil(
+      () => events.includes("resolve-start-1") && claimCount >= 2,
+    );
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    expect(events).not.toContain("unlock");
+    expect(events).not.toContain("release");
+
+    resolve1.resolve();
+    await waitUntil(() => events.includes("commit-1"));
+
+    await worker.stop();
+
+    expect(events).toContain("commit-1");
+    expect(events).toContain("unlock");
+    expect(events).toContain("release");
+    expect(events.indexOf("commit-1")).toBeLessThan(events.indexOf("unlock"));
+    expect(events.indexOf("unlock")).toBeLessThan(events.indexOf("release"));
   });
 });

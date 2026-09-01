@@ -60,6 +60,7 @@ function settings(overrides: Partial<Settings> = {}): Settings {
     databasePoolMinSize: 1,
     databasePoolMaxSize: 8,
     workerPollSeconds: 1,
+    workerConcurrency: 4,
     workerMaxAttempts: 3,
     workerRetryBackoffSeconds: 2,
     workerLockId: 7_320_260_818_001,

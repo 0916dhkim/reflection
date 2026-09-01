@@ -22,6 +22,7 @@ export interface Settings {
   readonly databasePoolMinSize: number;
   readonly databasePoolMaxSize: number;
   readonly workerPollSeconds: number;
+  readonly workerConcurrency: number;
   readonly workerMaxAttempts: number;
   readonly workerRetryBackoffSeconds: number;
   readonly workerLockId: number | string;
@@ -220,6 +221,7 @@ export function loadSettings(env: NodeJS.ProcessEnv = process.env): Settings {
   const databasePoolMinSize = integer(env, "DATABASE_POOL_MIN_SIZE", 1);
   const databasePoolMaxSize = integer(env, "DATABASE_POOL_MAX_SIZE", 8);
   const workerPollSeconds = decimal(env, "WORKER_POLL_SECONDS", 1);
+  const workerConcurrency = integer(env, "WORKER_CONCURRENCY", 4);
   const workerMaxAttempts = integer(env, "WORKER_MAX_ATTEMPTS", 3);
   const workerRetryBackoffSeconds = decimal(
     env,
@@ -247,6 +249,9 @@ export function loadSettings(env: NodeJS.ProcessEnv = process.env): Settings {
     throw new SettingsValidationError(
       "voyage-4-large embeddings must use 1024 dimensions",
     );
+  }
+  if (workerConcurrency < 1) {
+    throw new SettingsValidationError("worker_concurrency must be at least 1");
   }
   if (workerMaxAttempts < 1) {
     throw new SettingsValidationError("worker_max_attempts must be at least 1");
@@ -303,6 +308,7 @@ export function loadSettings(env: NodeJS.ProcessEnv = process.env): Settings {
     databasePoolMinSize,
     databasePoolMaxSize,
     workerPollSeconds,
+    workerConcurrency,
     workerMaxAttempts,
     workerRetryBackoffSeconds,
     workerLockId: postgresBigInt(env, "WORKER_LOCK_ID", 7_320_260_818_001),

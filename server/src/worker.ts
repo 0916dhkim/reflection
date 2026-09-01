@@ -19,6 +19,7 @@ type ProcessResult = "progressed" | "stale";
 type WorkerSettings = Pick<
   Settings,
   | "workerPollSeconds"
+  | "workerConcurrency"
   | "workerMaxAttempts"
   | "workerRetryBackoffSeconds"
   | "workerLockId"
@@ -38,15 +39,64 @@ function errorText(error: unknown): string {
   return `Error: ${String(error)}`;
 }
 
+function timingText(
+  result: string,
+  jobId: number,
+  totalMs: number,
+  extractMs: number,
+  reusedExtraction: boolean,
+  laneWaitMs: number,
+  resolveCommitMs: number,
+  claimCount: number,
+): string {
+  const extractLabel = reusedExtraction
+    ? "0.0ms [reused]"
+    : `${extractMs.toFixed(1)}ms`;
+  return (
+    `extraction job ${jobId} ${result} in ${totalMs.toFixed(1)}ms ` +
+    `(extract: ${extractLabel}, lane wait: ${laneWaitMs.toFixed(1)}ms, ` +
+    `resolve/commit: ${resolveCommitMs.toFixed(1)}ms, claims: ${claimCount})`
+  );
+}
+
+class ResolutionLane {
+  #tail: Promise<void> = Promise.resolve();
+
+  async run<T>(
+    operation: () => Promise<T>,
+  ): Promise<{ result: T; waitMs: number }> {
+    const queueStart = performance.now();
+    let release!: () => void;
+    const next = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const current = this.#tail;
+    this.#tail = this.#tail.then(
+      () => next,
+      () => next,
+    );
+    await current;
+    const waitMs = performance.now() - queueStart;
+    try {
+      const result = await operation();
+      return { result, waitMs };
+    } finally {
+      release();
+    }
+  }
+}
+
 export class ExtractionWorker {
   readonly #database: WorkerDatabase;
   readonly #engine: WorkerEngine;
   readonly #settings: WorkerSettings;
   readonly #logger: WorkerLogger;
+  readonly #resolutionLane = new ResolutionLane();
 
   #stopping = false;
   #wakeRequested = false;
   #wakeWaiter: (() => void) | null = null;
+  #taskWaiter: (() => void) | null = null;
   #task: Promise<void> | null = null;
 
   constructor(
@@ -74,28 +124,90 @@ export class ExtractionWorker {
   wake(): void {
     this.#wakeRequested = true;
     this.#wakeWaiter?.();
+    this.#taskWaiter?.();
   }
 
   async process(job: ClaimedJob): Promise<ProcessResult> {
+    const startTime = performance.now();
+    let extractMs = 0;
+    let laneWaitMs = 0;
+    let resolveCommitMs = 0;
+    const reusedExtraction = job.extractionResult !== null;
+    let extractionResult = job.extractionResult;
+
     try {
-      let extractionResult = job.extractionResult;
       if (extractionResult === null) {
+        const extractStart = performance.now();
         extractionResult = await this.#engine.extract(job);
+        extractMs = performance.now() - extractStart;
         const published = await this.#database.publishExtraction(
           job,
           extractionResult,
         );
-        if (!published) return "stale";
+        if (!published) {
+          const totalMs = performance.now() - startTime;
+          this.#logger.info(
+            timingText(
+              "stale",
+              job.id,
+              totalMs,
+              extractMs,
+              reusedExtraction,
+              0,
+              0,
+              extractionResult.claims.length,
+            ),
+          );
+          return "stale";
+        }
       }
-      const prepared = await this.#engine.resolve(job, extractionResult);
-      return (await this.#database.commitResolution(
-        job,
-        extractionResult,
-        prepared,
-      ))
-        ? "progressed"
-        : "stale";
+
+      const currentExtraction = extractionResult;
+      let result: ProcessResult;
+      if (currentExtraction.claims.length > 0) {
+        const resolution = await this.#resolutionLane.run(async () => {
+          const rcStart = performance.now();
+          const prepared = await this.#engine.resolve(job, currentExtraction);
+          const committed = await this.#database.commitResolution(
+            job,
+            currentExtraction,
+            prepared,
+          );
+          resolveCommitMs = performance.now() - rcStart;
+          return committed ? "progressed" : "stale";
+        });
+        laneWaitMs = resolution.waitMs;
+        result = resolution.result;
+      } else {
+        const rcStart = performance.now();
+        const prepared = await this.#engine.resolve(job, currentExtraction);
+        const committed = await this.#database.commitResolution(
+          job,
+          currentExtraction,
+          prepared,
+        );
+        resolveCommitMs = performance.now() - rcStart;
+        result = committed ? "progressed" : "stale";
+      }
+
+      const totalMs = performance.now() - startTime;
+      this.#logger.info(
+        timingText(
+          result,
+          job.id,
+          totalMs,
+          extractMs,
+          reusedExtraction,
+          laneWaitMs,
+          resolveCommitMs,
+          extractionResult.claims.length,
+        ),
+      );
+      return result;
     } catch (error) {
+      const totalMs = performance.now() - startTime;
+      const claimCount = extractionResult?.claims.length ?? 0;
+
       if (error instanceof TerminalExtractionValidationError) {
         this.#logger.error(
           `extraction job ${job.id} has invalid deterministic input`,
@@ -111,6 +223,18 @@ export class ExtractionWorker {
             `ignored deterministic failure from stale lease for job ${job.id}`,
           );
         }
+        this.#logger.info(
+          timingText(
+            "failed (terminal)",
+            job.id,
+            totalMs,
+            extractMs,
+            reusedExtraction,
+            laneWaitMs,
+            resolveCommitMs,
+            claimCount,
+          ),
+        );
         return updated ? "progressed" : "stale";
       }
 
@@ -131,6 +255,18 @@ export class ExtractionWorker {
       if (!updated) {
         this.#logger.info(`ignored failure from stale lease for job ${job.id}`);
       }
+      this.#logger.info(
+        timingText(
+          shouldRetry ? "failed (retryable)" : "failed (exhausted)",
+          job.id,
+          totalMs,
+          extractMs,
+          reusedExtraction,
+          laneWaitMs,
+          resolveCommitMs,
+          claimCount,
+        ),
+      );
       return updated ? "progressed" : "stale";
     }
   }
@@ -175,15 +311,109 @@ export class ExtractionWorker {
   }
 
   async #workLoop(connection: PoolClient): Promise<void> {
-    while (!this.#stopping) {
-      const job = await this.#database.claimOldestJob(connection);
-      if (job === null) {
-        await this.#waitForWork();
-        continue;
+    const activeTasks = new Set<Promise<void>>();
+    const activeSessions = new Set<string>();
+    let staleBackoff = false;
+    let taskWaiter: (() => void) | null = null;
+
+    const onTaskComplete = () => {
+      taskWaiter?.();
+    };
+
+    try {
+      while (!this.#stopping) {
+        if (staleBackoff) {
+          staleBackoff = false;
+          await this.#waitForWork(false);
+          if (this.#stopping) break;
+        }
+
+        if (activeTasks.size >= this.#settings.workerConcurrency) {
+          await new Promise<void>((resolve) => {
+            taskWaiter = resolve;
+            this.#taskWaiter = resolve;
+            if (
+              this.#stopping ||
+              activeTasks.size < this.#settings.workerConcurrency
+            ) {
+              resolve();
+            }
+          });
+          taskWaiter = null;
+          this.#taskWaiter = null;
+          if (this.#stopping) break;
+          continue;
+        }
+
+        const job = await this.#database.claimOldestJob(
+          connection,
+          Array.from(activeSessions),
+        );
+
+        if (this.#stopping) {
+          if (job !== null) {
+            activeSessions.add(job.request.session_id);
+            const task = this.#dispatchJob(job, activeSessions, (result) => {
+              if (result === "stale") staleBackoff = true;
+            }).finally(() => {
+              activeTasks.delete(task);
+              onTaskComplete();
+            });
+            activeTasks.add(task);
+          }
+          break;
+        }
+
+        if (job === null) {
+          if (activeTasks.size > 0) {
+            let listenerResolved = false;
+            const listener = () => {
+              if (listenerResolved) return;
+              listenerResolved = true;
+              this.wake();
+            };
+            taskWaiter = listener;
+            try {
+              await this.#waitForWork(true);
+            } finally {
+              taskWaiter = null;
+            }
+          } else {
+            await this.#waitForWork(true);
+          }
+          continue;
+        }
+
+        activeSessions.add(job.request.session_id);
+        const task = this.#dispatchJob(job, activeSessions, (result) => {
+          if (result === "stale") staleBackoff = true;
+        }).finally(() => {
+          activeTasks.delete(task);
+          onTaskComplete();
+        });
+        activeTasks.add(task);
       }
-      if ((await this.process(job)) === "stale") {
-        await this.#waitForWork(false);
+    } finally {
+      taskWaiter = null;
+      this.#taskWaiter = null;
+      if (activeTasks.size > 0) {
+        await Promise.allSettled(activeTasks);
       }
+    }
+  }
+
+  async #dispatchJob(
+    job: ClaimedJob,
+    activeSessions: Set<string>,
+    onFinished: (result: ProcessResult) => void,
+  ): Promise<void> {
+    try {
+      const result = await this.process(job);
+      onFinished(result);
+    } catch (error) {
+      this.#logger.error(`unexpected error processing job ${job.id}`, error);
+    } finally {
+      activeSessions.delete(job.request.session_id);
     }
   }
 
