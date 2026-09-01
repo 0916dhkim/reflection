@@ -1719,10 +1719,14 @@ export class Database {
     });
   }
 
-  async claimOldestJob(connection: ReservedClient): Promise<ClaimedJob | null> {
+  async claimOldestJob(
+    connection: ReservedClient,
+    excludedSessionIds: readonly string[] = [],
+  ): Promise<ClaimedJob | null> {
     return transaction(connection, async () => {
       const pending = (
-        await connection.query<ClaimedJobRow>(`
+        await connection.query<ClaimedJobRow>(
+          `
           SELECT jobs.id, jobs.segment_id, jobs.session_id,
                   jobs.start_user_message_id, jobs.end_user_message_id,
                   jobs.source_boundary_version, jobs.start_source_message_id,
@@ -1770,6 +1774,7 @@ export class Database {
           WHERE jobs.status = 'pending'
             AND jobs.next_attempt_at <= now()
             AND (targets.segment_id IS NOT NULL OR jobs.source_fingerprint IS NULL)
+            AND NOT (jobs.session_id = ANY($1::text[]))
             AND NOT EXISTS (
                 SELECT 1
                 FROM extraction_jobs AS running
@@ -1780,7 +1785,9 @@ export class Database {
                    targets.updated_at, jobs.id
           LIMIT 1
           FOR UPDATE OF jobs
-        `)
+        `,
+          [Array.from(excludedSessionIds)],
+        )
       ).rows[0];
       if (pending === undefined) return null;
 

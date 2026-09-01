@@ -3840,4 +3840,89 @@ describe.sequential("Database PostgreSQL integration", () => {
     },
     30_000,
   );
+
+  test.skipIf(!DATABASE_URL)(
+    "excludes in-flight sessions during claiming and claims them once unblocked",
+    async () => {
+      const database = new Database(settings());
+      await database.open();
+      try {
+        await truncate(database);
+
+        const sessionA1 = await database.enqueue(
+          request({
+            session_id: "session-A",
+            start_user_message_id: "a1",
+            end_user_message_id: "a1-end",
+            projection_version: 1,
+            processing_priority: 50,
+            messages: [{ role: "user", text: "session A job 1" }],
+          }),
+        );
+        const sessionA2 = await database.enqueue(
+          request({
+            session_id: "session-A",
+            start_user_message_id: "a2",
+            end_user_message_id: "a2-end",
+            projection_version: 1,
+            processing_priority: 50,
+            messages: [{ role: "user", text: "session A job 2" }],
+          }),
+        );
+        const sessionB1 = await database.enqueue(
+          request({
+            session_id: "session-B",
+            start_user_message_id: "b1",
+            end_user_message_id: "b1-end",
+            projection_version: 1,
+            processing_priority: 10,
+            messages: [{ role: "user", text: "session B job 1" }],
+          }),
+        );
+
+        const claimedB = required(
+          await withClient(database, (client) =>
+            database.claimOldestJob(client, ["session-A"]),
+          ),
+        );
+        expect(claimedB.id).toBe(sessionB1.id);
+        expect(claimedB.request.session_id).toBe("session-B");
+
+        const claimedNone = await withClient(database, (client) =>
+          database.claimOldestJob(client, ["session-A", "session-B"]),
+        );
+        expect(claimedNone).toBeNull();
+
+        const claimedA1 = required(
+          await withClient(database, (client) =>
+            database.claimOldestJob(client, ["session-B"]),
+          ),
+        );
+        expect(claimedA1.id).toBe(sessionA1.id);
+        expect(claimedA1.request.session_id).toBe("session-A");
+
+        const claimedA2Blocked = await withClient(database, (client) =>
+          database.claimOldestJob(client, ["session-A"]),
+        );
+        expect(claimedA2Blocked).toBeNull();
+
+        await completeResolution(
+          database,
+          claimedA1,
+          emptyPrepared(claimedA1, "Session A job 1 summary"),
+        );
+
+        const claimedA2 = required(
+          await withClient(database, (client) =>
+            database.claimOldestJob(client, []),
+          ),
+        );
+        expect(claimedA2.id).toBe(sessionA2.id);
+        expect(claimedA2.request.session_id).toBe("session-A");
+      } finally {
+        await database.close();
+      }
+    },
+    30_000,
+  );
 });

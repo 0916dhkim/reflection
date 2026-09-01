@@ -38,10 +38,10 @@ Segment UUIDs use fixed UUIDv5 namespaces. Source fingerprints use SHA-256 over 
 
 A PostgreSQL advisory lock elects one worker across all API replicas. Jobs are selected by `processing_priority` descending and then oldest desired target. Backfill and inactive-session sweeps use priority `0`, active-session idle ingestion uses priority `50`, and blocking context projection uses priority `100`. Reposting the same exact source at a higher priority raises the retained target priority without changing its identity.
 
-The worker has two durable phases:
+The worker dispatches up to `WORKER_CONCURRENCY` (default `4`) jobs concurrently while claiming sequentially on a single reserved advisory-lock connection and enforcing at most one in-flight job per session. The worker has two durable phases:
 
-1. Extraction produces a trimmed, nonempty summary of at most 1,000 characters and proposed claims. The result and a projection commit fingerprint are staged on the exact desired target. Legacy empty committed summaries remain readable so backfill can replace them safely.
-2. Source-aware claim triage, entity resolution, and embeddings complete. One transaction commits the segment, resolved claims, entities, aliases, successful job state, and payload cleanup.
+1. Extraction produces a trimmed, nonempty summary of at most 1,000 characters and proposed claims. The result and a projection commit fingerprint are staged on the exact desired target. Legacy empty committed summaries remain readable so backfill can replace them safely. Extraction runs concurrently across sessions.
+2. Source-aware claim triage, entity resolution, and embeddings complete. Claim-bearing resolution serializes through a process-local resolution lane to prevent duplicate entity creation, while claim-free segments commit concurrently. One transaction commits the segment, resolved claims, entities, aliases, successful job state, and payload cleanup.
 
 A staged summary can therefore appear in the session manifest while its job is still `running`. This is intentional so a foreground context transform can use the exact summary without waiting for entity resolution. A staged summary does not mean claims are available or the job succeeded. Use `GET /v1/jobs/{id}` for full job state; `GET /v1/segments/{id}` exposes only fully committed summaries and resolved claims.
 
@@ -145,7 +145,7 @@ Required variables:
 | `OPENROUTER_API_KEY` | Bearer key for extraction and resolution.       |
 | `VOYAGE_API_KEY`     | Bearer key for embeddings.                      |
 
-Model route, reasoning, schema mode, upstream URL, pool, worker, timeout, migration directory, and logging overrides are optional. Startup validates model/provider combinations, a 1,024-dimensional embedding configuration, and a pool of at least two connections because the elected worker retains one advisory-lock connection.
+Model route, reasoning, schema mode, upstream URL, pool, worker concurrency/polling/retry, timeout, migration directory, and logging overrides are optional. Startup validates model/provider combinations, a 1,024-dimensional embedding configuration, and a pool of at least two connections because the elected worker retains one advisory-lock connection.
 
 Provider pinning may be incompatible with OpenRouter zero-data-retention filters when a selected endpoint does not satisfy them. Voyage retention is controlled at the organization level. Review both providers' retention settings before sending sensitive transcripts.
 
