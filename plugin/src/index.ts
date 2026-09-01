@@ -39,7 +39,6 @@ import {
   projectMessages,
   projectionSourcesFingerprint,
   projectionSummaryFingerprint,
-  toProjectionArchivedSegment,
   type StoredSegmentSummary,
 } from "./projection.js";
 import { ProjectionStateStore } from "./projection-state.js";
@@ -60,8 +59,6 @@ const INACTIVE_SWEEP_TIMEOUT_MS = 60_000;
 const PROJECTION_REQUEST_TIMEOUT_MS = 5_000;
 const TARGET_POST_TIMEOUT_MS = 5_000;
 const TARGET_WAIT_TIMEOUT_MS = 5_000;
-const SUMMARY_WAIT_TIMEOUT_MS = 90_000;
-const SUMMARY_POLL_INTERVAL_MS = 1_000;
 const PROJECTION_VERSION = 1;
 const DEFAULT_OUTPUT_TOKEN_MAX = 32_000;
 const BACKGROUND_PROCESSING_PRIORITY = 0;
@@ -385,7 +382,6 @@ export const Reflection: Plugin = async ({ client, directory }) => {
   const compactingSessions = new Map<string, number>();
   const sessionGenerations = new Map<string, number>();
   const targetUpdates = new Map<string, TargetUpdateState>();
-  const targetRevisions = new Map<string, number>();
   const targetUpdateAborts = new Map<string, Set<AbortController>>();
   const automaticRetries = new Map<string, Map<string, string>>();
   const lifecycleAbort = new AbortController();
@@ -433,7 +429,6 @@ export const Reflection: Plugin = async ({ client, directory }) => {
       tailStartMessageId: string;
       archivedPrefixFingerprint: string;
       canonicalSourceFingerprint: string;
-      summaryFingerprint: string;
     }
   >();
   const synchronizeSuccessfulFingerprints = (
@@ -517,7 +512,6 @@ export const Reflection: Plugin = async ({ client, directory }) => {
     sessionId: string,
     operation: () => Promise<IngestionResult>,
   ): Promise<IngestionResult> => {
-    targetRevisions.set(sessionId, (targetRevisions.get(sessionId) ?? 0) + 1);
     const state = targetUpdates.get(sessionId) ?? {
       tail: Promise.resolve(),
     };
@@ -709,38 +703,6 @@ export const Reflection: Plugin = async ({ client, directory }) => {
     }
   };
 
-  const waitForTargetUpdates = async (
-    sessionId: string,
-    deadline = Date.now() + TARGET_WAIT_TIMEOUT_MS,
-  ): Promise<void> => {
-    while (true) {
-      const state = targetUpdates.get(sessionId);
-      const idle = idlePasses.get(sessionId);
-      const dirtyIdle = idle?.dirty ? idle.promise : undefined;
-      if (!state && !dirtyIdle) return;
-      const observed = state?.tail;
-      const remaining = deadline - Date.now();
-      if (remaining <= 0) {
-        throw new Error(
-          `target updates timed out after ${TARGET_WAIT_TIMEOUT_MS}ms`,
-        );
-      }
-      await waitWithin(
-        Promise.all([observed, dirtyIdle].filter(Boolean)).then(() => {}),
-        remaining,
-      );
-      if (dirtyIdle) continue;
-      if (
-        state &&
-        targetUpdates.get(sessionId) === state &&
-        observed === state.tail
-      ) {
-        if (state.failure) throw state.failure;
-        return;
-      }
-    }
-  };
-
   const getModelLimits = async (
     providerId: string,
     modelId: string,
@@ -804,105 +766,6 @@ export const Reflection: Plugin = async ({ client, directory }) => {
     }
     synchronizeSuccessfulFingerprints(sessionId, listing);
     return listing;
-  };
-
-  const getFreshSegmentListing = async (
-    sessionId: string,
-    deadline = Date.now() + TARGET_WAIT_TIMEOUT_MS,
-    signal?: AbortSignal,
-  ): Promise<SegmentListing> => {
-    while (true) {
-      await waitForTargetUpdates(sessionId, deadline);
-      const revision = targetRevisions.get(sessionId) ?? 0;
-      const remaining = deadline - Date.now();
-      if (remaining <= 0) {
-        throw new Error(
-          `target updates timed out after ${TARGET_WAIT_TIMEOUT_MS}ms`,
-        );
-      }
-      const listing = await getSegmentListing(
-        sessionId,
-        signal,
-        Math.min(PROJECTION_REQUEST_TIMEOUT_MS, remaining),
-      );
-      await waitForTargetUpdates(sessionId, deadline);
-      if ((targetRevisions.get(sessionId) ?? 0) === revision) return listing;
-      if (Date.now() >= deadline) {
-        throw new Error(
-          `target updates timed out after ${TARGET_WAIT_TIMEOUT_MS}ms`,
-        );
-      }
-    }
-  };
-
-  const exactSummaryForSegment = (
-    sessionId: string,
-    summaries: readonly SegmentSummary[],
-    segment: ReflectionSegment,
-  ): SegmentSummary | undefined => {
-    const body = submissionBody(sessionId, segment, 100);
-    const segmentId = segmentIdForRequest(body);
-    return summaries.find(
-      (summary) =>
-        summary.id === segmentId &&
-        summary.start_user_message_id === body.start_user_message_id &&
-        summary.end_user_message_id === body.end_user_message_id &&
-        summary.source_boundary_version === body.source_boundary_version &&
-        summary.start_source_message_id === body.start_source_message_id &&
-        summary.end_source_message_id === body.end_source_message_id,
-    );
-  };
-
-  const hasPendingExactTarget = (
-    sessionId: string,
-    listing: SegmentListing,
-    segment: ReflectionSegment,
-  ): boolean => {
-    const body = submissionBody(sessionId, segment, 100);
-    const segmentId = segmentIdForRequest(body);
-    const fingerprint = submissionSourceFingerprint(sessionId, segment);
-    return listing.targets.some(
-      (target) =>
-        target.id === segmentId &&
-        (target.status === "pending" || target.status === "running") &&
-        target.startUserMessageId === body.start_user_message_id &&
-        target.endUserMessageId === body.end_user_message_id &&
-        target.sourceBoundaryVersion === body.source_boundary_version &&
-        target.startSourceMessageId === body.start_source_message_id &&
-        target.endSourceMessageId === body.end_source_message_id &&
-        target.sourceFingerprint === fingerprint,
-    );
-  };
-
-  const waitForRequiredSummaries = async (
-    sessionId: string,
-    requiredSegments: readonly ReflectionSegment[],
-    deadline = Date.now() + SUMMARY_WAIT_TIMEOUT_MS,
-    signal?: AbortSignal,
-  ): Promise<readonly StoredSegmentSummary[]> => {
-    while (true) {
-      const listing = await getFreshSegmentListing(sessionId, deadline, signal);
-      const missing = requiredSegments.filter(
-        (segment) =>
-          exactSummaryForSegment(sessionId, listing.summaries, segment) ===
-          undefined,
-      );
-      if (missing.length === 0) return listing.summaries;
-      if (
-        !missing.some((segment) =>
-          hasPendingExactTarget(sessionId, listing, segment),
-        )
-      ) {
-        return listing.summaries;
-      }
-      const remaining = deadline - Date.now();
-      if (remaining <= 0) {
-        throw new Error(
-          `segment summaries timed out after ${SUMMARY_WAIT_TIMEOUT_MS}ms`,
-        );
-      }
-      await waitForDelay(Math.min(SUMMARY_POLL_INTERVAL_MS, remaining), signal);
-    }
   };
 
   const isSessionIdle = async (
@@ -1246,7 +1109,6 @@ export const Reflection: Plugin = async ({ client, directory }) => {
         }
         targetUpdateAborts.delete(sessionId);
         targetUpdates.delete(sessionId);
-        targetRevisions.delete(sessionId);
         idlePasses.delete(sessionId);
         successfulSegmentFingerprints.delete(sessionId);
         automaticRetries.delete(sessionId);
@@ -1348,9 +1210,7 @@ export const Reflection: Plugin = async ({ client, directory }) => {
           validatedTurn.archivedPrefixFingerprint ===
             previous.checkpoint.archivedPrefixFingerprint &&
           validatedTurn.canonicalSourceFingerprint ===
-            previous.checkpoint.canonicalSourceFingerprint &&
-          validatedTurn.summaryFingerprint ===
-            previous.checkpoint.summaryFingerprint;
+            previous.checkpoint.canonicalSourceFingerprint;
 
         const result = await projectMessages({
           messages,
@@ -1363,13 +1223,23 @@ export const Reflection: Plugin = async ({ client, directory }) => {
                 const current = await listing();
                 if (!current) return true;
 
-                const currentSummaryFp = projectionSummaryFingerprint(
+                const emptySummaryFingerprint = projectionSummaryFingerprint(
                   checkpoint.archivedSegments,
-                  current.summaries,
+                  [],
                 );
-                if (currentSummaryFp !== checkpoint.summaryFingerprint) {
-                  return false;
+                if (checkpoint.summaryFingerprint === emptySummaryFingerprint) {
+                  const currentSummaryFingerprint =
+                    projectionSummaryFingerprint(
+                      checkpoint.archivedSegments,
+                      current.summaries,
+                    );
+                  if (
+                    currentSummaryFingerprint !== checkpoint.summaryFingerprint
+                  ) {
+                    return false;
+                  }
                 }
+
                 let canUseFastCheck = true;
                 for (const seg of checkpoint.archivedSegments) {
                   const target = current.targets.find(
@@ -1447,28 +1317,15 @@ export const Reflection: Plugin = async ({ client, directory }) => {
                     return false;
                   }
                 }
-                if (
+                return (
                   projectionSourcesFingerprint({
                     sessionId: model.sessionId,
                     archivedSegments,
-                  }) !== checkpoint.canonicalSourceFingerprint
-                ) {
-                  return false;
-                }
-                if (
-                  projectionSummaryFingerprint(
-                    archivedSegments.map((segment) =>
-                      toProjectionArchivedSegment(model.sessionId, segment),
-                    ),
-                    current.summaries,
-                  ) !== checkpoint.summaryFingerprint
-                ) {
-                  return false;
-                }
-                return true;
+                  }) === checkpoint.canonicalSourceFingerprint
+                );
               },
           loadCanonicalSegments: loadCanonicalPlan,
-          loadSummaries: async (requiredSegments) => {
+          loadSummaries: async () => {
             const current = await listing();
             if (!current) {
               throw new SegmentListingUnavailableError(
@@ -1482,7 +1339,6 @@ export const Reflection: Plugin = async ({ client, directory }) => {
               generation,
               operation.signal,
             );
-            let foregroundSyncFailed = false;
             try {
               await waitWithin(
                 foregroundSync.then(() => {}),
@@ -1497,41 +1353,31 @@ export const Reflection: Plugin = async ({ client, directory }) => {
               ) {
                 throw error;
               }
-              foregroundSyncFailed = true;
               await log(
                 `Reflection foreground target sync failed for ${model.sessionId}: ${error instanceof Error ? error.message : String(error)}`,
               );
             }
-            if (foregroundSyncFailed) {
-              try {
-                const directListing = await getSegmentListing(
-                  model.sessionId,
-                  operation.signal,
-                  PROJECTION_REQUEST_TIMEOUT_MS,
-                );
-                return directListing.summaries;
-              } catch (error) {
-                if (
-                  operation.signal.aborted ||
-                  lifecycleAbort.signal.aborted ||
-                  deletedSessions.has(model.sessionId) ||
-                  (sessionGenerations.get(model.sessionId) ?? 0) !== generation
-                ) {
-                  throw error;
-                }
-                await log(
-                  `Reflection direct recovery listing failed for ${model.sessionId}: ${error instanceof Error ? error.message : String(error)}`,
-                );
-                return current.summaries;
+            try {
+              const directListing = await getSegmentListing(
+                model.sessionId,
+                operation.signal,
+                PROJECTION_REQUEST_TIMEOUT_MS,
+              );
+              return directListing.summaries;
+            } catch (error) {
+              if (
+                operation.signal.aborted ||
+                lifecycleAbort.signal.aborted ||
+                deletedSessions.has(model.sessionId) ||
+                (sessionGenerations.get(model.sessionId) ?? 0) !== generation
+              ) {
+                throw error;
               }
+              await log(
+                `Reflection direct summary listing failed for ${model.sessionId}: ${error instanceof Error ? error.message : String(error)}`,
+              );
+              return current.summaries;
             }
-            const deadline = Date.now() + SUMMARY_WAIT_TIMEOUT_MS;
-            return waitForRequiredSummaries(
-              model.sessionId,
-              requiredSegments,
-              deadline,
-              operation.signal,
-            );
           },
         });
         if (
@@ -1554,7 +1400,6 @@ export const Reflection: Plugin = async ({ client, directory }) => {
               result.state.checkpoint.archivedPrefixFingerprint,
             canonicalSourceFingerprint:
               result.state.checkpoint.canonicalSourceFingerprint,
-            summaryFingerprint: result.state.checkpoint.summaryFingerprint,
           });
         } else {
           sessionTurnValidations.delete(model.sessionId);
