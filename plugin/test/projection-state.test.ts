@@ -31,9 +31,22 @@ describe("ProjectionStateStore", () => {
       checkpoint: {
         tailStartMessageId: "assistant-10",
         archivedPrefixFingerprint: "a".repeat(64),
+        canonicalSourceFingerprint: "d".repeat(64),
         summaryText: "summary",
         createdAtMessageId: "user-20",
         lossy: true,
+        archivedSegments: [
+          {
+            id: "seg-1",
+            sourceFingerprint: "b".repeat(64),
+            startUserMessageId: "user-1",
+            endUserMessageId: "user-1",
+            sourceBoundaryVersion: 1 as const,
+            startSourceMessageId: null,
+            endSourceMessageId: null,
+          },
+        ],
+        summaryFingerprint: "c".repeat(64),
       },
     };
 
@@ -43,7 +56,7 @@ describe("ProjectionStateStore", () => {
     expect(
       JSON.parse(readFileSync(join(path, "session.json"), "utf8")),
     ).toMatchObject({
-      version: 3,
+      version: 4,
       state,
     });
   });
@@ -129,6 +142,32 @@ describe("ProjectionStateStore", () => {
           contextLimit: 100,
           checkpoint: {
             tailStartUserMessageId: "user-1",
+            summaryText: "summary",
+            createdAtMessageId: "user-2",
+          },
+        },
+      }),
+    );
+
+    expect(new ProjectionStateStore(path).get("session")).toEqual({
+      contextLimit: 100,
+    });
+  });
+
+  it("discards a version 3 checkpoint while preserving its context limit", () => {
+    const directory = mkdtempSync(join(tmpdir(), "reflection-projection-"));
+    directories.push(directory);
+    const path = join(directory, "projection");
+    mkdirSync(path, { recursive: true });
+    writeFileSync(
+      join(path, "session.json"),
+      JSON.stringify({
+        version: 3,
+        state: {
+          contextLimit: 100,
+          checkpoint: {
+            tailStartMessageId: "assistant-1",
+            archivedPrefixFingerprint: "a".repeat(64),
             summaryText: "summary",
             createdAtMessageId: "user-2",
           },

@@ -7,7 +7,10 @@ import {
 } from "node:fs";
 import { join } from "node:path";
 
-import type { ProjectionSessionState } from "./projection.js";
+import type {
+  ProjectionArchivedSegment,
+  ProjectionSessionState,
+} from "./projection.js";
 
 interface StoredProjectionStateV1 {
   version: 1;
@@ -29,7 +32,44 @@ interface StoredProjectionStateV2 {
 
 interface StoredProjectionStateV3 {
   version: 3;
+  state: unknown;
+}
+
+interface StoredProjectionStateV4 {
+  version: 4;
   state: ProjectionSessionState;
+}
+
+function isArchivedSegment(value: unknown): value is ProjectionArchivedSegment {
+  if (typeof value !== "object" || value === null) return false;
+  const item = value as Record<string, unknown>;
+  if (
+    typeof item.id !== "string" ||
+    item.id.length === 0 ||
+    typeof item.startUserMessageId !== "string" ||
+    item.startUserMessageId.length === 0 ||
+    typeof item.endUserMessageId !== "string" ||
+    item.endUserMessageId.length === 0 ||
+    typeof item.sourceFingerprint !== "string" ||
+    !/^[0-9a-f]{64}$/.test(item.sourceFingerprint)
+  ) {
+    return false;
+  }
+  if (item.sourceBoundaryVersion === 1) {
+    return (
+      item.startSourceMessageId === null && item.endSourceMessageId === null
+    );
+  }
+  if (item.sourceBoundaryVersion === 2) {
+    return (
+      item.startUserMessageId === item.endUserMessageId &&
+      typeof item.startSourceMessageId === "string" &&
+      item.startSourceMessageId.length > 0 &&
+      typeof item.endSourceMessageId === "string" &&
+      item.endSourceMessageId.length > 0
+    );
+  }
+  return false;
 }
 
 function isSessionState(value: unknown): value is ProjectionSessionState {
@@ -52,14 +92,18 @@ function isSessionState(value: unknown): value is ProjectionSessionState {
     checkpoint.tailStartMessageId.length > 0 &&
     typeof checkpoint.archivedPrefixFingerprint === "string" &&
     /^[0-9a-f]{64}$/.test(checkpoint.archivedPrefixFingerprint) &&
-    (checkpoint.canonicalSourceFingerprint === undefined ||
-      (typeof checkpoint.canonicalSourceFingerprint === "string" &&
-        /^[0-9a-f]{64}$/.test(checkpoint.canonicalSourceFingerprint))) &&
+    typeof checkpoint.canonicalSourceFingerprint === "string" &&
+    /^[0-9a-f]{64}$/.test(checkpoint.canonicalSourceFingerprint) &&
     typeof checkpoint.summaryText === "string" &&
     checkpoint.summaryText.length > 0 &&
     typeof checkpoint.createdAtMessageId === "string" &&
     checkpoint.createdAtMessageId.length > 0 &&
-    (checkpoint.lossy === undefined || typeof checkpoint.lossy === "boolean")
+    (checkpoint.lossy === undefined || typeof checkpoint.lossy === "boolean") &&
+    typeof checkpoint.summaryFingerprint === "string" &&
+    /^[0-9a-f]{64}$/.test(checkpoint.summaryFingerprint) &&
+    Array.isArray(checkpoint.archivedSegments) &&
+    checkpoint.archivedSegments.length > 0 &&
+    checkpoint.archivedSegments.every(isArchivedSegment)
   );
 }
 
@@ -91,11 +135,14 @@ export class ProjectionStateStore {
         | StoredProjectionStateV1
         | StoredProjectionStateV2
         | StoredProjectionStateV3
+        | StoredProjectionStateV4
       >;
-      if (stored.version === 3) {
+      if (stored.version === 4) {
         return isSessionState(stored.state) ? stored.state : undefined;
       }
-      return stored.version === 1 || stored.version === 2
+      return stored.version === 1 ||
+        stored.version === 2 ||
+        stored.version === 3
         ? legacyContextLimit(stored.state)
         : undefined;
     } catch {}
@@ -106,7 +153,7 @@ export class ProjectionStateStore {
     mkdirSync(this.directory, { recursive: true, mode: 0o700 });
     const path = this.path(sessionId);
     const temporary = `${path}.${process.pid}.tmp`;
-    const value: StoredProjectionStateV3 = { version: 3, state };
+    const value: StoredProjectionStateV4 = { version: 4, state };
     try {
       writeFileSync(temporary, `${JSON.stringify(value, null, 2)}\n`, {
         encoding: "utf8",

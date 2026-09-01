@@ -34,8 +34,12 @@ import {
 } from "./http.js";
 import {
   activeModel,
+  isNewUserTurn,
+  latestUserMessage,
   projectMessages,
   projectionSourcesFingerprint,
+  projectionSummaryFingerprint,
+  toProjectionArchivedSegment,
   type StoredSegmentSummary,
 } from "./projection.js";
 import { ProjectionStateStore } from "./projection-state.js";
@@ -422,6 +426,16 @@ export const Reflection: Plugin = async ({ client, directory }) => {
     Map<string, { fingerprint: string; processingPriority: number }>
   >();
   const deletedSessions = new Set<string>();
+  const sessionTurnValidations = new Map<
+    string,
+    {
+      latestUserMessageId: string;
+      tailStartMessageId: string;
+      archivedPrefixFingerprint: string;
+      canonicalSourceFingerprint: string;
+      summaryFingerprint: string;
+    }
+  >();
   const synchronizeSuccessfulFingerprints = (
     sessionId: string,
     listing: SegmentListing,
@@ -865,9 +879,22 @@ export const Reflection: Plugin = async ({ client, directory }) => {
     requiredSegments: readonly ReflectionSegment[],
     deadline = Date.now() + SUMMARY_WAIT_TIMEOUT_MS,
     signal?: AbortSignal,
+    bypassTargetUpdateBarrier = false,
   ): Promise<readonly StoredSegmentSummary[]> => {
     while (true) {
-      const listing = await getFreshSegmentListing(sessionId, deadline, signal);
+      let listing: SegmentListing;
+      if (bypassTargetUpdateBarrier) {
+        listing = await getSegmentListing(
+          sessionId,
+          signal,
+          Math.max(
+            1,
+            Math.min(PROJECTION_REQUEST_TIMEOUT_MS, deadline - Date.now()),
+          ),
+        );
+      } else {
+        listing = await getFreshSegmentListing(sessionId, deadline, signal);
+      }
       const missing = requiredSegments.filter(
         (segment) =>
           exactSummaryForSegment(sessionId, listing.summaries, segment) ===
@@ -1238,6 +1265,7 @@ export const Reflection: Plugin = async ({ client, directory }) => {
         automaticRetries.delete(sessionId);
         inactiveSessionChecks.delete(sessionId);
         projectionState.delete(sessionId);
+        sessionTurnValidations.delete(sessionId);
         return;
       }
       const sessionId =
@@ -1284,6 +1312,8 @@ export const Reflection: Plugin = async ({ client, directory }) => {
       });
       activeProjections.add(projectionCompletion);
       try {
+        const latestUser = latestUserMessage(messages);
+        const currentTurnUserMessageId = latestUser?.info.id;
         const previous = projectionState.get(model.sessionId);
         const limits = await getModelLimits(
           model.providerId,
@@ -1316,68 +1346,140 @@ export const Reflection: Plugin = async ({ client, directory }) => {
               ),
           ));
         let foregroundSync: Promise<IngestionResult> | undefined;
+
+        const validatedTurn = currentTurnUserMessageId
+          ? sessionTurnValidations.get(model.sessionId)
+          : undefined;
+        const isSameTurnAsValidated =
+          !isNewUserTurn(messages) &&
+          validatedTurn !== undefined &&
+          currentTurnUserMessageId !== undefined &&
+          validatedTurn.latestUserMessageId === currentTurnUserMessageId &&
+          previous?.checkpoint !== undefined &&
+          validatedTurn.tailStartMessageId ===
+            previous.checkpoint.tailStartMessageId &&
+          validatedTurn.archivedPrefixFingerprint ===
+            previous.checkpoint.archivedPrefixFingerprint &&
+          validatedTurn.canonicalSourceFingerprint ===
+            previous.checkpoint.canonicalSourceFingerprint &&
+          validatedTurn.summaryFingerprint ===
+            previous.checkpoint.summaryFingerprint;
+
         const result = await projectMessages({
           messages,
           ...limits,
           previous,
-          validateCheckpoint: async (checkpoint) => {
-            if (!checkpoint.canonicalSourceFingerprint) return false;
-            const current = await listing();
-            if (!current) return true;
-            const plan = await loadCanonicalPlan();
-            const tailSegmentIndex = plan.findIndex(
-              (segment) =>
-                segment.startMessageId === checkpoint.tailStartMessageId,
-            );
-            if (tailSegmentIndex < 0) return false;
-            const archivedSegments = plan.slice(0, tailSegmentIndex);
-            if (!archivedSegments.every((segment) => segment.closed)) {
-              return false;
-            }
-            const expectedSources = new Map(
-              archivedSegments.map((segment) => {
-                const body = submissionBody(model.sessionId, segment, 0);
-                return [
-                  segmentIdForRequest(body),
-                  submissionSourceFingerprint(model.sessionId, segment),
-                ] as const;
-              }),
-            );
-            for (const [segmentId, expected] of expectedSources) {
-              const target = current.targets.find(
-                (entry) => entry.id === segmentId,
-              );
-              if (target) {
+          skipPrefixFingerprint: isSameTurnAsValidated,
+          validateCheckpoint: isSameTurnAsValidated
+            ? undefined
+            : async (checkpoint) => {
+                const current = await listing();
+                if (!current) return true;
+
+                const currentSummaryFp = projectionSummaryFingerprint(
+                  checkpoint.archivedSegments,
+                  current.summaries,
+                );
+                if (currentSummaryFp !== checkpoint.summaryFingerprint) {
+                  return false;
+                }
+                let canUseFastCheck = true;
+                for (const seg of checkpoint.archivedSegments) {
+                  const target = current.targets.find(
+                    (entry) => entry.id === seg.id,
+                  );
+                  if (target) {
+                    if (target.sourceFingerprint !== seg.sourceFingerprint) {
+                      return false;
+                    }
+                    continue;
+                  }
+                  const knownBoundaries = current.boundaries.filter(
+                    (entry) =>
+                      entry.id === seg.id &&
+                      entry.sourceFingerprint !== undefined,
+                  );
+                  if (knownBoundaries.length > 0) {
+                    if (
+                      !knownBoundaries.some(
+                        (entry) =>
+                          entry.sourceFingerprint === seg.sourceFingerprint,
+                      )
+                    ) {
+                      return false;
+                    }
+                    continue;
+                  }
+                  canUseFastCheck = false;
+                  break;
+                }
+                if (canUseFastCheck) {
+                  return true;
+                }
+
+                const plan = await loadCanonicalPlan();
+                const tailSegmentIndex = plan.findIndex(
+                  (segment) =>
+                    segment.startMessageId === checkpoint.tailStartMessageId,
+                );
+                if (tailSegmentIndex < 0) return false;
+                const archivedSegments = plan.slice(0, tailSegmentIndex);
+                if (!archivedSegments.every((segment) => segment.closed)) {
+                  return false;
+                }
+                const expectedSources = new Map(
+                  archivedSegments.map((segment) => {
+                    const body = submissionBody(model.sessionId, segment, 0);
+                    return [
+                      segmentIdForRequest(body),
+                      submissionSourceFingerprint(model.sessionId, segment),
+                    ] as const;
+                  }),
+                );
+                for (const [segmentId, expected] of expectedSources) {
+                  const target = current.targets.find(
+                    (entry) => entry.id === segmentId,
+                  );
+                  if (target) {
+                    if (target.sourceFingerprint !== expected) {
+                      return false;
+                    }
+                    continue;
+                  }
+                  const knownBoundaries = current.boundaries.filter(
+                    (entry) =>
+                      entry.id === segmentId &&
+                      entry.sourceFingerprint !== undefined,
+                  );
+                  if (
+                    knownBoundaries.length > 0 &&
+                    !knownBoundaries.some(
+                      (entry) => entry.sourceFingerprint === expected,
+                    )
+                  ) {
+                    return false;
+                  }
+                }
                 if (
-                  target.sourceFingerprint !== expected ||
-                  target.status === "failed" ||
-                  target.status === "superseded"
+                  projectionSourcesFingerprint({
+                    sessionId: model.sessionId,
+                    archivedSegments,
+                  }) !== checkpoint.canonicalSourceFingerprint
                 ) {
                   return false;
                 }
-                continue;
-              }
-              const knownBoundaries = current.boundaries.filter(
-                (entry) =>
-                  entry.id === segmentId &&
-                  entry.sourceFingerprint !== undefined,
-              );
-              if (
-                knownBoundaries.length > 0 &&
-                !knownBoundaries.some(
-                  (entry) => entry.sourceFingerprint === expected,
-                )
-              ) {
-                return false;
-              }
-            }
-            return (
-              projectionSourcesFingerprint({
-                sessionId: model.sessionId,
-                archivedSegments,
-              }) === checkpoint.canonicalSourceFingerprint
-            );
-          },
+                if (
+                  projectionSummaryFingerprint(
+                    archivedSegments.map((segment) =>
+                      toProjectionArchivedSegment(model.sessionId, segment),
+                    ),
+                    current.summaries,
+                  ) !== checkpoint.summaryFingerprint
+                ) {
+                  return false;
+                }
+                return true;
+              },
           loadCanonicalSegments: loadCanonicalPlan,
           loadSummaries: async (requiredSegments) => {
             const current = await listing();
@@ -1400,15 +1502,32 @@ export const Reflection: Plugin = async ({ client, directory }) => {
                 `segment summaries timed out after ${SUMMARY_WAIT_TIMEOUT_MS}ms`,
               );
             }
-            await waitWithin(
-              foregroundSync.then(() => {}),
-              remaining,
-            );
+            let foregroundSyncFailed = false;
+            try {
+              await waitWithin(
+                foregroundSync.then(() => {}),
+                remaining,
+              );
+            } catch (error) {
+              if (
+                operation.signal.aborted ||
+                lifecycleAbort.signal.aborted ||
+                deletedSessions.has(model.sessionId) ||
+                (sessionGenerations.get(model.sessionId) ?? 0) !== generation
+              ) {
+                throw error;
+              }
+              foregroundSyncFailed = true;
+              await log(
+                `Reflection foreground target sync failed for ${model.sessionId}: ${error instanceof Error ? error.message : String(error)}`,
+              );
+            }
             return waitForRequiredSummaries(
               model.sessionId,
               requiredSegments,
               deadline,
               operation.signal,
+              foregroundSyncFailed,
             );
           },
         });
@@ -1423,6 +1542,19 @@ export const Reflection: Plugin = async ({ client, directory }) => {
         }
         if (JSON.stringify(previous) !== JSON.stringify(result.state)) {
           projectionState.set(model.sessionId, result.state);
+        }
+        if (result.state.checkpoint && currentTurnUserMessageId) {
+          sessionTurnValidations.set(model.sessionId, {
+            latestUserMessageId: currentTurnUserMessageId,
+            tailStartMessageId: result.state.checkpoint.tailStartMessageId,
+            archivedPrefixFingerprint:
+              result.state.checkpoint.archivedPrefixFingerprint,
+            canonicalSourceFingerprint:
+              result.state.checkpoint.canonicalSourceFingerprint,
+            summaryFingerprint: result.state.checkpoint.summaryFingerprint,
+          });
+        } else {
+          sessionTurnValidations.delete(model.sessionId);
         }
         output.messages.splice(
           0,

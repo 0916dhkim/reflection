@@ -2240,9 +2240,10 @@ describe("Reflection plugin hooks", () => {
     expect(targetPosts).toBe(2);
   });
 
-  it("makes reset lossy without GET when initial closed sync fails", async () => {
+  it("recovers available listing summaries when initial closed sync fails", async () => {
     const sessionId = "reset-sync-failure-session";
     const messages = projectionMessages(sessionId);
+    const closed = segmentMessages(messages)[0]!;
     const client = clientFor(messages);
     const submittedBodies: Array<Record<string, unknown>> = [];
     let summaryGets = 0;
@@ -2256,8 +2257,8 @@ describe("Reflection plugin hooks", () => {
         summaryGets += 1;
         return ok({
           session_id: sessionId,
-          segments: [],
-          boundaries: [],
+          segments: [segmentSummary(sessionId, closed, "Recovered summary")],
+          boundaries: [segmentBoundary(sessionId, closed)],
           targets: [],
         });
       }),
@@ -2267,7 +2268,7 @@ describe("Reflection plugin hooks", () => {
 
     await hooks["experimental.chat.messages.transform"]?.({}, output as never);
 
-    expect(summaryGets).toBe(1);
+    expect(summaryGets).toBe(2);
     expect(submittedBodies).toHaveLength(1);
     expect(submittedBodies[0]).toMatchObject({
       start_user_message_id: `${sessionId}-old-user`,
@@ -2277,7 +2278,8 @@ describe("Reflection plugin hooks", () => {
         start_user_message_id: `${sessionId}-current`,
       }),
     );
-    expect(output.messages[1]?.parts[0]?.text).toContain(
+    expect(output.messages[1]?.parts[0]?.text).toContain("Recovered summary");
+    expect(output.messages[1]?.parts[0]?.text).not.toContain(
       "Reflection summaries were unavailable",
     );
   });
@@ -2323,14 +2325,14 @@ describe("Reflection plugin hooks", () => {
     await vi.advanceTimersByTimeAsync(5_000);
     await projection;
 
-    expect(summaryGets).toBe(1);
+    expect(summaryGets).toBe(2);
     expect(submittedBodies).not.toContainEqual(
       expect.objectContaining({
         start_user_message_id: `${sessionId}-current`,
       }),
     );
     expect(output.messages[1]?.parts[0]?.text).toContain(
-      "Reflection summaries were unavailable",
+      "archived closed segments had no exact committed Reflection summary",
     );
   });
 
@@ -2371,9 +2373,9 @@ describe("Reflection plugin hooks", () => {
     await hooks["experimental.chat.messages.transform"]?.({}, output as never);
 
     expect(targetPosts).toBe(2);
-    expect(summaryGets).toBe(2);
+    expect(summaryGets).toBe(3);
     expect(output.messages[1]?.parts[0]?.text).toContain(
-      "Reflection summaries were unavailable",
+      "archived closed segments had no exact committed Reflection summary",
     );
   });
 
@@ -3043,9 +3045,9 @@ describe("Reflection plugin hooks", () => {
     await vi.advanceTimersByTimeAsync(10_000);
     await Promise.all([idle, projection]);
 
-    expect(summaryGets).toBe(2);
+    expect(summaryGets).toBe(3);
     expect(output.messages[1]?.parts[0]?.text).toContain(
-      "Reflection summaries were unavailable",
+      "archived closed segments had no exact committed Reflection summary",
     );
   });
 
@@ -3114,5 +3116,558 @@ describe("Reflection plugin hooks", () => {
       } as never),
     ).resolves.toBeUndefined();
     expect(client.session.prompt).not.toHaveBeenCalled();
+  });
+
+  it.each(["failed", "superseded"] as const)(
+    "does not invalidate or rebuild a checkpoint when a matching target is %s",
+    async (status) => {
+      const sessionId = `${status}-target-reuse-session`;
+      const messages = projectionMessages(sessionId);
+      const closed = segmentMessages(messages)[0]!;
+      const client = clientFor(messages);
+      let targetPosts = 0;
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+          if (init?.method === "POST") {
+            targetPosts += 1;
+            return acceptedSegment(init);
+          }
+          return ok({
+            session_id: sessionId,
+            segments: [],
+            boundaries: [],
+            targets: [
+              {
+                id: segmentId(sessionId, closed),
+                start_user_message_id: closed.startUserMessageId,
+                end_user_message_id: closed.endUserMessageId,
+                ...segmentWireBoundary(closed),
+                projection_version: 1,
+                status,
+                source_fingerprint: submissionSourceFingerprint(
+                  sessionId,
+                  closed,
+                ),
+              },
+            ],
+          });
+        }),
+      );
+      const hooks = await Reflection(pluginInput(client));
+
+      // Turn 1: initial projection creates checkpoint
+      await hooks["experimental.chat.messages.transform"]?.({}, {
+        messages: structuredClone(messages),
+      } as never);
+      expect(targetPosts).toBe(1);
+      expect(client.session.messages).toHaveBeenCalledOnce();
+
+      // Turn 2: new user turn with different user message ID
+      const turn2Messages = structuredClone(messages);
+      turn2Messages.push({
+        info: {
+          id: `${sessionId}-turn-2`,
+          sessionID: sessionId,
+          role: "user",
+          agent: "build",
+          model: { providerID: "provider", modelID: "model" },
+        },
+        parts: [{ type: "text", text: "next turn" }],
+      });
+
+      await hooks["experimental.chat.messages.transform"]?.({}, {
+        messages: turn2Messages,
+      } as never);
+
+      // Should NOT rebuild (targetPosts remains 1)
+      expect(targetPosts).toBe(1);
+      expect(client.session.messages).toHaveBeenCalledOnce();
+
+      // Turn 3: another user turn
+      const turn3Messages = structuredClone(turn2Messages);
+      turn3Messages.push({
+        info: {
+          id: `${sessionId}-turn-3`,
+          sessionID: sessionId,
+          role: "user",
+          agent: "build",
+          model: { providerID: "provider", modelID: "model" },
+        },
+        parts: [{ type: "text", text: "third turn" }],
+      });
+
+      await hooks["experimental.chat.messages.transform"]?.({}, {
+        messages: turn3Messages,
+      } as never);
+
+      // Checkpoint still reused without rebuild
+      expect(targetPosts).toBe(1);
+      expect(client.session.messages).toHaveBeenCalledOnce();
+    },
+  );
+
+  it("validates listing and prefix only once per user turn during tool loops", async () => {
+    const sessionId = "tool-loop-single-validation";
+    const messages = projectionMessages(sessionId);
+    const closed = segmentMessages(messages)[0]!;
+    const client = clientFor(messages);
+    let summaryGets = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+        if (init?.method === "POST") return acceptedSegment(init);
+        summaryGets += 1;
+        return ok({
+          session_id: sessionId,
+          segments: [segmentSummary(sessionId, closed, "Summary 1")],
+          boundaries: [segmentBoundary(sessionId, closed)],
+          targets: [],
+        });
+      }),
+    );
+    const hooks = await Reflection(pluginInput(client));
+
+    // Initial transform (turn 1 creation)
+    const turn1UserMessages = structuredClone(messages);
+    await hooks["experimental.chat.messages.transform"]?.({}, {
+      messages: turn1UserMessages,
+    } as never);
+    const getsAfterTurn1Start = summaryGets;
+    expect(getsAfterTurn1Start).toBe(2);
+
+    // Turn 1 first tool loop step: assistant with tool call added
+    const turn1Step1 = structuredClone(turn1UserMessages);
+    turn1Step1.push({
+      info: {
+        id: `${sessionId}-assistant-tool-1`,
+        sessionID: sessionId,
+        role: "assistant",
+        parentID: `${sessionId}-current`,
+        providerID: "provider",
+        modelID: "model",
+        time: { created: 10, completed: 11 },
+        finish: "tool-calls",
+      },
+      parts: [
+        {
+          type: "tool",
+          tool: "bash",
+          state: {
+            status: "completed",
+            input: { command: "ls" },
+            output: "file.txt",
+          },
+        },
+      ],
+    });
+
+    await hooks["experimental.chat.messages.transform"]?.({}, {
+      messages: turn1Step1,
+    } as never);
+
+    // Fast path: no listing GET performed during tool loop continuation
+    expect(summaryGets).toBe(getsAfterTurn1Start);
+
+    // Turn 1 second tool loop step: another assistant message added
+    const turn1Step2 = structuredClone(turn1Step1);
+    turn1Step2.push({
+      info: {
+        id: `${sessionId}-assistant-tool-2`,
+        sessionID: sessionId,
+        role: "assistant",
+        parentID: `${sessionId}-current`,
+        providerID: "provider",
+        modelID: "model",
+        time: { created: 12, completed: 13 },
+        finish: "tool-calls",
+      },
+      parts: [
+        {
+          type: "tool",
+          tool: "read",
+          state: {
+            status: "completed",
+            input: { file: "file.txt" },
+            output: "hello",
+          },
+        },
+      ],
+    });
+
+    await hooks["experimental.chat.messages.transform"]?.({}, {
+      messages: turn1Step2,
+    } as never);
+
+    // Still no additional GET during tool loop
+    expect(summaryGets).toBe(getsAfterTurn1Start);
+
+    // Now a new user turn starts
+    const turn2Messages = structuredClone(turn1Step2);
+    turn2Messages.push({
+      info: {
+        id: `${sessionId}-turn-2`,
+        sessionID: sessionId,
+        role: "user",
+        agent: "build",
+        model: { providerID: "provider", modelID: "model" },
+      },
+      parts: [{ type: "text", text: "continue with next task" }],
+    });
+
+    await hooks["experimental.chat.messages.transform"]?.({}, {
+      messages: turn2Messages,
+    } as never);
+
+    // Validated once for new user turn (listing GET called 1 time)
+    expect(summaryGets).toBe(getsAfterTurn1Start + 1);
+  });
+
+  it("invalidates exactly once and includes a previously missing summary when it appears on a later turn", async () => {
+    const sessionId = "missing-summary-appears-session";
+    const messages = projectionMessages(sessionId);
+    const closed = segmentMessages(messages)[0]!;
+    const client = clientFor(messages);
+    let summaryPresent = false;
+    let targetPosts = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+        if (init?.method === "POST") {
+          targetPosts += 1;
+          return acceptedSegment(init);
+        }
+        return ok({
+          session_id: sessionId,
+          segments: summaryPresent
+            ? [segmentSummary(sessionId, closed, "Newly ready summary")]
+            : [],
+          boundaries: [segmentBoundary(sessionId, closed)],
+          targets: [],
+        });
+      }),
+    );
+    const hooks = await Reflection(pluginInput(client));
+
+    // Turn 1: summary is missing
+    const output1 = { messages: structuredClone(messages) };
+    await hooks["experimental.chat.messages.transform"]?.({}, output1 as never);
+    expect(targetPosts).toBe(1);
+    expect(client.session.messages).toHaveBeenCalledOnce();
+    expect(output1.messages[1]?.parts[0]?.text).not.toContain(
+      "Newly ready summary",
+    );
+    expect(output1.messages[1]?.parts[0]?.text).toContain(
+      "archived closed segments had no exact committed Reflection summary",
+    );
+
+    // Turn 2: summary is still missing
+    const turn2Messages = structuredClone(messages);
+    turn2Messages.push({
+      info: {
+        id: `${sessionId}-user-turn-2`,
+        sessionID: sessionId,
+        role: "user",
+        agent: "build",
+        model: { providerID: "provider", modelID: "model" },
+      },
+      parts: [{ type: "text", text: "second prompt" }],
+    });
+    const output2 = { messages: structuredClone(turn2Messages) };
+    await hooks["experimental.chat.messages.transform"]?.({}, output2 as never);
+    expect(output2.messages[1]?.parts[0]?.text).not.toContain(
+      "Newly ready summary",
+    );
+    expect(client.session.messages).toHaveBeenCalledOnce();
+
+    // Turn 3: summary is NOW ready on server
+    summaryPresent = true;
+    const turn3Messages = structuredClone(turn2Messages);
+    turn3Messages.push({
+      info: {
+        id: `${sessionId}-user-turn-3`,
+        sessionID: sessionId,
+        role: "user",
+        agent: "build",
+        model: { providerID: "provider", modelID: "model" },
+      },
+      parts: [{ type: "text", text: "third prompt" }],
+    });
+    const output3 = { messages: structuredClone(turn3Messages) };
+    await hooks["experimental.chat.messages.transform"]?.({}, output3 as never);
+    // Rebuilt once with the newly available summary
+    expect(output3.messages[1]?.parts[0]?.text).toContain(
+      "Newly ready summary",
+    );
+    expect(output3.messages[1]?.parts[0]?.text).not.toContain(
+      "archived closed segments had no exact committed Reflection summary",
+    );
+    expect(client.session.messages).toHaveBeenCalledTimes(2);
+
+    // Turn 4: summary is still the same
+    const turn4Messages = structuredClone(turn3Messages);
+    turn4Messages.push({
+      info: {
+        id: `${sessionId}-user-turn-4`,
+        sessionID: sessionId,
+        role: "user",
+        agent: "build",
+        model: { providerID: "provider", modelID: "model" },
+      },
+      parts: [{ type: "text", text: "fourth prompt" }],
+    });
+    const output4 = { messages: structuredClone(turn4Messages) };
+    await hooks["experimental.chat.messages.transform"]?.({}, output4 as never);
+    // Checkpoint is reused without rebuilding again
+    expect(output4.messages[1]?.parts[0]?.text).toContain(
+      "Newly ready summary",
+    );
+    expect(client.session.messages).toHaveBeenCalledTimes(2);
+  });
+
+  it("invalidates exactly once when an included summary content changes", async () => {
+    const sessionId = "summary-changed-session";
+    const messages = projectionMessages(sessionId);
+    const closed = segmentMessages(messages)[0]!;
+    const client = clientFor(messages);
+    let summaryText = "Initial summary v1";
+    let targetPosts = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+        if (init?.method === "POST") {
+          targetPosts += 1;
+          return acceptedSegment(init);
+        }
+        return ok({
+          session_id: sessionId,
+          segments: [segmentSummary(sessionId, closed, summaryText)],
+          boundaries: [segmentBoundary(sessionId, closed)],
+          targets: [],
+        });
+      }),
+    );
+    const hooks = await Reflection(pluginInput(client));
+
+    // Turn 1
+    const output1 = { messages: structuredClone(messages) };
+    await hooks["experimental.chat.messages.transform"]?.({}, output1 as never);
+    expect(targetPosts).toBe(1);
+    expect(output1.messages[1]?.parts[0]?.text).toContain("Initial summary v1");
+    expect(client.session.messages).toHaveBeenCalledOnce();
+
+    // Turn 2: same summary text
+    const turn2Messages = structuredClone(messages);
+    turn2Messages.push({
+      info: {
+        id: `${sessionId}-u2`,
+        sessionID: sessionId,
+        role: "user",
+        agent: "build",
+        model: { providerID: "provider", modelID: "model" },
+      },
+      parts: [{ type: "text", text: "turn 2" }],
+    });
+    const output2 = { messages: structuredClone(turn2Messages) };
+    await hooks["experimental.chat.messages.transform"]?.({}, output2 as never);
+    expect(output2.messages[1]?.parts[0]?.text).toContain("Initial summary v1");
+    expect(client.session.messages).toHaveBeenCalledOnce();
+
+    // Turn 3: summary text changed on server
+    summaryText = "Updated summary v2 with edits";
+    const turn3Messages = structuredClone(turn2Messages);
+    turn3Messages.push({
+      info: {
+        id: `${sessionId}-u3`,
+        sessionID: sessionId,
+        role: "user",
+        agent: "build",
+        model: { providerID: "provider", modelID: "model" },
+      },
+      parts: [{ type: "text", text: "turn 3" }],
+    });
+    const output3 = { messages: structuredClone(turn3Messages) };
+    await hooks["experimental.chat.messages.transform"]?.({}, output3 as never);
+    expect(output3.messages[1]?.parts[0]?.text).toContain(
+      "Updated summary v2 with edits",
+    );
+    expect(client.session.messages).toHaveBeenCalledTimes(2);
+
+    // Turn 4: unchanged
+    const turn4Messages = structuredClone(turn3Messages);
+    turn4Messages.push({
+      info: {
+        id: `${sessionId}-u4`,
+        sessionID: sessionId,
+        role: "user",
+        agent: "build",
+        model: { providerID: "provider", modelID: "model" },
+      },
+      parts: [{ type: "text", text: "turn 4" }],
+    });
+    const output4 = { messages: structuredClone(turn4Messages) };
+    await hooks["experimental.chat.messages.transform"]?.({}, output4 as never);
+    expect(output4.messages[1]?.parts[0]?.text).toContain(
+      "Updated summary v2 with edits",
+    );
+    expect(client.session.messages).toHaveBeenCalledTimes(2);
+  });
+
+  it("preserves completed summaries when foreground sync fails and does not report total unavailable", async () => {
+    const sessionId = "partial-summary-recovery-session";
+    const raw = siblingProjectionMessages(sessionId);
+    const segments = segmentMessages(raw);
+    const firstSegment = segments[0]!;
+    const secondSegment = segments[1]!;
+    const visibleAssistant = raw.find(
+      (message) => message.info.id === `${sessionId}-step-2`,
+    );
+    visibleAssistant!.info.tokens = {
+      input: 100_000,
+      output: 1_000,
+      reasoning: 0,
+      cache: { read: 0, write: 0 },
+    };
+    const client = clientFor(raw);
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+        if (init?.method === "POST") {
+          return new Response("failed", { status: 500 });
+        }
+        return ok({
+          session_id: sessionId,
+          segments: [
+            segmentSummary(sessionId, firstSegment, "First completed summary"),
+          ],
+          boundaries: [segmentBoundary(sessionId, firstSegment)],
+          targets: [
+            {
+              id: segmentId(sessionId, secondSegment),
+              start_user_message_id: secondSegment.startUserMessageId,
+              end_user_message_id: secondSegment.endUserMessageId,
+              ...segmentWireBoundary(secondSegment),
+              projection_version: 1,
+              status: "failed",
+              source_fingerprint: submissionSourceFingerprint(
+                sessionId,
+                secondSegment,
+              ),
+            },
+          ],
+        });
+      }),
+    );
+    const hooks = await Reflection(pluginInput(client));
+    const output = { messages: structuredClone(raw) };
+
+    await hooks["experimental.chat.messages.transform"]?.({}, output as never);
+
+    expect(output.messages[1]?.parts[0]?.text).toContain(
+      "First completed summary",
+    );
+    expect(output.messages[1]?.parts[0]?.text).not.toContain(
+      "Reflection summaries were unavailable",
+    );
+  });
+
+  it("falls back to canonical plan validation when manifest lacks authoritative entries for an archived segment", async () => {
+    const sessionId = "fallback-canonical-manifest-session";
+    const messages = projectionMessages(sessionId);
+    const closed = segmentMessages(messages)[0]!;
+    const client = clientFor(messages);
+    let targetPosts = 0;
+    let manifestHasBoundaries = true;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+        if (init?.method === "POST") {
+          targetPosts += 1;
+          return acceptedSegment(init);
+        }
+        return ok({
+          session_id: sessionId,
+          segments: [segmentSummary(sessionId, closed, "Summary text")],
+          boundaries: manifestHasBoundaries
+            ? [segmentBoundary(sessionId, closed)]
+            : [],
+          targets: [],
+        });
+      }),
+    );
+    const hooks = await Reflection(pluginInput(client));
+
+    // Turn 1: create checkpoint
+    await hooks["experimental.chat.messages.transform"]?.({}, {
+      messages: structuredClone(messages),
+    } as never);
+    expect(targetPosts).toBe(1);
+    expect(client.session.messages).toHaveBeenCalledOnce();
+
+    // Turn 2: manifest lacks boundaries/targets
+    manifestHasBoundaries = false;
+    client.session.messages.mockClear();
+
+    const turn2Messages = structuredClone(messages);
+    turn2Messages.push({
+      info: {
+        id: `${sessionId}-user-turn-2`,
+        sessionID: sessionId,
+        role: "user",
+        agent: "build",
+        model: { providerID: "provider", modelID: "model" },
+      },
+      parts: [{ type: "text", text: "turn 2" }],
+    });
+
+    await hooks["experimental.chat.messages.transform"]?.({}, {
+      messages: turn2Messages,
+    } as never);
+
+    // Falls back to canonical plan loading
+    expect(client.session.messages).toHaveBeenCalledOnce();
+    expect(targetPosts).toBe(1);
+  });
+
+  it("clears per-turn validation state on session.deleted", async () => {
+    const sessionId = "session-deleted-turn-cache";
+    const messages = projectionMessages(sessionId);
+    const closed = segmentMessages(messages)[0]!;
+    const client = clientFor(messages);
+    let summaryGets = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+        if (init?.method === "POST") return acceptedSegment(init);
+        summaryGets += 1;
+        return ok({
+          session_id: sessionId,
+          segments: [segmentSummary(sessionId, closed, "Summary")],
+          boundaries: [segmentBoundary(sessionId, closed)],
+          targets: [],
+        });
+      }),
+    );
+    const hooks = await Reflection(pluginInput(client));
+
+    await hooks["experimental.chat.messages.transform"]?.({}, {
+      messages: structuredClone(messages),
+    } as never);
+    expect(summaryGets).toBe(2);
+
+    // Delete session
+    await hooks.event?.({
+      event: {
+        type: "session.deleted",
+        properties: { info: { id: sessionId } },
+      },
+    } as never);
+
+    // Verify transform on deleted session throws
+    await expect(
+      hooks["experimental.chat.messages.transform"]?.({}, {
+        messages: structuredClone(messages),
+      } as never),
+    ).rejects.toThrow("was deleted");
   });
 });
