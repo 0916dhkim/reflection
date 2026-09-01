@@ -120,11 +120,36 @@ export interface ClaimedJob {
   extractionResult: ValidatedExtractionResult | null;
 }
 
+export interface RetryFailedJobOptions {
+  readonly restartExtraction?: boolean;
+}
+
 export class JobNotRetryableError extends Error {
   constructor(message: string) {
     super(message);
     this.name = "JobNotRetryableError";
   }
+}
+
+interface LockedFailedJobRow extends QueryResultRow {
+  id: PgBigInt;
+  segment_id: string;
+  session_id: string;
+  start_user_message_id: string;
+  status: string;
+  lease_id: string | null;
+  source_generation: PgBigInt;
+  source_fingerprint: string | null;
+  projection_version: number;
+  end_user_message_id: string;
+  source_boundary_version: number;
+  start_source_message_id: string | null;
+  end_source_message_id: string | null;
+}
+
+interface LockedFailedTargetJobContext {
+  readonly job: LockedFailedJobRow;
+  readonly target: TargetRow;
 }
 
 interface JobResponseRow extends QueryResultRow {
@@ -466,6 +491,36 @@ function targetMatchesRequest(
   } catch {
     return false;
   }
+}
+
+export function failedTargetMatchesJob(
+  target: TargetRow | undefined,
+  job: LockedFailedJobRow,
+): target is TargetRow {
+  if (
+    target === undefined ||
+    !sameBigInt(target.job_id, job.id) ||
+    !sameBigInt(target.source_generation, job.source_generation) ||
+    target.source_fingerprint !== job.source_fingerprint ||
+    target.projection_version !== job.projection_version
+  ) {
+    return false;
+  }
+  let targetSource: SegmentCreate;
+  try {
+    targetSource = targetRequest(target);
+  } catch {
+    return false;
+  }
+  return (
+    boundaryMatchesRequest(target, targetSource) &&
+    boundaryMatchesRequest(job, targetSource) &&
+    targetSource.projection_version === job.projection_version &&
+    targetSource.session_id === job.session_id &&
+    targetSource.start_user_message_id === job.start_user_message_id &&
+    segmentIdForRequest(targetSource) === job.segment_id &&
+    sourceFingerprint(targetSource) === job.source_fingerprint
+  );
 }
 
 function targetMatchesJob(
@@ -1377,101 +1432,98 @@ export class Database {
     });
   }
 
-  async retryFailedJob(jobId: number): Promise<JobResponse | null> {
-    return this.#withTransaction(async (connection) => {
-      const segment = (
-        await connection.query<{ segment_id: string } & QueryResultRow>(
-          "SELECT segment_id FROM extraction_jobs WHERE id = $1",
-          [jobId],
-        )
-      ).rows[0];
-      if (segment === undefined) return null;
+  static async #lockCurrentFailedTargetJob(
+    connection: ReservedClient,
+    jobId: number,
+  ): Promise<LockedFailedTargetJobContext | null> {
+    const segment = (
+      await connection.query<{ segment_id: string } & QueryResultRow>(
+        "SELECT segment_id FROM extraction_jobs WHERE id = $1",
+        [jobId],
+      )
+    ).rows[0];
+    if (segment === undefined) return null;
 
-      await Database.#lockSegment(connection, segment.segment_id);
-      const job = (
-        await connection.query<
-          QueryResultRow & {
-            id: PgBigInt;
-            segment_id: string;
-            session_id: string;
-            start_user_message_id: string;
-            status: string;
-            lease_id: string | null;
-            source_generation: PgBigInt;
-            source_fingerprint: string | null;
-            projection_version: number;
-            end_user_message_id: string;
-            source_boundary_version: number;
-            start_source_message_id: string | null;
-            end_source_message_id: string | null;
-          }
-        >(
+    await Database.#lockSegment(connection, segment.segment_id);
+    const job = (
+      await connection.query<LockedFailedJobRow>(
+        `
+        SELECT id, segment_id, session_id, start_user_message_id, status,
+               lease_id, source_generation, source_fingerprint,
+               projection_version, end_user_message_id,
+               source_boundary_version, start_source_message_id,
+               end_source_message_id
+        FROM extraction_jobs
+        WHERE id = $1
+        FOR UPDATE
+        `,
+        [jobId],
+      )
+    ).rows[0];
+    if (job === undefined) return null;
+
+    const target = (
+      await connection.query<TargetRow>(
+        `
+        SELECT job_id, end_user_message_id, source_boundary_version,
+               start_source_message_id, end_source_message_id,
+               projection_version, payload, source_generation,
+               source_fingerprint, extraction_result,
+               extraction_validation_version,
+               extraction_validation_fingerprint,
+               summary_commit_fingerprint, processing_priority
+        FROM segment_targets
+        WHERE segment_id = $1
+        FOR UPDATE
+        `,
+        [job.segment_id],
+      )
+    ).rows[0];
+
+    if (job.status === "superseded") {
+      throw new JobNotRetryableError(
+        "job cannot be retried because a newer snapshot exists for the segment",
+      );
+    }
+    if (job.status !== "failed" || job.lease_id !== null) {
+      throw new JobNotRetryableError(
+        "only terminal failed jobs can be retried",
+      );
+    }
+    if (!failedTargetMatchesJob(target, job)) {
+      throw new JobNotRetryableError(
+        "job cannot be retried because a newer snapshot exists for the segment",
+      );
+    }
+    return { job, target };
+  }
+
+  async retryFailedJob(
+    jobId: number,
+    options: RetryFailedJobOptions = {},
+  ): Promise<JobResponse | null> {
+    return this.#withTransaction(async (connection) => {
+      const context = await Database.#lockCurrentFailedTargetJob(
+        connection,
+        jobId,
+      );
+      if (context === null) return null;
+      const { job, target } = context;
+
+      if (options.restartExtraction ?? false) {
+        await connection.query(
           `
-          SELECT id, segment_id, session_id, start_user_message_id, status,
-                 lease_id, source_generation, source_fingerprint,
-                 projection_version, end_user_message_id,
-                 source_boundary_version, start_source_message_id,
-                 end_source_message_id
-          FROM extraction_jobs
-          WHERE id = $1
-          FOR UPDATE
+          UPDATE segment_targets
+          SET extraction_result = NULL,
+              extraction_validation_version = NULL,
+              extraction_validation_fingerprint = NULL,
+              summary_commit_fingerprint = NULL
+          WHERE segment_id = $1 AND job_id = $2
           `,
-          [jobId],
-        )
-      ).rows[0];
-      if (job === undefined) return null;
-      const target = (
-        await connection.query<TargetRow>(
-          `
-          SELECT job_id, end_user_message_id, source_boundary_version,
-                 start_source_message_id, end_source_message_id,
-                 projection_version, payload, source_generation,
-                  source_fingerprint, extraction_result,
-                  extraction_validation_version,
-                  extraction_validation_fingerprint,
-                  summary_commit_fingerprint, processing_priority
-          FROM segment_targets
-          WHERE segment_id = $1
-          FOR UPDATE
-          `,
-          [job.segment_id],
-        )
-      ).rows[0];
-      if (job.status === "superseded") {
-        throw new JobNotRetryableError(
-          "job cannot be retried because a newer snapshot exists for the segment",
+          [job.segment_id, job.id],
         );
       }
-      if (job.status !== "failed" || job.lease_id !== null) {
-        throw new JobNotRetryableError(
-          "only terminal failed jobs can be retried",
-        );
-      }
-      let targetSource: SegmentCreate | null = null;
-      try {
-        if (target !== undefined) targetSource = targetRequest(target);
-      } catch {
-        targetSource = null;
-      }
-      if (
-        target === undefined ||
-        targetSource === null ||
-        !sameBigInt(target.job_id, job.id) ||
-        !sameBigInt(target.source_generation, job.source_generation) ||
-        target.source_fingerprint !== job.source_fingerprint ||
-        target.projection_version !== job.projection_version ||
-        !boundaryMatchesRequest(target, targetSource) ||
-        !boundaryMatchesRequest(job, targetSource) ||
-        targetSource.projection_version !== job.projection_version ||
-        targetSource.session_id !== job.session_id ||
-        targetSource.start_user_message_id !== job.start_user_message_id ||
-        segmentIdForRequest(targetSource) !== job.segment_id ||
-        sourceFingerprint(targetSource) !== job.source_fingerprint
-      ) {
-        throw new JobNotRetryableError(
-          "job cannot be retried because a newer snapshot exists for the segment",
-        );
-      }
+
       const updated = await connection.query(
         `
         UPDATE extraction_jobs
@@ -1502,6 +1554,49 @@ export class Database {
       }
       const row = await Database.#jobRow(connection, jobId);
       if (row === undefined) throw new Error("retried job disappeared");
+      return Database.#jobResponse(row);
+    });
+  }
+
+  async supersedeFailedJob(jobId: number): Promise<JobResponse | null> {
+    return this.#withTransaction(async (connection) => {
+      const context = await Database.#lockCurrentFailedTargetJob(
+        connection,
+        jobId,
+      );
+      if (context === null) return null;
+      const { job } = context;
+
+      const updated = await connection.query(
+        `
+        UPDATE extraction_jobs
+        SET payload = NULL,
+            status = 'superseded',
+            error = 'snapshot was superseded',
+            lease_id = NULL,
+            started_at = NULL,
+            finished_at = now()
+        WHERE id = $1 AND status = 'failed' AND lease_id IS NULL
+        `,
+        [jobId],
+      );
+      if ((updated.rowCount ?? 0) !== 1) {
+        throw new Error("failed job changed while superseding");
+      }
+
+      const deletedTarget = await connection.query(
+        `
+        DELETE FROM segment_targets
+        WHERE segment_id = $1 AND job_id = $2
+        `,
+        [job.segment_id, job.id],
+      );
+      if ((deletedTarget.rowCount ?? 0) !== 1) {
+        throw new Error("failed target changed while superseding");
+      }
+
+      const row = await Database.#jobRow(connection, jobId);
+      if (row === undefined) throw new Error("superseded job disappeared");
       return Database.#jobResponse(row);
     });
   }

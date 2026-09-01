@@ -1,12 +1,17 @@
 import { randomUUID } from "node:crypto";
 
 import {
+  parseSegmentCreate,
   parseSegmentResponse,
   type JobResponse,
   type QueueStatusResponse,
   type SegmentResponse,
   type SegmentSummary,
 } from "@reflection/shared/contracts";
+import {
+  segmentIdForRequest,
+  sourceFingerprint,
+} from "@reflection/shared/domain";
 import { afterEach, describe, expect, test, vi } from "vitest";
 
 import {
@@ -21,7 +26,10 @@ import {
 } from "../src/app.js";
 import { UpstreamRequestError, UpstreamResponseError } from "../src/clients.js";
 import { loadSettings, type Settings } from "../src/config.js";
-import { JobNotRetryableError } from "../src/database.js";
+import {
+  JobNotRetryableError,
+  failedTargetMatchesJob,
+} from "../src/database.js";
 
 const API_HEADERS = { "x-api-key": "test-key" };
 const openApps = new Set<ReflectionApp>();
@@ -122,6 +130,7 @@ function dependencies(
     enqueue: vi.fn(async () => jobResponse()),
     getJob: vi.fn(async () => null),
     retryFailedJob: vi.fn(async () => null),
+    supersedeFailedJob: vi.fn(async () => null),
     getSegment: vi.fn(async () => null),
     sessionSegmentListing: vi.fn(async () => [[], [], []] as const),
     ...overrides.database,
@@ -528,6 +537,206 @@ describe("jobs and committed segments", () => {
     });
     expect(retryMissing.statusCode).toBe(404);
     expect(injected.worker.wake).toHaveBeenCalledOnce();
+  });
+
+  test("restarts failed extraction, supersedes obsolete targets, and enforces worker wake policies", async () => {
+    const existing = jobResponse("failed");
+    const superseded: JobResponse = {
+      ...existing,
+      status: "superseded",
+      error: "snapshot was superseded",
+      finished_at: "2026-08-22T12:00:00Z",
+    };
+    const retryFailedJob = vi
+      .fn<AppDatabase["retryFailedJob"]>()
+      .mockResolvedValueOnce(existing)
+      .mockRejectedValueOnce(
+        new JobNotRetryableError(
+          "job cannot be retried because a newer snapshot exists for the segment",
+        ),
+      )
+      .mockResolvedValueOnce(null);
+    const supersedeFailedJob = vi
+      .fn<AppDatabase["supersedeFailedJob"]>()
+      .mockResolvedValueOnce(superseded)
+      .mockRejectedValueOnce(
+        new JobNotRetryableError("only terminal failed jobs can be retried"),
+      )
+      .mockResolvedValueOnce(null);
+    const { app, injected } = appWith(
+      dependencies({ database: { retryFailedJob, supersedeFailedJob } }),
+    );
+
+    const restartOk = await app.inject({
+      method: "POST",
+      url: "/v1/jobs/1/restart",
+      headers: API_HEADERS,
+    });
+    expect(restartOk.statusCode).toBe(202);
+    expect(restartOk.json()).toEqual(existing);
+    expect(retryFailedJob).toHaveBeenLastCalledWith(1, {
+      restartExtraction: true,
+    });
+    expect(injected.worker.wake).toHaveBeenCalledTimes(1);
+
+    const restartConflict = await app.inject({
+      method: "POST",
+      url: "/v1/jobs/1/restart",
+      headers: API_HEADERS,
+    });
+    expect(restartConflict.statusCode).toBe(409);
+    expect(restartConflict.json()).toEqual({
+      detail:
+        "job cannot be retried because a newer snapshot exists for the segment",
+    });
+
+    const restartMissing = await app.inject({
+      method: "POST",
+      url: "/v1/jobs/2/restart",
+      headers: API_HEADERS,
+    });
+    expect(restartMissing.statusCode).toBe(404);
+    expect(restartMissing.json()).toEqual({ detail: "job not found" });
+
+    const restartInvalid = await app.inject({
+      method: "POST",
+      url: "/v1/jobs/not-an-int/restart",
+      headers: API_HEADERS,
+    });
+    expect(restartInvalid.statusCode).toBe(422);
+
+    const restartUnauthorized = await app.inject({
+      method: "POST",
+      url: "/v1/jobs/1/restart",
+    });
+    expect(restartUnauthorized.statusCode).toBe(401);
+
+    const supersedeOk = await app.inject({
+      method: "POST",
+      url: "/v1/jobs/1/supersede",
+      headers: API_HEADERS,
+    });
+    expect(supersedeOk.statusCode).toBe(200);
+    expect(supersedeOk.json()).toEqual(superseded);
+    expect(supersedeFailedJob).toHaveBeenLastCalledWith(1);
+    expect(injected.worker.wake).toHaveBeenCalledTimes(1);
+
+    const supersedeConflict = await app.inject({
+      method: "POST",
+      url: "/v1/jobs/1/supersede",
+      headers: API_HEADERS,
+    });
+    expect(supersedeConflict.statusCode).toBe(409);
+    expect(supersedeConflict.json()).toEqual({
+      detail: "only terminal failed jobs can be retried",
+    });
+
+    const supersedeMissing = await app.inject({
+      method: "POST",
+      url: "/v1/jobs/2/supersede",
+      headers: API_HEADERS,
+    });
+    expect(supersedeMissing.statusCode).toBe(404);
+    expect(supersedeMissing.json()).toEqual({ detail: "job not found" });
+
+    const supersedeInvalid = await app.inject({
+      method: "POST",
+      url: "/v1/jobs/not-an-int/supersede",
+      headers: API_HEADERS,
+    });
+    expect(supersedeInvalid.statusCode).toBe(422);
+
+    const supersedeUnauthorized = await app.inject({
+      method: "POST",
+      url: "/v1/jobs/1/supersede",
+    });
+    expect(supersedeUnauthorized.statusCode).toBe(401);
+  });
+
+  test("validates failed target matching pure logic", () => {
+    const payload = parseSegmentCreate({
+      session_id: "ses_1",
+      start_user_message_id: "msg_user_1",
+      end_user_message_id: "msg_user_1",
+      source_boundary_version: 1,
+      start_source_message_id: null,
+      end_source_message_id: null,
+      projection_version: 1,
+      processing_priority: 0,
+      messages: [{ role: "user", text: "" }],
+    });
+    const segmentId = segmentIdForRequest(payload);
+    const fingerprint = sourceFingerprint(payload);
+    const validJob = {
+      id: 1,
+      segment_id: segmentId,
+      session_id: "ses_1",
+      start_user_message_id: "msg_user_1",
+      status: "failed",
+      lease_id: null,
+      source_generation: 1n,
+      source_fingerprint: fingerprint,
+      projection_version: 1,
+      end_user_message_id: "msg_user_1",
+      source_boundary_version: 1,
+      start_source_message_id: null,
+      end_source_message_id: null,
+    };
+    const validTarget = {
+      job_id: 1,
+      end_user_message_id: "msg_user_1",
+      source_boundary_version: 1,
+      start_source_message_id: null,
+      end_source_message_id: null,
+      projection_version: 1,
+      payload,
+      source_generation: 1n,
+      source_fingerprint: fingerprint,
+      extraction_result: null,
+      extraction_validation_version: null,
+      extraction_validation_fingerprint: null,
+      summary_commit_fingerprint: null,
+      processing_priority: 0,
+    };
+
+    expect(failedTargetMatchesJob(undefined, validJob)).toBe(false);
+    expect(failedTargetMatchesJob(validTarget, validJob)).toBe(true);
+    expect(
+      failedTargetMatchesJob({ ...validTarget, job_id: 2 }, validJob),
+    ).toBe(false);
+    expect(
+      failedTargetMatchesJob(
+        { ...validTarget, source_generation: 2n },
+        validJob,
+      ),
+    ).toBe(false);
+    expect(
+      failedTargetMatchesJob(
+        { ...validTarget, source_fingerprint: "other" },
+        validJob,
+      ),
+    ).toBe(false);
+    expect(
+      failedTargetMatchesJob(
+        { ...validTarget, projection_version: 2 },
+        validJob,
+      ),
+    ).toBe(false);
+    expect(
+      failedTargetMatchesJob(
+        { ...validTarget, payload: "invalid-json" },
+        validJob,
+      ),
+    ).toBe(false);
+    expect(
+      failedTargetMatchesJob(
+        {
+          ...validTarget,
+          payload: { ...payload, session_id: "other_ses" },
+        },
+        validJob,
+      ),
+    ).toBe(false);
   });
 
   test("returns a segment and rejects invalid or missing UUIDs", async () => {

@@ -52,6 +52,7 @@ export type AppDatabase = Pick<
   | "enqueue"
   | "getJob"
   | "retryFailedJob"
+  | "supersedeFailedJob"
   | "getSegment"
   | "sessionSegmentListing"
 >;
@@ -145,6 +146,8 @@ const KNOWN_ROUTES: ReadonlyArray<{
   { pattern: /^\/v1\/queue$/u, methods: ["GET"] },
   { pattern: /^\/v1\/segments$/u, methods: ["POST"] },
   { pattern: /^\/v1\/jobs\/[^/]+\/retry$/u, methods: ["POST"] },
+  { pattern: /^\/v1\/jobs\/[^/]+\/restart$/u, methods: ["POST"] },
+  { pattern: /^\/v1\/jobs\/[^/]+\/supersede$/u, methods: ["POST"] },
   { pattern: /^\/v1\/jobs\/[^/]+$/u, methods: ["GET"] },
   { pattern: /^\/v1\/segments\/[^/]+$/u, methods: ["GET"] },
   {
@@ -414,6 +417,59 @@ function registerRoutes(
           if (job === null) throw new HttpError(404, "job not found");
           dependencies.worker.wake();
           return reply.code(202).send(job);
+        },
+      );
+
+      v1.post(
+        "/jobs/:job_id/restart",
+        {
+          schema: {
+            headers: API_KEY_HEADER_SCHEMA,
+            params: JOB_PARAMS_SCHEMA,
+            response: { 202: JobResponseSchema },
+          },
+        },
+        async (request, reply) => {
+          const { job_id: jobId } = request.params as { job_id: number };
+          let job;
+          try {
+            job = await dependencies.database.retryFailedJob(jobId, {
+              restartExtraction: true,
+            });
+          } catch (error) {
+            if (error instanceof JobNotRetryableError) {
+              throw new HttpError(409, error.message);
+            }
+            throw error;
+          }
+          if (job === null) throw new HttpError(404, "job not found");
+          dependencies.worker.wake();
+          return reply.code(202).send(job);
+        },
+      );
+
+      v1.post(
+        "/jobs/:job_id/supersede",
+        {
+          schema: {
+            headers: API_KEY_HEADER_SCHEMA,
+            params: JOB_PARAMS_SCHEMA,
+            response: { 200: JobResponseSchema },
+          },
+        },
+        async (request, reply) => {
+          const { job_id: jobId } = request.params as { job_id: number };
+          let job;
+          try {
+            job = await dependencies.database.supersedeFailedJob(jobId);
+          } catch (error) {
+            if (error instanceof JobNotRetryableError) {
+              throw new HttpError(409, error.message);
+            }
+            throw error;
+          }
+          if (job === null) throw new HttpError(404, "job not found");
+          return reply.code(200).send(job);
         },
       );
 
