@@ -3426,4 +3426,418 @@ describe.sequential("Database PostgreSQL integration", () => {
     },
     30_000,
   );
+
+  test.skipIf(!DATABASE_URL)(
+    "preserves staged extraction on ordinary retry and clears staged fields on restart extraction",
+    async () => {
+      const database = new Database(settings());
+      await database.open();
+      try {
+        await truncate(database);
+        const req = request({
+          session_id: "repair-session",
+          start_user_message_id: "u1",
+          end_user_message_id: "u1",
+          source_boundary_version: 2,
+          start_source_message_id: "s1",
+          end_source_message_id: "s2",
+          projection_version: 1,
+          processing_priority: 75,
+          messages: [{ role: "user", text: "test source content" }],
+        });
+        const job = await database.enqueue(req);
+
+        const claim = required(
+          await withClient(database, (client) =>
+            database.claimOldestJob(client),
+          ),
+        );
+        expect(claim.id).toBe(job.id);
+        expect(claim.extractionResult).toBeNull();
+
+        const staged = validatedExtractionResult({
+          summary: "Staged summary for repair",
+          claims: [
+            {
+              subject: "Reflection",
+              predicate: "supports",
+              confidence: 1,
+              object_entity: null,
+              object_value: "repair endpoints",
+            },
+          ],
+        });
+        expect(await database.publishExtraction(claim, staged)).toBe(true);
+
+        const targetBeforeFail = required(
+          (
+            await database.pool.query<
+              {
+                extraction_result: unknown;
+                extraction_validation_version: number;
+                extraction_validation_fingerprint: string;
+                summary_commit_fingerprint: string;
+                processing_priority: number;
+              } & QueryResultRow
+            >(
+              "SELECT extraction_result, extraction_validation_version, " +
+                "extraction_validation_fingerprint, summary_commit_fingerprint, " +
+                "processing_priority FROM segment_targets WHERE segment_id = $1",
+              [job.segment_id],
+            )
+          ).rows[0],
+        );
+        expect(targetBeforeFail.extraction_result).toEqual(staged);
+        expect(targetBeforeFail.extraction_validation_version).toBe(2);
+        expect(targetBeforeFail.extraction_validation_fingerprint).toMatch(
+          /^[0-9a-f]{64}$/,
+        );
+        expect(targetBeforeFail.summary_commit_fingerprint).toMatch(
+          /^[0-9a-f]{64}$/,
+        );
+        expect(targetBeforeFail.processing_priority).toBe(75);
+
+        expect(
+          await database.finishFailedAttempt(
+            claim,
+            "resolution exhausted attempts",
+            { retryAfterSeconds: null },
+          ),
+        ).toBe(true);
+        const failedJob = required(await database.getJob(job.id));
+        expect(failedJob.status).toBe("failed");
+        expect(failedJob.attempts).toBe(1);
+
+        // Ordinary retry preserves staged extraction
+        const retried = required(await database.retryFailedJob(job.id));
+        expect(retried.status).toBe("pending");
+        expect(retried.attempts).toBe(0);
+        expect(retried.error).toBeNull();
+
+        const targetAfterRetry = required(
+          (
+            await database.pool.query<
+              {
+                extraction_result: unknown;
+                extraction_validation_version: number;
+                extraction_validation_fingerprint: string;
+                summary_commit_fingerprint: string;
+                processing_priority: number;
+              } & QueryResultRow
+            >(
+              "SELECT extraction_result, extraction_validation_version, " +
+                "extraction_validation_fingerprint, summary_commit_fingerprint, " +
+                "processing_priority FROM segment_targets WHERE segment_id = $1",
+              [job.segment_id],
+            )
+          ).rows[0],
+        );
+        expect(targetAfterRetry.extraction_result).toEqual(staged);
+        expect(targetAfterRetry.extraction_validation_version).toBe(2);
+        expect(targetAfterRetry.extraction_validation_fingerprint).toBe(
+          targetBeforeFail.extraction_validation_fingerprint,
+        );
+        expect(targetAfterRetry.summary_commit_fingerprint).toBe(
+          targetBeforeFail.summary_commit_fingerprint,
+        );
+        expect(targetAfterRetry.processing_priority).toBe(75);
+
+        const retriedClaim = required(
+          await withClient(database, (client) =>
+            database.claimOldestJob(client),
+          ),
+        );
+        expect(retriedClaim.id).toBe(job.id);
+        expect(retriedClaim.extractionResult).toEqual(staged);
+        expect(retriedClaim.request.processing_priority).toBe(75);
+        expect(retriedClaim.sourceFingerprint).toBe(sourceFingerprint(req));
+
+        expect(
+          await database.finishFailedAttempt(
+            retriedClaim,
+            "resolution exhausted attempts again",
+            { retryAfterSeconds: null },
+          ),
+        ).toBe(true);
+
+        // Restart extraction clears all four stage fields and resets job to pending
+        const restarted = required(
+          await database.retryFailedJob(job.id, { restartExtraction: true }),
+        );
+        expect(restarted.status).toBe("pending");
+        expect(restarted.attempts).toBe(0);
+        expect(restarted.error).toBeNull();
+
+        const targetAfterRestart = required(
+          (
+            await database.pool.query<
+              {
+                extraction_result: unknown | null;
+                extraction_validation_version: number | null;
+                extraction_validation_fingerprint: string | null;
+                summary_commit_fingerprint: string | null;
+                processing_priority: number;
+                source_generation: string;
+                source_fingerprint: string;
+              } & QueryResultRow
+            >(
+              "SELECT extraction_result, extraction_validation_version, " +
+                "extraction_validation_fingerprint, summary_commit_fingerprint, " +
+                "processing_priority, source_generation, source_fingerprint " +
+                "FROM segment_targets WHERE segment_id = $1",
+              [job.segment_id],
+            )
+          ).rows[0],
+        );
+        expect(targetAfterRestart.extraction_result).toBeNull();
+        expect(targetAfterRestart.extraction_validation_version).toBeNull();
+        expect(targetAfterRestart.extraction_validation_fingerprint).toBeNull();
+        expect(targetAfterRestart.summary_commit_fingerprint).toBeNull();
+        expect(targetAfterRestart.processing_priority).toBe(75);
+        expect(targetAfterRestart.source_fingerprint).toBe(
+          sourceFingerprint(req),
+        );
+        expect(BigInt(targetAfterRestart.source_generation)).toBe(1n);
+
+        const restartedClaim = required(
+          await withClient(database, (client) =>
+            database.claimOldestJob(client),
+          ),
+        );
+        expect(restartedClaim.id).toBe(job.id);
+        expect(restartedClaim.segmentId).toBe(job.segment_id);
+        expect(restartedClaim.extractionResult).toBeNull();
+        expect(restartedClaim.request.processing_priority).toBe(75);
+        expect(restartedClaim.sourceGeneration).toBe(1n);
+        expect(restartedClaim.sourceFingerprint).toBe(sourceFingerprint(req));
+        expect(restartedClaim.request).toEqual(req);
+      } finally {
+        await database.close();
+      }
+    },
+    30_000,
+  );
+
+  test.skipIf(!DATABASE_URL)(
+    "supersedes failed jobs, removes targets from manifest, preserves committed segments, and rejects unretryable jobs",
+    async () => {
+      const database = new Database(settings());
+      await database.open();
+      try {
+        await truncate(database);
+
+        // Missing job returns null
+        expect(await database.supersedeFailedJob(999_999)).toBeNull();
+
+        // 1. Terminal failed job supersede
+        const seg1Req = request({
+          session_id: "supersede-session",
+          start_user_message_id: "turn1",
+          end_user_message_id: "turn1",
+          source_boundary_version: 1,
+          projection_version: 1,
+          messages: [{ role: "user", text: "obsolete segment content" }],
+        });
+        const job1 = await database.enqueue(seg1Req);
+        const claim1 = required(
+          await withClient(database, (client) =>
+            database.claimOldestJob(client),
+          ),
+        );
+        expect(
+          await database.finishFailedAttempt(claim1, "unsupported format", {
+            retryAfterSeconds: null,
+          }),
+        ).toBe(true);
+
+        const [, , targets1] =
+          await database.sessionSegmentListing("supersede-session");
+        expect(targets1).toHaveLength(1);
+        expect(required(targets1[0]).id).toBe(job1.segment_id);
+        expect(required(targets1[0]).status).toBe("failed");
+
+        const superseded1 = required(
+          await database.supersedeFailedJob(job1.id),
+        );
+        expect(superseded1.id).toBe(job1.id);
+        expect(superseded1.status).toBe("superseded");
+        expect(superseded1.error).toBe("snapshot was superseded");
+        expect(superseded1.finished_at).not.toBeNull();
+
+        const rawJob1 = required(
+          (
+            await database.pool.query<
+              {
+                id: string;
+                status: string;
+                payload: unknown | null;
+                error: string | null;
+                lease_id: string | null;
+                started_at: string | null;
+              } & QueryResultRow
+            >(
+              "SELECT id, status, payload, error, lease_id, started_at FROM extraction_jobs WHERE id = $1",
+              [job1.id],
+            )
+          ).rows[0],
+        );
+        expect(rawJob1.status).toBe("superseded");
+        expect(rawJob1.payload).toBeNull();
+        expect(rawJob1.error).toBe("snapshot was superseded");
+        expect(rawJob1.lease_id).toBeNull();
+        expect(rawJob1.started_at).toBeNull();
+
+        const targetRows1 = (
+          await database.pool.query(
+            "SELECT * FROM segment_targets WHERE segment_id = $1",
+            [job1.segment_id],
+          )
+        ).rows;
+        expect(targetRows1).toHaveLength(0);
+
+        const [, , targetsAfter] =
+          await database.sessionSegmentListing("supersede-session");
+        expect(targetsAfter).toHaveLength(0);
+
+        // Cannot supersede already superseded job
+        await expect(database.supersedeFailedJob(job1.id)).rejects.toThrow(
+          JobNotRetryableError,
+        );
+
+        // Cannot retry already superseded job
+        await expect(database.retryFailedJob(job1.id)).rejects.toThrow(
+          JobNotRetryableError,
+        );
+
+        // 2. Reject pending, running, succeeded jobs
+        const pendingJob = await database.enqueue(
+          request({
+            session_id: "supersede-session",
+            start_user_message_id: "turn2",
+            end_user_message_id: "turn2",
+            source_boundary_version: 1,
+            projection_version: 1,
+            messages: [{ role: "user", text: "pending job content" }],
+          }),
+        );
+        await expect(
+          database.supersedeFailedJob(pendingJob.id),
+        ).rejects.toThrow(/only terminal failed jobs can be retried/);
+
+        const runningClaim = required(
+          await withClient(database, (client) =>
+            database.claimOldestJob(client),
+          ),
+        );
+        expect(runningClaim.id).toBe(pendingJob.id);
+        await expect(
+          database.supersedeFailedJob(pendingJob.id),
+        ).rejects.toThrow(/only terminal failed jobs can be retried/);
+
+        const succExtraction = validatedExtractionResult({
+          summary: "Succeeded summary",
+          claims: [],
+        });
+        await database.publishExtraction(runningClaim, succExtraction);
+        await database.commitResolution(
+          runningClaim,
+          succExtraction,
+          emptyPrepared(runningClaim, succExtraction.summary),
+        );
+        await expect(
+          database.supersedeFailedJob(pendingJob.id),
+        ).rejects.toThrow(/only terminal failed jobs can be retried/);
+
+        // 3. Preserve committed segment when newer failed update is superseded
+        const committedBefore = required(
+          await database.getSegment(pendingJob.segment_id),
+        );
+        expect(committedBefore.summary).toBe("Succeeded summary");
+
+        const updateV2 = request({
+          session_id: "supersede-session",
+          start_user_message_id: "turn2",
+          end_user_message_id: "turn2-extended",
+          source_boundary_version: 1,
+          projection_version: 2,
+          messages: [
+            { role: "user", text: "pending job content" },
+            { role: "assistant", text: "v2 reply" },
+          ],
+        });
+        const v2Job = await database.enqueue(updateV2);
+        expect(v2Job.segment_id).toBe(pendingJob.segment_id);
+
+        const v2Claim = required(
+          await withClient(database, (client) =>
+            database.claimOldestJob(client),
+          ),
+        );
+        expect(
+          await database.finishFailedAttempt(v2Claim, "upstream rate limit", {
+            retryAfterSeconds: null,
+          }),
+        ).toBe(true);
+
+        const [, , manifestTargets] =
+          await database.sessionSegmentListing("supersede-session");
+        expect(manifestTargets).toHaveLength(1);
+        expect(required(manifestTargets[0]).id).toBe(pendingJob.segment_id);
+
+        const supersededV2 = required(
+          await database.supersedeFailedJob(v2Job.id),
+        );
+        expect(supersededV2.status).toBe("superseded");
+
+        const committedAfter = required(
+          await database.getSegment(pendingJob.segment_id),
+        );
+        expect(committedAfter.summary).toBe("Succeeded summary");
+        expect(committedAfter.id).toBe(pendingJob.segment_id);
+
+        const [cleanSummaries, , cleanTargets] =
+          await database.sessionSegmentListing("supersede-session");
+        expect(cleanTargets).toHaveLength(0);
+        expect(cleanSummaries).toHaveLength(1);
+        expect(required(cleanSummaries[0]).summary).toBe("Succeeded summary");
+
+        // 4. Rejects supersede on stale snapshot
+        const staleV1Req = request({
+          session_id: "supersede-session",
+          start_user_message_id: "turn3",
+          end_user_message_id: "turn3-v1",
+          source_boundary_version: 1,
+          projection_version: 1,
+          messages: [{ role: "user", text: "stale v1" }],
+        });
+        const staleJob = await database.enqueue(staleV1Req);
+        const staleClaim = required(
+          await withClient(database, (client) =>
+            database.claimOldestJob(client),
+          ),
+        );
+        await database.finishFailedAttempt(staleClaim, "failed v1", {
+          retryAfterSeconds: null,
+        });
+
+        const newerV2Req = request({
+          session_id: "supersede-session",
+          start_user_message_id: "turn3",
+          end_user_message_id: "turn3-v2",
+          source_boundary_version: 1,
+          projection_version: 1,
+          messages: [{ role: "user", text: "newer v2" }],
+        });
+        const newerJob = await database.enqueue(newerV2Req);
+        expect(newerJob.segment_id).toBe(staleJob.segment_id);
+
+        await expect(database.supersedeFailedJob(staleJob.id)).rejects.toThrow(
+          /newer snapshot exists/,
+        );
+      } finally {
+        await database.close();
+      }
+    },
+    30_000,
+  );
 });

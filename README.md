@@ -92,7 +92,9 @@ When a source span has no visible text, writers submit bounded renderer-canonica
 
 - `GET /v1/queue` returns historical job and current target counts, due and delayed pending work, bounded running-job ages, sanitized current-target error categories split between retrying and terminal work, and current terminal-job counts over 5-minute, 1-hour, and 24-hour windows. Because retries mutate job rows, the windows are a current-state drain signal rather than append-only attempt history. The endpoint never returns source payloads or raw errors.
 - `GET /v1/jobs/{id}` returns status, attempts, timestamps, exact source boundary, and a bounded error.
-- `POST /v1/jobs/{id}/retry` resets a retryable terminal job and returns `202`.
+- `POST /v1/jobs/{id}/retry` resets an exact current terminal failed job to pending and wakes the extraction worker, returning `202`. Any eligible staged extraction result on the matching current target is preserved so work resumes directly at entity resolution.
+- `POST /v1/jobs/{id}/restart` resets an exact current terminal failed job to pending and wakes the extraction worker, returning `202`. Unlike retry, restart atomically clears staged extraction results and validation fingerprints on the current target so the worker performs a completely fresh extraction from the original source payload.
+- `POST /v1/jobs/{id}/supersede` marks an exact current terminal failed job as `superseded`, clears its payload, sets `error = 'snapshot was superseded'`, and deletes the exact matching row from `segment_targets`, returning `200`. This endpoint does not wake the worker and never deletes committed segments. It is strictly intended for operators when an authoritative local source planner proves an exact current failed target is obsolete and will never be generated again under current segmentation rules, clearing poisoned targets from session manifests.
 - `GET /v1/segments/{uuid}` returns a committed summary and resolved claims without source text.
 - `GET /v1/sessions/{session_id}/segments` returns the manifest described above.
 - `POST /v1/search` accepts `{"query":"..."}` and returns grouped claims plus supporting segment IDs.
