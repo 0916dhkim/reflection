@@ -635,7 +635,9 @@ export class ModelClient {
         model: this.#settings.extractionModel,
         issues: validationIssues(error),
       });
-      throw new UpstreamValidationError();
+      throw new UpstreamValidationError(
+        "invalid normalized reflection_extraction schema",
+      );
     }
     const normalized = normalizeExtractedPaths(result, request.messages);
     result = normalized.result;
@@ -652,7 +654,9 @@ export class ModelClient {
         model: this.#settings.extractionModel,
         issues: validationIssues(error),
       });
-      throw new UpstreamValidationError();
+      throw new UpstreamValidationError(
+        "invalid normalized reflection_extraction schema",
+      );
     }
     return result as ValidatedExtractionResult;
   }
@@ -695,7 +699,7 @@ export class ModelClient {
         model: this.#settings.resolutionModel,
         issues: [error.message],
       });
-      throw new UpstreamValidationError();
+      throw new UpstreamValidationError("invalid entity_resolution semantics");
     }
   }
 
@@ -821,7 +825,11 @@ export class ModelClient {
           errorType: error instanceof Error ? error.name : "unknown",
         });
       }
-      throw new UpstreamValidationError();
+      throw new UpstreamValidationError(
+        error instanceof ContractValidationError
+          ? `invalid structured ${options.schemaName} schema`
+          : `invalid structured ${options.schemaName} response`,
+      );
     }
   }
 }
