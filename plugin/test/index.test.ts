@@ -35,9 +35,6 @@ vi.mock("node:os", async (importOriginal) => ({
 
 import { Reflection } from "../src/index.js";
 
-const SUMMARY_WAIT_TIMEOUT_MS = 90_000;
-const SUMMARY_POLL_INTERVAL_MS = 1_000;
-
 function segmentId(sessionId: string, segment: ReflectionSegment): string {
   return segmentIdForRequest({
     session_id: sessionId,
@@ -2776,12 +2773,22 @@ describe("Reflection plugin hooks", () => {
     });
   });
 
-  it("waits for an exact required staged summary to appear", async () => {
-    vi.useFakeTimers();
-    const sessionId = "summary-poll-session";
-    const messages = projectionMessages(sessionId);
-    const required = segmentMessages(messages)[0]!;
-    const client = clientFor(messages);
+  it("returns direct listing immediately after foreground sync without polling when exact summaries are pending and retains available summaries", async () => {
+    const sessionId = "summary-immediate-direct-listing";
+    const raw = siblingProjectionMessages(sessionId);
+    const segments = segmentMessages(raw);
+    const firstSegment = segments[0]!;
+    const secondSegment = segments[1]!;
+    const visibleAssistant = raw.find(
+      (message) => message.info.id === `${sessionId}-step-2`,
+    );
+    visibleAssistant!.info.tokens = {
+      input: 100_000,
+      output: 1_000,
+      reasoning: 0,
+      cache: { read: 0, write: 0 },
+    };
+    const client = clientFor(raw);
     let gets = 0;
     const posted: Array<Record<string, unknown>> = [];
     vi.stubGlobal(
@@ -2796,50 +2803,36 @@ describe("Reflection plugin hooks", () => {
           return ok({
             session_id: sessionId,
             segments: [],
-            boundaries: [],
+            boundaries: [
+              segmentBoundary(sessionId, firstSegment),
+              segmentBoundary(sessionId, secondSegment),
+            ],
             targets: [],
-          });
-        }
-        if (gets === 2) {
-          return ok({
-            session_id: sessionId,
-            segments: [],
-            boundaries: [],
-            targets: [segmentTarget(sessionId, required)],
           });
         }
         return ok({
           session_id: sessionId,
           segments: [
-            segmentSummary(sessionId, required, "Summary became available"),
+            segmentSummary(sessionId, firstSegment, "Available summary 1"),
           ],
-          boundaries: [],
-          targets: [segmentTarget(sessionId, required)],
+          boundaries: [
+            segmentBoundary(sessionId, firstSegment),
+            segmentBoundary(sessionId, secondSegment),
+          ],
+          targets: [segmentTarget(sessionId, secondSegment)],
         });
       }),
     );
     const hooks = await Reflection(pluginInput(client));
-    const output = { messages: structuredClone(messages) };
-    const projection = hooks["experimental.chat.messages.transform"]?.(
-      {},
-      output as never,
-    );
+    const output = { messages: structuredClone(raw) };
 
-    await vi.advanceTimersByTimeAsync(0);
-    expect(gets).toBe(2);
-    await vi.advanceTimersByTimeAsync(SUMMARY_POLL_INTERVAL_MS - 1);
-    expect(gets).toBe(2);
-    await vi.advanceTimersByTimeAsync(1);
-    await projection;
+    await hooks["experimental.chat.messages.transform"]?.({}, output as never);
 
-    expect(gets).toBe(3);
-    expect(posted).toHaveLength(1);
-    expect(posted[0]?.processing_priority).toBe(100);
-    expect(output.messages[1]?.parts[0]?.text).toContain(
-      "Summary became available",
-    );
+    expect(gets).toBe(2);
+    expect(posted.length).toBeGreaterThan(0);
+    expect(output.messages[1]?.parts[0]?.text).toContain("Available summary 1");
     expect(output.messages[1]?.parts[0]?.text).not.toContain(
-      PROJECTION_LOSS_WARNING,
+      "Reflection summaries were unavailable",
     );
   });
 
@@ -2875,8 +2868,7 @@ describe("Reflection plugin hooks", () => {
     );
   });
 
-  it("bounds summary polling and falls back to explicit lossy projection", async () => {
-    vi.useFakeTimers();
+  it("does not poll when a target is pending after foreground sync and projects available state immediately", async () => {
     const sessionId = "summary-poll-timeout-session";
     const messages = projectionMessages(sessionId);
     const required = segmentMessages(messages)[0]!;
@@ -2897,23 +2889,16 @@ describe("Reflection plugin hooks", () => {
     );
     const hooks = await Reflection(pluginInput(client));
     const output = { messages: structuredClone(messages) };
-    const projection = hooks["experimental.chat.messages.transform"]?.(
-      {},
-      output as never,
-    );
 
-    await vi.advanceTimersByTimeAsync(
-      SUMMARY_WAIT_TIMEOUT_MS + SUMMARY_POLL_INTERVAL_MS,
-    );
-    await projection;
+    await hooks["experimental.chat.messages.transform"]?.({}, output as never);
 
-    expect(gets).toBeGreaterThan(2);
+    expect(gets).toBe(2);
     expect(output.messages[1]?.parts[0]?.text).toContain(
-      "Reflection summaries were unavailable",
+      "archived closed segments had no exact committed Reflection summary",
     );
   });
 
-  it("falls back lossily when summary polling loses the service", async () => {
+  it("falls back lossily when direct recovery GET fails with service unavailable", async () => {
     const sessionId = "summary-poll-service-failure";
     const messages = projectionMessages(sessionId);
     const client = clientFor(messages);
@@ -2940,7 +2925,7 @@ describe("Reflection plugin hooks", () => {
 
     expect(gets).toBe(2);
     expect(output.messages[1]?.parts[0]?.text).toContain(
-      "Reflection summaries were unavailable",
+      "had no exact committed Reflection summary",
     );
   });
 
@@ -3323,8 +3308,8 @@ describe("Reflection plugin hooks", () => {
     expect(summaryGets).toBe(getsAfterTurn1Start + 1);
   });
 
-  it("invalidates exactly once and includes a previously missing summary when it appears on a later turn", async () => {
-    const sessionId = "missing-summary-appears-session";
+  it("invalidates an all-zero source-valid checkpoint once when its first exact summary appears, then reuses", async () => {
+    const sessionId = "all-zero-checkpoint-recovery-session";
     const messages = projectionMessages(sessionId);
     const closed = segmentMessages(messages)[0]!;
     const client = clientFor(messages);
@@ -3349,7 +3334,7 @@ describe("Reflection plugin hooks", () => {
     );
     const hooks = await Reflection(pluginInput(client));
 
-    // Turn 1: summary is missing
+    // Turn 1: all summaries missing, creates all-zero checkpoint
     const output1 = { messages: structuredClone(messages) };
     await hooks["experimental.chat.messages.transform"]?.({}, output1 as never);
     expect(targetPosts).toBe(1);
@@ -3361,7 +3346,8 @@ describe("Reflection plugin hooks", () => {
       "archived closed segments had no exact committed Reflection summary",
     );
 
-    // Turn 2: summary is still missing
+    // Turn 2: first exact summary appears; all-zero checkpoint invalidates once
+    summaryPresent = true;
     const turn2Messages = structuredClone(messages);
     turn2Messages.push({
       info: {
@@ -3375,13 +3361,16 @@ describe("Reflection plugin hooks", () => {
     });
     const output2 = { messages: structuredClone(turn2Messages) };
     await hooks["experimental.chat.messages.transform"]?.({}, output2 as never);
-    expect(output2.messages[1]?.parts[0]?.text).not.toContain(
+    expect(targetPosts).toBe(1);
+    expect(client.session.messages).toHaveBeenCalledTimes(2);
+    expect(output2.messages[1]?.parts[0]?.text).toContain(
       "Newly ready summary",
     );
-    expect(client.session.messages).toHaveBeenCalledOnce();
+    expect(output2.messages[1]?.parts[0]?.text).not.toContain(
+      "archived closed segments had no exact committed Reflection summary",
+    );
 
-    // Turn 3: summary is NOW ready on server
-    summaryPresent = true;
+    // Turn 3: same summary present; now nonzero checkpoint reuses without rebuild
     const turn3Messages = structuredClone(turn2Messages);
     turn3Messages.push({
       info: {
@@ -3395,42 +3384,29 @@ describe("Reflection plugin hooks", () => {
     });
     const output3 = { messages: structuredClone(turn3Messages) };
     await hooks["experimental.chat.messages.transform"]?.({}, output3 as never);
-    // Rebuilt once with the newly available summary
+    expect(targetPosts).toBe(1);
+    expect(client.session.messages).toHaveBeenCalledTimes(2);
     expect(output3.messages[1]?.parts[0]?.text).toContain(
       "Newly ready summary",
     );
-    expect(output3.messages[1]?.parts[0]?.text).not.toContain(
-      "archived closed segments had no exact committed Reflection summary",
-    );
-    expect(client.session.messages).toHaveBeenCalledTimes(2);
-
-    // Turn 4: summary is still the same
-    const turn4Messages = structuredClone(turn3Messages);
-    turn4Messages.push({
-      info: {
-        id: `${sessionId}-user-turn-4`,
-        sessionID: sessionId,
-        role: "user",
-        agent: "build",
-        model: { providerID: "provider", modelID: "model" },
-      },
-      parts: [{ type: "text", text: "fourth prompt" }],
-    });
-    const output4 = { messages: structuredClone(turn4Messages) };
-    await hooks["experimental.chat.messages.transform"]?.({}, output4 as never);
-    // Checkpoint is reused without rebuilding again
-    expect(output4.messages[1]?.parts[0]?.text).toContain(
-      "Newly ready summary",
-    );
-    expect(client.session.messages).toHaveBeenCalledTimes(2);
   });
 
-  it("invalidates exactly once when an included summary content changes", async () => {
-    const sessionId = "summary-changed-session";
-    const messages = projectionMessages(sessionId);
-    const closed = segmentMessages(messages)[0]!;
-    const client = clientFor(messages);
-    let summaryText = "Initial summary v1";
+  it("reuses a nonzero source-valid checkpoint when another missing summary appears and included summary content changes, while source mismatch invalidates", async () => {
+    const sessionId = "nonzero-checkpoint-reuse-session";
+    const messages1 = projectionMessages(`${sessionId}-1`).slice(0, 2);
+    const messages2 = projectionMessages(`${sessionId}-2`).slice(0, 2);
+    const messages3 = projectionMessages(`${sessionId}-3`).slice(0, 2);
+    const current = projectionMessages(`${sessionId}-current`).slice(0, 1);
+    const raw = [...messages1, ...messages2, ...messages3, ...current];
+    for (const message of raw) message.info.sessionID = sessionId;
+    const closed = segmentMessages(raw).filter((segment) => segment.closed);
+    expect(closed).toHaveLength(3);
+    const firstSegment = closed[0]!;
+    const secondSegment = closed[1]!;
+    const thirdSegment = closed[2]!;
+    const client = clientFor(raw);
+    let firstSummaryText = "Initial summary 1";
+    let secondSummaryPresent = false;
     let targetPosts = 0;
     vi.stubGlobal(
       "fetch",
@@ -3441,26 +3417,45 @@ describe("Reflection plugin hooks", () => {
         }
         return ok({
           session_id: sessionId,
-          segments: [segmentSummary(sessionId, closed, summaryText)],
-          boundaries: [segmentBoundary(sessionId, closed)],
-          targets: [],
+          segments: [
+            segmentSummary(sessionId, firstSegment, firstSummaryText),
+            ...(secondSummaryPresent
+              ? [
+                  segmentSummary(
+                    sessionId,
+                    secondSegment,
+                    "Newly ready summary 2",
+                  ),
+                ]
+              : []),
+          ],
+          boundaries: [
+            segmentBoundary(sessionId, firstSegment),
+            segmentBoundary(sessionId, secondSegment),
+            segmentBoundary(sessionId, thirdSegment),
+          ],
+          targets: secondSummaryPresent
+            ? []
+            : [segmentTarget(sessionId, secondSegment)],
         });
       }),
     );
     const hooks = await Reflection(pluginInput(client));
 
-    // Turn 1
-    const output1 = { messages: structuredClone(messages) };
+    // Turn 1: first segment has summary, second segment is missing -> creates nonzero checkpoint
+    const output1 = { messages: structuredClone(raw) };
     await hooks["experimental.chat.messages.transform"]?.({}, output1 as never);
-    expect(targetPosts).toBe(1);
-    expect(output1.messages[1]?.parts[0]?.text).toContain("Initial summary v1");
+    expect(targetPosts).toBe(3);
     expect(client.session.messages).toHaveBeenCalledOnce();
+    expect(output1.messages[1]?.parts[0]?.text).toContain("Initial summary 1");
 
-    // Turn 2: same summary text
-    const turn2Messages = structuredClone(messages);
+    // Turn 2: second summary appears and first summary changes, but source is unchanged
+    firstSummaryText = "Updated summary 1";
+    secondSummaryPresent = true;
+    const turn2Messages = structuredClone(raw);
     turn2Messages.push({
       info: {
-        id: `${sessionId}-u2`,
+        id: `${sessionId}-user-turn-2`,
         sessionID: sessionId,
         role: "user",
         agent: "build",
@@ -3470,15 +3465,23 @@ describe("Reflection plugin hooks", () => {
     });
     const output2 = { messages: structuredClone(turn2Messages) };
     await hooks["experimental.chat.messages.transform"]?.({}, output2 as never);
-    expect(output2.messages[1]?.parts[0]?.text).toContain("Initial summary v1");
+    // Nonzero source-valid checkpoint is reused without rebuilding
+    expect(targetPosts).toBe(3);
     expect(client.session.messages).toHaveBeenCalledOnce();
+    expect(output2.messages[1]?.parts[0]?.text).toContain("Initial summary 1");
+    expect(output2.messages[1]?.parts[0]?.text).not.toContain(
+      "Newly ready summary 2",
+    );
 
-    // Turn 3: summary text changed on server
-    summaryText = "Updated summary v2 with edits";
+    // Turn 3: source message modified (source fingerprint mismatch)
     const turn3Messages = structuredClone(turn2Messages);
+    turn3Messages[0]!.parts[0]!.text = "modified archived message text";
+    client.session.messages.mockImplementation(async () => ({
+      data: structuredClone(turn3Messages),
+    }));
     turn3Messages.push({
       info: {
-        id: `${sessionId}-u3`,
+        id: `${sessionId}-user-turn-3`,
         sessionID: sessionId,
         role: "user",
         agent: "build",
@@ -3488,29 +3491,13 @@ describe("Reflection plugin hooks", () => {
     });
     const output3 = { messages: structuredClone(turn3Messages) };
     await hooks["experimental.chat.messages.transform"]?.({}, output3 as never);
+    // Source mismatch invalidates and triggers a rebuild incorporating both updated summaries
+    expect(targetPosts).toBe(5);
+    expect(client.session.messages).toHaveBeenCalledTimes(2);
+    expect(output3.messages[1]?.parts[0]?.text).toContain("Updated summary 1");
     expect(output3.messages[1]?.parts[0]?.text).toContain(
-      "Updated summary v2 with edits",
+      "Newly ready summary 2",
     );
-    expect(client.session.messages).toHaveBeenCalledTimes(2);
-
-    // Turn 4: unchanged
-    const turn4Messages = structuredClone(turn3Messages);
-    turn4Messages.push({
-      info: {
-        id: `${sessionId}-u4`,
-        sessionID: sessionId,
-        role: "user",
-        agent: "build",
-        model: { providerID: "provider", modelID: "model" },
-      },
-      parts: [{ type: "text", text: "turn 4" }],
-    });
-    const output4 = { messages: structuredClone(turn4Messages) };
-    await hooks["experimental.chat.messages.transform"]?.({}, output4 as never);
-    expect(output4.messages[1]?.parts[0]?.text).toContain(
-      "Updated summary v2 with edits",
-    );
-    expect(client.session.messages).toHaveBeenCalledTimes(2);
   });
 
   it("preserves completed summaries when foreground sync fails and does not report total unavailable", async () => {
@@ -3783,5 +3770,104 @@ describe("Reflection plugin hooks", () => {
     expect(output.messages[1]?.parts[0]?.text).not.toContain(
       "Reflection summaries were unavailable",
     );
+  });
+
+  it("throws when session is deleted while foreground sync is in flight", async () => {
+    const sessionId = "session-deleted-during-sync";
+    const messages = projectionMessages(sessionId);
+    const client = clientFor(messages);
+    let postStarted: (() => void) | undefined;
+    const postStartedPromise = new Promise<void>((resolve) => {
+      postStarted = resolve;
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+        if (init?.method === "POST") {
+          postStarted?.();
+          return new Promise<Response>((_resolve, reject) => {
+            init?.signal?.addEventListener(
+              "abort",
+              () => reject(init.signal?.reason),
+              { once: true },
+            );
+          });
+        }
+        return ok({
+          session_id: sessionId,
+          segments: [],
+          boundaries: [],
+          targets: [],
+        });
+      }),
+    );
+    const hooks = await Reflection(pluginInput(client));
+    const output = { messages: structuredClone(messages) };
+    const transformPromise = hooks["experimental.chat.messages.transform"]?.(
+      {},
+      output as never,
+    );
+
+    await postStartedPromise;
+    await hooks.event?.({
+      event: {
+        type: "session.deleted",
+        properties: { info: { id: sessionId } },
+      },
+    } as never);
+
+    await expect(transformPromise).rejects.toThrow("was deleted");
+  });
+
+  it("throws when session is deleted while direct recovery GET is in flight", async () => {
+    const sessionId = "session-deleted-during-direct-get";
+    const messages = projectionMessages(sessionId);
+    const client = clientFor(messages);
+    let getCount = 0;
+    let directGetStarted: (() => void) | undefined;
+    const directGetPromise = new Promise<void>((resolve) => {
+      directGetStarted = resolve;
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+        if (init?.method === "POST") {
+          return new Response("failed", { status: 500 });
+        }
+        getCount += 1;
+        if (getCount === 1) {
+          return ok({
+            session_id: sessionId,
+            segments: [],
+            boundaries: [],
+            targets: [],
+          });
+        }
+        directGetStarted?.();
+        return new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener(
+            "abort",
+            () => reject(init.signal?.reason),
+            { once: true },
+          );
+        });
+      }),
+    );
+    const hooks = await Reflection(pluginInput(client));
+    const output = { messages: structuredClone(messages) };
+    const transformPromise = hooks["experimental.chat.messages.transform"]?.(
+      {},
+      output as never,
+    );
+
+    await directGetPromise;
+    await hooks.event?.({
+      event: {
+        type: "session.deleted",
+        properties: { info: { id: sessionId } },
+      },
+    } as never);
+
+    await expect(transformPromise).rejects.toThrow("was deleted");
   });
 });
