@@ -1,6 +1,6 @@
 import type { ExtractionResult } from "@reflection/shared/contracts";
 
-export const EXTRACTION_VALIDATION_VERSION = 1;
+export const EXTRACTION_VALIDATION_VERSION = 2;
 
 declare const validatedExtractionResultBrand: unique symbol;
 

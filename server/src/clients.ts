@@ -10,6 +10,7 @@ import {
   parseResolutionResult,
   toExtractionResult,
   type ExtractedClaim,
+  type ExtractionResult,
   type ExtractionWireResult,
   type ResolutionResult,
   type SegmentCreate,
@@ -23,8 +24,8 @@ import {
   type ValidatedResolutionPlan,
 } from "@reflection/shared/domain";
 import type { Settings } from "./config.js";
+import { normalizeExtractedPaths } from "./extraction-normalization.js";
 import type { ValidatedExtractionResult } from "./extraction-validation.js";
-import { IdentifierValidationSession } from "./identifier-validation.js";
 
 export const MAX_EMBEDDING_INPUT_BYTES = 30_000;
 export const MAX_EMBEDDING_BATCH_BYTES = 100_000;
@@ -606,11 +607,6 @@ export class ModelClient {
     request: SegmentCreate,
     priorSummaries: readonly string[],
   ): Promise<ValidatedExtractionResult> {
-    const identifierValidation = await IdentifierValidationSession.create(
-      request,
-      this.#settings.extractionModel,
-      this.#logger,
-    );
     const wireResult = await this.#structuredCall<ExtractionWireResult>({
       model: this.#settings.extractionModel,
       provider: this.#settings.extractionProvider,
@@ -631,8 +627,7 @@ export class ModelClient {
       maxTokens: 16_384,
     });
 
-    await identifierValidation.prepare(wireResult.claims);
-    let result: { summary: string; claims: ExtractedClaim[] };
+    let result: ExtractionResult;
     try {
       result = toExtractionResult(wireResult);
     } catch (error) {
@@ -642,7 +637,7 @@ export class ModelClient {
       });
       throw new UpstreamValidationError();
     }
-    const normalized = await identifierValidation.normalizePaths(result);
+    const normalized = normalizeExtractedPaths(result, request.messages);
     result = normalized.result;
     if (normalized.normalizedPaths > 0) {
       this.#logger.warn("normalized extracted paths to source filenames", {
@@ -659,9 +654,7 @@ export class ModelClient {
       });
       throw new UpstreamValidationError();
     }
-    const validatedResult = await identifierValidation.validate(result);
-    if (validatedResult === null) throw new UpstreamValidationError();
-    return validatedResult;
+    return result as ValidatedExtractionResult;
   }
 
   async resolve(

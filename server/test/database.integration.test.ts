@@ -275,7 +275,7 @@ describe.sequential("Database PostgreSQL integration", () => {
            SET status = 'failed', attempts = 3, finished_at = now() - INTERVAL '10 minutes',
                error = CASE id
                    WHEN $1 THEN 'UpstreamRequestError: upstream request failed: 429 Too Many Requests'
-                   WHEN $2 THEN 'TerminalExtractionValidationError: source identifier validation budget exceeded'
+                    WHEN $2 THEN 'TerminalExtractionValidationError: generated embedding input is 40000 UTF-8 bytes; maximum is 30000'
                END
            WHERE id = ANY($3::bigint[])`,
           [rateLimited.id, invalid.id, [rateLimited.id, invalid.id]],
@@ -1708,10 +1708,10 @@ describe.sequential("Database PostgreSQL integration", () => {
         ).toBe(true);
         await database.pool.query(
           `UPDATE segment_targets
-           SET extraction_validation_version = 2,
+           SET extraction_validation_version = 1,
                extraction_validation_fingerprint =
                    reflection_extraction_validation_fingerprint(
-                       extraction_result, 2, source_fingerprint
+                       extraction_result, 1, source_fingerprint
                    )
            WHERE segment_id = $1`,
           [enqueued.segment_id],
@@ -1880,10 +1880,10 @@ describe.sequential("Database PostgreSQL integration", () => {
         ).rejects.toThrow("segment_targets_extraction_validation_check");
         await database.pool.query(
           `UPDATE segment_targets
-           SET extraction_validation_version = 2,
+           SET extraction_validation_version = 1,
                extraction_validation_fingerprint =
                    reflection_extraction_validation_fingerprint(
-                       extraction_result, 2, source_fingerprint
+                       extraction_result, 1, source_fingerprint
                    )
            WHERE segment_id = $1`,
           [lowJob.segment_id],
