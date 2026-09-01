@@ -685,7 +685,7 @@ describe("ModelClient", () => {
         segmentRequest("source"),
         [],
       ),
-    ).rejects.toBeInstanceOf(UpstreamValidationError);
+    ).rejects.toThrow("invalid structured reflection_extraction schema");
   });
 
   test("uses compact prompt schemas for non-native structured output", async () => {
@@ -1123,7 +1123,31 @@ describe("ModelClient", () => {
           },
         ],
       ),
-    ).rejects.toBeInstanceOf(UpstreamValidationError);
+    ).rejects.toThrow("invalid entity_resolution semantics");
+  });
+
+  test("identifies the structured response phase without exposing output", async () => {
+    const extraction = new ModelClient(
+      settings(),
+      async () => Response.json({ choices: [] }),
+      silentLogger,
+    ).extract(segmentRequest("source"), []);
+    await expect(extraction).rejects.toThrow(
+      "invalid structured reflection_extraction response",
+    );
+
+    const resolution = new ModelClient(
+      settings(),
+      async () =>
+        modelResponse({
+          claims: [],
+          resolutions: "invalid",
+        }),
+      silentLogger,
+    ).resolve(segmentRequest("source"), "Summary", [], []);
+    await expect(resolution).rejects.toThrow(
+      "invalid structured entity_resolution schema",
+    );
   });
 
   test("rejects a candidate ID that was not offered for the mention", async () => {
