@@ -879,22 +879,9 @@ export const Reflection: Plugin = async ({ client, directory }) => {
     requiredSegments: readonly ReflectionSegment[],
     deadline = Date.now() + SUMMARY_WAIT_TIMEOUT_MS,
     signal?: AbortSignal,
-    bypassTargetUpdateBarrier = false,
   ): Promise<readonly StoredSegmentSummary[]> => {
     while (true) {
-      let listing: SegmentListing;
-      if (bypassTargetUpdateBarrier) {
-        listing = await getSegmentListing(
-          sessionId,
-          signal,
-          Math.max(
-            1,
-            Math.min(PROJECTION_REQUEST_TIMEOUT_MS, deadline - Date.now()),
-          ),
-        );
-      } else {
-        listing = await getFreshSegmentListing(sessionId, deadline, signal);
-      }
+      const listing = await getFreshSegmentListing(sessionId, deadline, signal);
       const missing = requiredSegments.filter(
         (segment) =>
           exactSummaryForSegment(sessionId, listing.summaries, segment) ===
@@ -1488,7 +1475,6 @@ export const Reflection: Plugin = async ({ client, directory }) => {
                 "context projection failed: segment manifest unavailable",
               );
             }
-            const deadline = Date.now() + SUMMARY_WAIT_TIMEOUT_MS;
             const plan = await loadCanonicalPlan();
             foregroundSync ??= enqueueClosedTargetSync(
               model.sessionId,
@@ -1496,17 +1482,11 @@ export const Reflection: Plugin = async ({ client, directory }) => {
               generation,
               operation.signal,
             );
-            const remaining = deadline - Date.now();
-            if (remaining <= 0) {
-              throw new Error(
-                `segment summaries timed out after ${SUMMARY_WAIT_TIMEOUT_MS}ms`,
-              );
-            }
             let foregroundSyncFailed = false;
             try {
               await waitWithin(
                 foregroundSync.then(() => {}),
-                remaining,
+                TARGET_WAIT_TIMEOUT_MS,
               );
             } catch (error) {
               if (
@@ -1522,12 +1502,35 @@ export const Reflection: Plugin = async ({ client, directory }) => {
                 `Reflection foreground target sync failed for ${model.sessionId}: ${error instanceof Error ? error.message : String(error)}`,
               );
             }
+            if (foregroundSyncFailed) {
+              try {
+                const directListing = await getSegmentListing(
+                  model.sessionId,
+                  operation.signal,
+                  PROJECTION_REQUEST_TIMEOUT_MS,
+                );
+                return directListing.summaries;
+              } catch (error) {
+                if (
+                  operation.signal.aborted ||
+                  lifecycleAbort.signal.aborted ||
+                  deletedSessions.has(model.sessionId) ||
+                  (sessionGenerations.get(model.sessionId) ?? 0) !== generation
+                ) {
+                  throw error;
+                }
+                await log(
+                  `Reflection direct recovery listing failed for ${model.sessionId}: ${error instanceof Error ? error.message : String(error)}`,
+                );
+                return current.summaries;
+              }
+            }
+            const deadline = Date.now() + SUMMARY_WAIT_TIMEOUT_MS;
             return waitForRequiredSummaries(
               model.sessionId,
               requiredSegments,
               deadline,
               operation.signal,
-              foregroundSyncFailed,
             );
           },
         });

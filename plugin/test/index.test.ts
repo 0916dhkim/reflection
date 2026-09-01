@@ -3670,4 +3670,118 @@ describe("Reflection plugin hooks", () => {
       } as never),
     ).rejects.toThrow("was deleted");
   });
+
+  it("caps aggregate serial sync at 5s when a successful POST is followed by a blocked POST and recovers fresh summaries", async () => {
+    vi.useFakeTimers();
+    const sessionId = "aggregate-sync-cap-session";
+    const messages = projectionMessages(sessionId);
+    const current = messages.pop()!;
+    const additionalTurn = projectionMessages(`${sessionId}-additional`).slice(
+      0,
+      2,
+    );
+    for (const message of additionalTurn) message.info.sessionID = sessionId;
+    messages.push(...additionalTurn, current);
+    const closed = segmentMessages(messages).filter(
+      (segment) => segment.closed,
+    );
+    expect(closed).toHaveLength(2);
+    const client = clientFor(messages);
+    let postCount = 0;
+    let summaryGets = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+        if (init?.method === "POST") {
+          postCount += 1;
+          if (postCount === 1) {
+            await new Promise((resolve) => setTimeout(resolve, 4_000));
+            return acceptedSegment(init);
+          }
+          return new Promise<Response>((_resolve, reject) => {
+            init?.signal?.addEventListener(
+              "abort",
+              () => reject(init.signal?.reason),
+              { once: true },
+            );
+          });
+        }
+        summaryGets += 1;
+        return ok({
+          session_id: sessionId,
+          segments: closed.map((segment, index) =>
+            segmentSummary(sessionId, segment, `Available summary ${index}`),
+          ),
+          boundaries: closed.map((segment) =>
+            segmentBoundary(sessionId, segment),
+          ),
+          targets: [],
+        });
+      }),
+    );
+    const hooks = await Reflection(pluginInput(client));
+    const output = { messages: structuredClone(messages) };
+    const projection = hooks["experimental.chat.messages.transform"]?.(
+      {},
+      output as never,
+    );
+    let settled = false;
+    void projection?.then(() => {
+      settled = true;
+    });
+
+    await vi.advanceTimersByTimeAsync(0);
+    expect(postCount).toBe(1);
+
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(settled).toBe(true);
+    await projection;
+
+    expect(postCount).toBe(2);
+    expect(summaryGets).toBe(2);
+    expect(output.messages[1]?.parts[0]?.text).toContain("Available summary 0");
+    expect(output.messages[1]?.parts[0]?.text).not.toContain(
+      "Reflection summaries were unavailable",
+    );
+  });
+
+  it("falls back to initial listing summaries when direct recovery GET fails", async () => {
+    const sessionId = "recovery-get-fallback-session";
+    const messages = projectionMessages(sessionId);
+    const closed = segmentMessages(messages)[0]!;
+    const client = clientFor(messages);
+    let gets = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+        if (init?.method === "POST") {
+          return new Response("sync failed", { status: 500 });
+        }
+        gets += 1;
+        if (gets === 1) {
+          return ok({
+            session_id: sessionId,
+            segments: [
+              segmentSummary(sessionId, closed, "Initial listing summary"),
+            ],
+            boundaries: [segmentBoundary(sessionId, closed)],
+            targets: [],
+          });
+        }
+        return new Response("service unavailable", { status: 503 });
+      }),
+    );
+    const hooks = await Reflection(pluginInput(client));
+    const output = { messages: structuredClone(messages) };
+
+    await hooks["experimental.chat.messages.transform"]?.({}, output as never);
+
+    expect(gets).toBe(2);
+    expect(output.messages[1]?.parts[0]?.text).toContain(
+      "Initial listing summary",
+    );
+    expect(output.messages[1]?.parts[0]?.text).not.toContain(
+      "Reflection summaries were unavailable",
+    );
+  });
 });
