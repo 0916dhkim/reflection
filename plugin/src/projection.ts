@@ -24,6 +24,12 @@ export const PROJECTION_THRESHOLD_RATIO = 0.75;
 export const PROJECTION_TAIL_RATIO = 0.25;
 export const PROJECTION_SUMMARY_RATIO = 0.05;
 export const PROJECTION_HARD_LIMIT_RATIO = 0.9;
+export const CONTEXT_RESTORATION_NOTICE =
+  "This is system-generated context restoration, not a new user-authored request.";
+export const CAUSAL_USER_REQUEST_HEADER =
+  "## Causal user request (verbatim)\nThe retained assistant messages that follow were responding to this user request. It remains the active instruction.";
+export const CAUSAL_USER_REQUEST_FOOTER =
+  "## End of causal user request (verbatim)";
 const ESTIMATED_CHARS_PER_TOKEN = 4;
 const DEFAULT_OUTPUT_LIMIT = 32_000;
 const MAX_TOOL_OUTPUT_CHARS = 2_000;
@@ -217,10 +223,10 @@ function applyCheckpoint(
     (message) => message.info.id === checkpoint.tailStartMessageId,
   );
   if (tailIndex < 0) return null;
+  const prefix = messages.slice(0, tailIndex);
   if (
     !options?.skipPrefixFingerprint &&
-    archivedPrefixFingerprint(messages.slice(0, tailIndex)) !==
-      checkpoint.archivedPrefixFingerprint
+    archivedPrefixFingerprint(prefix) !== checkpoint.archivedPrefixFingerprint
   ) {
     return null;
   }
@@ -229,18 +235,10 @@ function applyCheckpoint(
   const first = tail[0];
   const activeUser = latestUserMessage(messages);
   if (!first || !activeUser) return null;
-  const archivedAssistant = messages
-    .slice(0, tailIndex)
-    .reverse()
-    .find(
-      (message) =>
-        message.info.role === "assistant" && isModelVisibleMessage(message),
-    );
   const sessionId = activeUser.info.sessionID;
   const model = activeUser.info.model;
   if (!sessionId || !model) return null;
   const userId = `${first.info.id}_reflection_context_user`;
-  const assistantId = `${first.info.id}_reflection_context_assistant`;
   const firstTime = first.info.time;
   const created =
     typeof firstTime === "object" &&
@@ -249,75 +247,90 @@ function applyCheckpoint(
     typeof firstTime.created === "number"
       ? firstTime.created - 1
       : 0;
+
+  const parts: OpenCodeMessage["parts"][number][] = [
+    {
+      id: `${userId}_part_0`,
+      sessionID: sessionId,
+      messageID: userId,
+      type: "text",
+      text: `${CONTEXT_RESTORATION_NOTICE}\n\n${checkpoint.summaryText}`,
+      synthetic: true,
+      ignored: false,
+    },
+  ];
+
+  if (first.info.role === "assistant") {
+    let causalUser: OpenCodeMessage | undefined;
+    if (first.info.parentID) {
+      causalUser = prefix.find(
+        (message) =>
+          message.info.id === first.info.parentID &&
+          isNormalUserMessage(message),
+      );
+    }
+    if (!causalUser) {
+      for (let index = prefix.length - 1; index >= 0; index -= 1) {
+        const message = prefix[index];
+        if (message && isNormalUserMessage(message)) {
+          causalUser = message;
+          break;
+        }
+      }
+    }
+
+    const causalParts =
+      causalUser?.parts.filter((part) =>
+        isModelVisiblePart(causalUser, part),
+      ) ?? [];
+    if (causalUser && causalParts.length > 0) {
+      parts.push({
+        id: `${userId}_causal_header`,
+        sessionID: sessionId,
+        messageID: userId,
+        type: "text",
+        text: CAUSAL_USER_REQUEST_HEADER,
+        synthetic: true,
+        ignored: false,
+      });
+      for (let index = 0; index < causalParts.length; index += 1) {
+        const part = causalParts[index]!;
+        parts.push({
+          ...part,
+          id: `${userId}_causal_${index}`,
+          sessionID: sessionId,
+          messageID: userId,
+          synthetic: true,
+        });
+      }
+      parts.push({
+        id: `${userId}_causal_footer`,
+        sessionID: sessionId,
+        messageID: userId,
+        type: "text",
+        text: CAUSAL_USER_REQUEST_FOOTER,
+        synthetic: true,
+        ignored: false,
+      });
+    }
+  }
+
   const contextUser: OpenCodeMessage = {
     info: {
       ...activeUser.info,
       id: userId,
       role: "user",
       sessionID: sessionId,
-      time: { created: created - 1 },
+      parentID: undefined,
+      time: { created },
       summary: undefined,
       system: undefined,
       tools: undefined,
     },
-    parts: [
-      {
-        id: `${userId}_part`,
-        sessionID: sessionId,
-        messageID: userId,
-        type: "compaction",
-        auto: true,
-      },
-    ],
+    parts,
   };
-  const contextAssistant: OpenCodeMessage = {
-    info: {
-      ...(archivedAssistant?.info ?? {
-        id: assistantId,
-        role: "assistant" as const,
-        mode:
-          typeof activeUser.info.agent === "string"
-            ? activeUser.info.agent
-            : "build",
-        path: { cwd: "", root: "" },
-        cost: 0,
-        tokens: {
-          input: 0,
-          output: 0,
-          reasoning: 0,
-          cache: { read: 0, write: 0 },
-        },
-        finish: "stop",
-      }),
-      id: assistantId,
-      sessionID: sessionId,
-      parentID: userId,
-      providerID: model.providerID,
-      modelID: model.modelID,
-      time: { created, completed: created },
-      cost: 0,
-      tokens: {
-        input: 0,
-        output: 0,
-        reasoning: 0,
-        cache: { read: 0, write: 0 },
-      },
-      summary: true,
-      error: undefined,
-    },
-    parts: [
-      {
-        id: `${assistantId}_part`,
-        sessionID: sessionId,
-        messageID: assistantId,
-        type: "text",
-        text: checkpoint.summaryText,
-        synthetic: true,
-        ignored: false,
-      },
-    ],
-  };
-  return [contextUser, contextAssistant, ...tail];
+
+  return [contextUser, ...tail];
 }
 
 function reportedInputTokens(message: OpenCodeMessage): number | null {

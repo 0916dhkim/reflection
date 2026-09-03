@@ -6,6 +6,9 @@ import {
   projectMessages as projectMessagesImplementation,
   projectionSummaryFingerprint,
   toProjectionArchivedSegment,
+  CONTEXT_RESTORATION_NOTICE,
+  CAUSAL_USER_REQUEST_HEADER,
+  CAUSAL_USER_REQUEST_FOOTER,
   type ProjectMessagesInput,
   type StoredSegmentSummary,
 } from "../src/projection.js";
@@ -14,6 +17,7 @@ import {
   PROJECTION_LOSS_WARNING,
   PROJECTION_LOSS_WARNING_METADATA,
   segmentMessages,
+  textOf,
   type OpenCodeMessage,
   type ReflectionSegment,
 } from "@reflection/shared/segmentation";
@@ -285,30 +289,26 @@ describe("projectMessages", () => {
     expect(result.reset).toBe(true);
     expect(result.estimatedTokens).toBeLessThan(CONTEXT_LIMIT * 0.75);
     expect(result.state.checkpoint?.tailStartMessageId).toMatch(/^u/);
-    expect(result.messages[2]?.info.id).toBe(
+    expect(result.messages[1]?.info.id).toBe(
       result.state.checkpoint?.tailStartMessageId,
     );
     expect(projectedContext(result.messages)).toContain("<reflection-context>");
     expect(projectedContext(result.messages)).toContain("37 tests passed");
+    expect(result.messages[0]?.info.role).toBe("user");
     expect(result.messages[0]?.parts[0]).toMatchObject({
-      type: "compaction",
-      sessionID: SESSION_ID,
-      messageID: result.messages[0]?.info.id,
-    });
-    expect(result.messages[1]?.parts[0]).toMatchObject({
       type: "text",
       sessionID: SESSION_ID,
-      messageID: result.messages[1]?.info.id,
+      messageID: result.messages[0]?.info.id,
+      synthetic: true,
     });
-    expect(result.messages[1]?.info).toMatchObject({
-      cost: 0,
-      tokens: {
-        input: 0,
-        output: 0,
-        reasoning: 0,
-        cache: { read: 0, write: 0 },
-      },
-    });
+    expect(result.messages[0]?.parts[0]?.text).toContain(
+      CONTEXT_RESTORATION_NOTICE,
+    );
+    expect(
+      result.messages
+        .flatMap((message) => message.parts)
+        .some((part) => part.type === "compaction"),
+    ).toBe(false);
     expect(result.messages.at(-1)?.info.id).toBe("current");
   });
 
@@ -441,14 +441,14 @@ describe("projectMessages", () => {
 
     expect(result.reset).toBe(true);
     expect(tailIndex).toBeGreaterThan(0);
-    expect(result.messages.slice(2)).toEqual(messages.slice(tailIndex));
-    result.messages.slice(2).forEach((message, index) => {
+    expect(result.messages.slice(1)).toEqual(messages.slice(tailIndex));
+    result.messages.slice(1).forEach((message, index) => {
       expect(message).toBe(messages[tailIndex + index]);
       expect(message.parts).toBe(messages[tailIndex + index]?.parts);
     });
     expect(
       result.messages
-        .slice(2)
+        .slice(1)
         .flatMap((message) => message.parts)
         .filter((part) => part.type === "tool")
         .every((part) =>
@@ -480,7 +480,7 @@ describe("projectMessages", () => {
 
     expect(result.reset).toBe(true);
     expect(result.state.checkpoint?.tailStartMessageId).toBe("current");
-    expect(result.messages.slice(2)).toEqual(messages.slice(3));
+    expect(result.messages.slice(1)).toEqual(messages.slice(3));
   });
 
   it("marks an interior orphan assistant outside canonical coverage as lossy", async () => {
@@ -592,20 +592,214 @@ describe("projectMessages", () => {
     );
     expect(result.reset).toBe(true);
     expect(result.state.checkpoint?.tailStartMessageId).toBe("step-2");
-    expect(result.messages[2]).toBe(messages[2]);
-    expect(result.messages[2]?.parts).toBe(messages[2]?.parts);
-    expect(result.messages[3]).toBe(messages[3]);
+    expect(result.messages[1]).toBe(messages[2]);
+    expect(result.messages[1]?.parts).toBe(messages[2]?.parts);
+    expect(result.messages[2]).toBe(messages[3]);
     expect(result.messages[0]?.info).toMatchObject({
       role: "user",
       sessionID: SESSION_ID,
       model: { providerID: PROVIDER_ID, modelID: MODEL_ID },
     });
-    expect(result.messages[1]?.info).toMatchObject({
-      role: "assistant",
+    expect(textOf(result.messages[0]!)).toContain("request");
+  });
+
+  it("preserves the causal user request when cutoff begins at an assistant inside an active turn (side-gallery failure)", async () => {
+    const causalInstruction =
+      "Please review test logs, draft PR + deploy preview for the gallery fix.";
+    const causalUserMessage: OpenCodeMessage = {
+      info: {
+        id: "causal-turn",
+        sessionID: SESSION_ID,
+        role: "user",
+        agent: "build",
+        model: { providerID: PROVIDER_ID, modelID: MODEL_ID },
+      },
+      parts: [
+        {
+          type: "text",
+          text: causalInstruction,
+        },
+        {
+          type: "file",
+          filename: "gallery-preview.png",
+          mime: "image/png",
+          url: "file:///tmp/gallery-preview.png",
+        },
+        {
+          type: "file",
+          filename: "notes.txt",
+          mime: "text/plain",
+          url: "file:///tmp/notes.txt",
+        },
+        {
+          type: "text",
+          text: "ignored user prompt text",
+          ignored: true,
+        },
+      ],
+    };
+    const messages = [
+      causalUserMessage,
+      assistant("step-1", "causal-turn", "a".repeat(30_000), [], 100_000),
+      assistant("step-2", "causal-turn", "b".repeat(30_000)),
+      user("current", "continue"),
+    ];
+    const canonical = segmentMessages(messages);
+    expect(canonical.map((segment) => segment.startMessageId)).toContain(
+      "step-2",
+    );
+
+    // Exact summaries for the causal segment are unavailable; missing-summary condition exists
+    const result = await projectMessages({
+      messages,
+      contextLimit: CONTEXT_LIMIT,
+      loadCanonicalSegments: async () => canonical,
+      loadSummaries: async () => [],
+    });
+
+    expect(result.reset).toBe(true);
+    expect(result.state.checkpoint?.tailStartMessageId).toBe("step-2");
+
+    // Exactly one generated user-role message before the raw tail
+    const tailStartIndex = messages.findIndex((m) => m.info.id === "step-2");
+    const tail = messages.slice(tailStartIndex);
+    expect(result.messages).toHaveLength(1 + tail.length);
+    expect(result.messages[0]?.info.role).toBe("user");
+
+    // No generated compaction part and no 'What did we do so far?' marker
+    expect(
+      result.messages
+        .flatMap((m) => m.parts)
+        .some((part) => part.type === "compaction"),
+    ).toBe(false);
+    expect(JSON.stringify(result.messages)).not.toContain(
+      "What did we do so far?",
+    );
+
+    // The exact causal instruction remains model-visible in that generated user message
+    const generatedUserText = textOf(result.messages[0]!);
+    expect(generatedUserText).toContain("draft PR + deploy preview");
+    expect(
+      result.messages[0]?.parts.some(
+        (part) =>
+          part.type === "text" &&
+          typeof part.text === "string" &&
+          part.text.includes("draft PR + deploy preview"),
+      ),
+    ).toBe(true);
+    expect(generatedUserText).not.toContain("ignored user prompt text");
+
+    // Notice text and verbatim summaryText notice are present
+    expect(generatedUserText).toContain(CONTEXT_RESTORATION_NOTICE);
+    expect(generatedUserText).toContain(CAUSAL_USER_REQUEST_HEADER);
+    expect(generatedUserText).toContain(CAUSAL_USER_REQUEST_FOOTER);
+
+    // Supported file part is copied; unsupported text/plain is omitted
+    const fileParts = result.messages[0]?.parts.filter(
+      (part) => part.type === "file",
+    );
+    expect(fileParts).toHaveLength(1);
+    expect(fileParts?.[0]).toMatchObject({
+      type: "file",
+      filename: "gallery-preview.png",
+      mime: "image/png",
+      synthetic: true,
+      messageID: result.messages[0]?.info.id,
       sessionID: SESSION_ID,
-      providerID: PROVIDER_ID,
-      modelID: MODEL_ID,
-      parentID: result.messages[0]?.info.id,
+    });
+    expect(
+      result.messages[0]?.parts.some((p) => p.filename === "notes.txt"),
+    ).toBe(false);
+
+    // Assistant-starting raw tail remains object-identical
+    expect(result.messages.slice(1)).toEqual(tail);
+    result.messages.slice(1).forEach((message, index) => {
+      expect(message).toBe(tail[index]);
+      expect(message.parts).toBe(tail[index]?.parts);
+    });
+
+    // Missing summary condition is recorded
+    expect(result.diagnostic?.lossy).toBe(true);
+    expect(result.diagnostic?.omissionReasons).toContain(
+      "missing-segment-summaries",
+    );
+  });
+
+  it("falls back to nearest preceding normal user when first assistant parentID does not identify a user in prefix", async () => {
+    const causalUserMessage = user(
+      "causal-turn",
+      "run tests and draft PR + deploy preview",
+    );
+    const step1 = assistant(
+      "step-1",
+      "causal-turn",
+      "a".repeat(30_000),
+      [],
+      100_000,
+    );
+    const step2 = assistant("step-2", "causal-turn", "b".repeat(30_000));
+    const current = user("current", "continue");
+    const messages = [causalUserMessage, step1, step2, current];
+    const canonical = segmentMessages(messages);
+    // Simulate first assistant parentID not pointing to a prefix user
+    step2.info.parentID = "unknown-user";
+
+    const result = await projectMessages({
+      messages,
+      contextLimit: CONTEXT_LIMIT,
+      loadCanonicalSegments: async () => canonical,
+      loadSummaries: async () => [],
+    });
+
+    expect(result.reset).toBe(true);
+    expect(result.state.checkpoint?.tailStartMessageId).toBe("step-2");
+    expect(textOf(result.messages[0]!)).toContain("draft PR + deploy preview");
+  });
+
+  it("preserves a user-starting tail without duplicating the user request", async () => {
+    const messages = [
+      user("u0", "first turn"),
+      assistant("a0", "u0", "a".repeat(30_000), [], 100_000),
+      user("u1", "second turn starting tail"),
+      assistant("a1", "u1", "response"),
+      user("current", "continue"),
+    ];
+    const canonical = segmentMessages(messages);
+
+    const result = await projectMessages({
+      messages,
+      contextLimit: CONTEXT_LIMIT,
+      loadCanonicalSegments: async () => canonical,
+      loadSummaries: async () => summaries(messages),
+    });
+
+    expect(result.reset).toBe(true);
+    expect(result.state.checkpoint?.tailStartMessageId).toBe("u1");
+
+    // Exactly one generated user message before the raw tail
+    const tail = messages.slice(2);
+    expect(result.messages).toHaveLength(1 + tail.length);
+    expect(result.messages[0]?.info.role).toBe("user");
+
+    // No compaction part, no 'What did we do so far?', and no causal request boundary
+    expect(
+      result.messages
+        .flatMap((m) => m.parts)
+        .some((part) => part.type === "compaction"),
+    ).toBe(false);
+    expect(JSON.stringify(result.messages)).not.toContain(
+      "What did we do so far?",
+    );
+    expect(textOf(result.messages[0]!)).not.toContain(
+      "Causal user request (verbatim)",
+    );
+
+    // Tail starts with u1 and is object-identical
+    expect(result.messages[1]?.info.id).toBe("u1");
+    expect(result.messages.slice(1)).toEqual(tail);
+    result.messages.slice(1).forEach((message, index) => {
+      expect(message).toBe(tail[index]);
+      expect(message.parts).toBe(tail[index]?.parts);
     });
   });
 
@@ -647,7 +841,7 @@ describe("projectMessages", () => {
       (message) => message.info.id === tailId,
     );
     expect(tailIndex).toBeGreaterThan(1);
-    result.messages.slice(2).forEach((message, index) => {
+    result.messages.slice(1).forEach((message, index) => {
       expect(message).toBe(filtered[tailIndex + index]);
     });
   });
@@ -682,7 +876,7 @@ describe("projectMessages", () => {
 
     expect(result.reset).toBe(true);
     expect(result.state.checkpoint?.tailStartMessageId).toBe("current");
-    expect(result.messages[2]).toBe(raw[6]);
+    expect(result.messages[1]).toBe(raw[6]);
   });
 
   it("immediately resets when switching to a smaller context model", async () => {
@@ -1057,13 +1251,11 @@ describe("projectMessages", () => {
 
     expect(result.reset).toBe(true);
     expect(result.state.checkpoint?.lossy).toBeUndefined();
-    expect(result.messages[1]?.info).toMatchObject({
-      role: "assistant",
-      providerID: PROVIDER_ID,
-      modelID: MODEL_ID,
-      finish: "stop",
-      cost: 0,
+    expect(result.messages[0]?.info).toMatchObject({
+      role: "user",
+      sessionID: SESSION_ID,
     });
+    expect(result.messages[1]?.info.id).toBe("current");
   });
 
   it("does not resurrect compacted tool output", async () => {
