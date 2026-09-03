@@ -42,6 +42,7 @@ import {
   type StoredSegmentSummary,
 } from "./projection.js";
 import { ProjectionStateStore } from "./projection-state.js";
+import { stripStaleToolAttachments } from "./attachments.js";
 
 const CONFIG_PATH = join(homedir(), ".config", "opencode", "reflection.json");
 const PROJECTION_STATE_PATH = join(
@@ -1407,7 +1408,9 @@ export const Reflection: Plugin = async ({ client, directory }) => {
         output.messages.splice(
           0,
           output.messages.length,
-          ...(result.messages as typeof output.messages),
+          ...(stripStaleToolAttachments(
+            result.messages,
+          ) as typeof output.messages),
         );
         if (result.reset) {
           if (result.diagnostic?.lossy) {
