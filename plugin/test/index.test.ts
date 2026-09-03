@@ -676,7 +676,7 @@ describe("Reflection plugin hooks", () => {
     expect(summaryGets).toBe(4);
     expect(client.session.messages).toHaveBeenCalledTimes(3);
     expect(client.session.status).toHaveBeenCalledTimes(4);
-    expect(output.messages[1]?.parts[0]?.text).toContain(
+    expect(output.messages[0]?.parts[0]?.text).toContain(
       "Reflection compacted older context with omissions",
     );
 
@@ -1034,8 +1034,8 @@ describe("Reflection plugin hooks", () => {
       segmentId(sessionId, retained),
     ]);
     expect(postedPriorities).toEqual([50, 50, 100]);
-    expect(output.messages[1]?.parts[0]?.text).toContain("Retained summary");
-    expect(output.messages[1]?.parts[0]?.text).not.toContain(
+    expect(output.messages[0]?.parts[0]?.text).toContain("Retained summary");
+    expect(output.messages[0]?.parts[0]?.text).not.toContain(
       "Reflection summaries were unavailable",
     );
   });
@@ -2155,7 +2155,7 @@ describe("Reflection plugin hooks", () => {
 
     releaseRestartSync?.();
     await projection;
-    const context = output.messages[1]?.parts[0]?.text;
+    const context = output.messages[0]?.parts[0]?.text;
     expect(summaryGets).toBe(3);
     expect(context).toContain("FRESH SUMMARY");
     expect(context).not.toContain("STALE SUMMARY");
@@ -2275,8 +2275,8 @@ describe("Reflection plugin hooks", () => {
         start_user_message_id: `${sessionId}-current`,
       }),
     );
-    expect(output.messages[1]?.parts[0]?.text).toContain("Recovered summary");
-    expect(output.messages[1]?.parts[0]?.text).not.toContain(
+    expect(output.messages[0]?.parts[0]?.text).toContain("Recovered summary");
+    expect(output.messages[0]?.parts[0]?.text).not.toContain(
       "Reflection summaries were unavailable",
     );
   });
@@ -2328,7 +2328,7 @@ describe("Reflection plugin hooks", () => {
         start_user_message_id: `${sessionId}-current`,
       }),
     );
-    expect(output.messages[1]?.parts[0]?.text).toContain(
+    expect(output.messages[0]?.parts[0]?.text).toContain(
       "archived closed segments had no exact committed Reflection summary",
     );
   });
@@ -2371,7 +2371,7 @@ describe("Reflection plugin hooks", () => {
 
     expect(targetPosts).toBe(2);
     expect(summaryGets).toBe(3);
-    expect(output.messages[1]?.parts[0]?.text).toContain(
+    expect(output.messages[0]?.parts[0]?.text).toContain(
       "archived closed segments had no exact committed Reflection summary",
     );
   });
@@ -2505,10 +2505,10 @@ describe("Reflection plugin hooks", () => {
       newClosedKey,
     ]);
     expect(summaryGets).toBe(4);
-    expect(output.messages[1]?.parts[0]?.text).not.toContain(
+    expect(output.messages[0]?.parts[0]?.text).not.toContain(
       "Reflection summaries were unavailable",
     );
-    expect(output.messages[1]?.parts[0]?.text).toContain(
+    expect(output.messages[0]?.parts[0]?.text).toContain(
       "archived closed segments had no exact committed Reflection summary",
     );
   });
@@ -2733,7 +2733,7 @@ describe("Reflection plugin hooks", () => {
 
     expect(targetPosts).toBe(2);
     expect(summaryGets).toBe(4);
-    expect(output.messages[1]?.parts[0]?.text).toContain("Post-rewind summary");
+    expect(output.messages[0]?.parts[0]?.text).toContain("Post-rewind summary");
   });
 
   it("never rejects when queued idle finish work fails", async () => {
@@ -2830,8 +2830,8 @@ describe("Reflection plugin hooks", () => {
 
     expect(gets).toBe(2);
     expect(posted.length).toBeGreaterThan(0);
-    expect(output.messages[1]?.parts[0]?.text).toContain("Available summary 1");
-    expect(output.messages[1]?.parts[0]?.text).not.toContain(
+    expect(output.messages[0]?.parts[0]?.text).toContain("Available summary 1");
+    expect(output.messages[0]?.parts[0]?.text).not.toContain(
       "Reflection summaries were unavailable",
     );
   });
@@ -2863,7 +2863,7 @@ describe("Reflection plugin hooks", () => {
     await hooks["experimental.chat.messages.transform"]?.({}, output as never);
 
     expect(summaryGets).toBeLessThanOrEqual(2);
-    expect(output.messages[1]?.parts[0]?.text).toContain(
+    expect(output.messages[0]?.parts[0]?.text).toContain(
       "had no exact committed Reflection summary",
     );
   });
@@ -2893,7 +2893,7 @@ describe("Reflection plugin hooks", () => {
     await hooks["experimental.chat.messages.transform"]?.({}, output as never);
 
     expect(gets).toBe(2);
-    expect(output.messages[1]?.parts[0]?.text).toContain(
+    expect(output.messages[0]?.parts[0]?.text).toContain(
       "archived closed segments had no exact committed Reflection summary",
     );
   });
@@ -2924,7 +2924,7 @@ describe("Reflection plugin hooks", () => {
     await hooks["experimental.chat.messages.transform"]?.({}, output as never);
 
     expect(gets).toBe(2);
-    expect(output.messages[1]?.parts[0]?.text).toContain(
+    expect(output.messages[0]?.parts[0]?.text).toContain(
       "had no exact committed Reflection summary",
     );
   });
@@ -2951,7 +2951,7 @@ describe("Reflection plugin hooks", () => {
 
     expect(posts).toBe(0);
     expect(client.session.messages).toHaveBeenCalledOnce();
-    expect(output.messages[1]?.parts[0]?.text).toContain(
+    expect(output.messages[0]?.parts[0]?.text).toContain(
       "Reflection summaries were unavailable",
     );
   });
@@ -2984,7 +2984,7 @@ describe("Reflection plugin hooks", () => {
     await vi.advanceTimersByTimeAsync(5_000);
     await projection;
 
-    expect(output.messages[1]?.parts[0]?.text).toContain(
+    expect(output.messages[0]?.parts[0]?.text).toContain(
       "Reflection summaries were unavailable",
     );
   });
@@ -3031,7 +3031,7 @@ describe("Reflection plugin hooks", () => {
     await Promise.all([idle, projection]);
 
     expect(summaryGets).toBe(3);
-    expect(output.messages[1]?.parts[0]?.text).toContain(
+    expect(output.messages[0]?.parts[0]?.text).toContain(
       "archived closed segments had no exact committed Reflection summary",
     );
   });
@@ -3339,10 +3339,10 @@ describe("Reflection plugin hooks", () => {
     await hooks["experimental.chat.messages.transform"]?.({}, output1 as never);
     expect(targetPosts).toBe(1);
     expect(client.session.messages).toHaveBeenCalledOnce();
-    expect(output1.messages[1]?.parts[0]?.text).not.toContain(
+    expect(output1.messages[0]?.parts[0]?.text).not.toContain(
       "Newly ready summary",
     );
-    expect(output1.messages[1]?.parts[0]?.text).toContain(
+    expect(output1.messages[0]?.parts[0]?.text).toContain(
       "archived closed segments had no exact committed Reflection summary",
     );
 
@@ -3363,10 +3363,10 @@ describe("Reflection plugin hooks", () => {
     await hooks["experimental.chat.messages.transform"]?.({}, output2 as never);
     expect(targetPosts).toBe(1);
     expect(client.session.messages).toHaveBeenCalledTimes(2);
-    expect(output2.messages[1]?.parts[0]?.text).toContain(
+    expect(output2.messages[0]?.parts[0]?.text).toContain(
       "Newly ready summary",
     );
-    expect(output2.messages[1]?.parts[0]?.text).not.toContain(
+    expect(output2.messages[0]?.parts[0]?.text).not.toContain(
       "archived closed segments had no exact committed Reflection summary",
     );
 
@@ -3386,7 +3386,7 @@ describe("Reflection plugin hooks", () => {
     await hooks["experimental.chat.messages.transform"]?.({}, output3 as never);
     expect(targetPosts).toBe(1);
     expect(client.session.messages).toHaveBeenCalledTimes(2);
-    expect(output3.messages[1]?.parts[0]?.text).toContain(
+    expect(output3.messages[0]?.parts[0]?.text).toContain(
       "Newly ready summary",
     );
   });
@@ -3447,7 +3447,7 @@ describe("Reflection plugin hooks", () => {
     await hooks["experimental.chat.messages.transform"]?.({}, output1 as never);
     expect(targetPosts).toBe(3);
     expect(client.session.messages).toHaveBeenCalledOnce();
-    expect(output1.messages[1]?.parts[0]?.text).toContain("Initial summary 1");
+    expect(output1.messages[0]?.parts[0]?.text).toContain("Initial summary 1");
 
     // Turn 2: second summary appears and first summary changes, but source is unchanged
     firstSummaryText = "Updated summary 1";
@@ -3468,8 +3468,8 @@ describe("Reflection plugin hooks", () => {
     // Nonzero source-valid checkpoint is reused without rebuilding
     expect(targetPosts).toBe(3);
     expect(client.session.messages).toHaveBeenCalledOnce();
-    expect(output2.messages[1]?.parts[0]?.text).toContain("Initial summary 1");
-    expect(output2.messages[1]?.parts[0]?.text).not.toContain(
+    expect(output2.messages[0]?.parts[0]?.text).toContain("Initial summary 1");
+    expect(output2.messages[0]?.parts[0]?.text).not.toContain(
       "Newly ready summary 2",
     );
 
@@ -3494,8 +3494,8 @@ describe("Reflection plugin hooks", () => {
     // Source mismatch invalidates and triggers a rebuild incorporating both updated summaries
     expect(targetPosts).toBe(5);
     expect(client.session.messages).toHaveBeenCalledTimes(2);
-    expect(output3.messages[1]?.parts[0]?.text).toContain("Updated summary 1");
-    expect(output3.messages[1]?.parts[0]?.text).toContain(
+    expect(output3.messages[0]?.parts[0]?.text).toContain("Updated summary 1");
+    expect(output3.messages[0]?.parts[0]?.text).toContain(
       "Newly ready summary 2",
     );
   });
@@ -3550,10 +3550,10 @@ describe("Reflection plugin hooks", () => {
 
     await hooks["experimental.chat.messages.transform"]?.({}, output as never);
 
-    expect(output.messages[1]?.parts[0]?.text).toContain(
+    expect(output.messages[0]?.parts[0]?.text).toContain(
       "First completed summary",
     );
-    expect(output.messages[1]?.parts[0]?.text).not.toContain(
+    expect(output.messages[0]?.parts[0]?.text).not.toContain(
       "Reflection summaries were unavailable",
     );
   });
@@ -3726,8 +3726,8 @@ describe("Reflection plugin hooks", () => {
 
     expect(postCount).toBe(2);
     expect(summaryGets).toBe(2);
-    expect(output.messages[1]?.parts[0]?.text).toContain("Available summary 0");
-    expect(output.messages[1]?.parts[0]?.text).not.toContain(
+    expect(output.messages[0]?.parts[0]?.text).toContain("Available summary 0");
+    expect(output.messages[0]?.parts[0]?.text).not.toContain(
       "Reflection summaries were unavailable",
     );
   });
@@ -3764,10 +3764,10 @@ describe("Reflection plugin hooks", () => {
     await hooks["experimental.chat.messages.transform"]?.({}, output as never);
 
     expect(gets).toBe(2);
-    expect(output.messages[1]?.parts[0]?.text).toContain(
+    expect(output.messages[0]?.parts[0]?.text).toContain(
       "Initial listing summary",
     );
-    expect(output.messages[1]?.parts[0]?.text).not.toContain(
+    expect(output.messages[0]?.parts[0]?.text).not.toContain(
       "Reflection summaries were unavailable",
     );
   });
