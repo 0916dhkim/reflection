@@ -1440,6 +1440,7 @@ export const Reflection: Plugin = async ({ client, directory }) => {
                   extra: {
                     ...result.diagnostic,
                     estimatedTokens: result.estimatedTokens,
+                    estimatedBytes: result.estimatedBytes,
                     thresholdTokens: result.thresholdTokens,
                     hardLimitTokens: result.hardLimitTokens,
                     contextLimit: limits.contextLimit,

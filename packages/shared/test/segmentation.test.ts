@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import { sourceFingerprint } from "../src/domain.js";
 import { modelVisibleToolStateSize } from "../src/tool-source.js";
+import { modelWireSize } from "../src/segmentation.js";
 import {
   PROJECTION_LOSS_WARNING,
   PROJECTION_LOSS_WARNING_METADATA,
@@ -1635,5 +1636,76 @@ describe("modelVisibleToolStateSize", () => {
     });
 
     expect(nested.utf8Bytes).toBeGreaterThan(1_000);
+  });
+});
+
+describe("modelWireSize", () => {
+  function assistantWithTool(state: unknown): OpenCodeMessage {
+    return {
+      info: {
+        id: "a0",
+        sessionID: "s",
+        role: "assistant",
+        parentID: "u0",
+        providerID: "p",
+        modelID: "m",
+        time: { created: 0, completed: 1 },
+        finish: "stop",
+      },
+      parts: [{ type: "tool", tool: "read", callID: "c0", state }],
+    } as unknown as OpenCodeMessage;
+  }
+
+  const dataUrl = (bytes: number) =>
+    `data:image/png;base64,${"A".repeat(bytes)}`;
+
+  it("reports tokens and bytes from one traversal", () => {
+    const size = modelWireSize([
+      assistantWithTool({
+        status: "completed",
+        input: {},
+        output: "x".repeat(400),
+      }),
+    ]);
+
+    expect(size.bytes).toBeGreaterThan(400);
+    expect(size.tokens).toBeGreaterThan(0);
+    expect(size.tokens).toBeLessThan(size.bytes);
+  });
+
+  it("measures media bytes from the encoded url, not from its token cost", () => {
+    const small = modelWireSize([
+      assistantWithTool({
+        status: "completed",
+        input: {},
+        output: "ok",
+        attachments: [{ mime: "image/png", url: dataUrl(1_000) }],
+      }),
+    ]);
+    const large = modelWireSize([
+      assistantWithTool({
+        status: "completed",
+        input: {},
+        output: "ok",
+        attachments: [{ mime: "image/png", url: dataUrl(500_000) }],
+      }),
+    ]);
+
+    // Images are priced by resolution, so tokens match while bytes do not.
+    expect(large.tokens).toBe(small.tokens);
+    expect(large.bytes - small.bytes).toBeGreaterThan(490_000);
+  });
+
+  it("excludes host-side tool metadata from both measurements", () => {
+    const base = { status: "completed", input: {}, output: "ok" };
+    const withMetadata = { ...base, metadata: { diff: "d".repeat(2_000_000) } };
+
+    expect(modelWireSize([assistantWithTool(withMetadata)])).toEqual(
+      modelWireSize([assistantWithTool(base)]),
+    );
+  });
+
+  it("ignores messages the model never receives", () => {
+    expect(modelWireSize([])).toEqual({ tokens: 0, bytes: 0 });
   });
 });
