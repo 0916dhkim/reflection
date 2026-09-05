@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import { sourceFingerprint } from "../src/domain.js";
+import { modelVisibleToolStateSize } from "../src/tool-source.js";
 import {
   PROJECTION_LOSS_WARNING,
   PROJECTION_LOSS_WARNING_METADATA,
@@ -1582,5 +1583,57 @@ describe("readSegmentMessages", () => {
     expect(() => readSegmentMessages(messages, "u2", "u1")).toThrow(
       "out of order",
     );
+  });
+});
+
+describe("modelVisibleToolStateSize", () => {
+  it("counts the input and output the provider receives", () => {
+    const size = modelVisibleToolStateSize({
+      status: "completed",
+      input: { path: "a.ts" },
+      output: "x".repeat(500),
+    });
+
+    expect(size.utf8Bytes).toBeGreaterThan(500);
+    expect(size.utf8Bytes).toBeLessThan(700);
+  });
+
+  it("ignores host-side tool metadata", () => {
+    const base = { status: "completed", input: {}, output: "done" };
+    const withMetadata = {
+      ...base,
+      metadata: { diff: "d".repeat(5_000_000), files: ["a", "b"] },
+    };
+
+    expect(modelVisibleToolStateSize(withMetadata)).toEqual(
+      modelVisibleToolStateSize(base),
+    );
+  });
+
+  it("ignores attachments, which are measured as media", () => {
+    const base = { status: "completed", input: {}, output: "done" };
+    const withAttachments = {
+      ...base,
+      attachments: [
+        {
+          mime: "image/png",
+          url: `data:image/png;base64,${"A".repeat(10_000)}`,
+        },
+      ],
+    };
+
+    expect(modelVisibleToolStateSize(withAttachments)).toEqual(
+      modelVisibleToolStateSize(base),
+    );
+  });
+
+  it("still counts a nested key named metadata", () => {
+    const nested = modelVisibleToolStateSize({
+      status: "completed",
+      input: { metadata: "n".repeat(1_000) },
+      output: "done",
+    });
+
+    expect(nested.utf8Bytes).toBeGreaterThan(1_000);
   });
 });

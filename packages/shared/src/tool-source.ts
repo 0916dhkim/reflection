@@ -341,6 +341,15 @@ function modelVisibleToolStateValue(value: unknown): unknown {
     : state;
 }
 
+/**
+ * Tool state keys that never reach the provider. `attachments` are measured
+ * separately as media, and `metadata` holds host-side bookkeeping such as
+ * diffs and file snapshots, which a tool may populate far beyond the size of
+ * anything the model sees. Counting either here would size a request by
+ * content that is not in it.
+ */
+const UNSENT_TOOL_STATE_KEYS = new Set(["attachments", "metadata"]);
+
 export function modelVisibleToolStateSize(value: unknown): {
   chars: number;
   utf8Bytes: number;
@@ -350,7 +359,9 @@ export function modelVisibleToolStateSize(value: unknown): {
     const seen = new WeakSet<object>();
     const serialized =
       JSON.stringify(visible, function (key, item: unknown) {
-        if (this === visible && key === "attachments") return undefined;
+        if (this === visible && UNSENT_TOOL_STATE_KEYS.has(key)) {
+          return undefined;
+        }
         if (typeof item === "string" && item.startsWith("data:")) {
           return "[data URL omitted]";
         }
