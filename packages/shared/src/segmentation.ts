@@ -1,7 +1,9 @@
 import { sourceFingerprint } from "./domain.js";
 import {
   MAX_COMPLETE_TOOL_SOURCE_CHARS,
+  modelVisibleMediaBytes,
   modelVisibleMediaTokens,
+  modelVisibleToolAttachmentBytes,
   modelVisibleToolAttachmentTokens,
   modelVisibleToolInlineDataTokens,
   modelVisibleToolStateSize,
@@ -387,6 +389,136 @@ function canonicalHistory(
   return { turns: completeTurns, messages: sourceMessages };
 }
 
+export interface ModelWireSize {
+  /** Estimated tokens the model reads. */
+  tokens: number;
+  /** Serialized bytes the request body carries. */
+  bytes: number;
+}
+
+const EMPTY_WIRE_SIZE: ModelWireSize = { tokens: 0, bytes: 0 };
+
+function addWireSize(left: ModelWireSize, right: ModelWireSize): ModelWireSize {
+  return {
+    tokens: left.tokens + right.tokens,
+    bytes: left.bytes + right.bytes,
+  };
+}
+
+/**
+ * Media is measured numerically rather than serialized. A single screenshot is
+ * hundreds of kilobytes of base64, so materializing one to size it would cost
+ * more than the request it is describing, and its token cost is set by
+ * resolution rather than by length.
+ */
+function mediaWireSize(tokens: number, bytes: number): ModelWireSize {
+  return { tokens, bytes };
+}
+
+function toolPartWire(part: OpenCodePart): {
+  sent: unknown;
+  media: ModelWireSize;
+} {
+  let toolName: unknown;
+  let state: unknown;
+  try {
+    toolName = part.tool;
+    state = part.state;
+  } catch {
+    return {
+      sent: { type: "tool" },
+      media: mediaWireSize(Number.POSITIVE_INFINITY, Number.POSITIVE_INFINITY),
+    };
+  }
+  const stateSize = modelVisibleToolStateSize(state);
+  const attachmentTokens = modelVisibleToolAttachmentTokens(state);
+  const inlineTokens = modelVisibleToolInlineDataTokens(state);
+  return {
+    sent: {
+      type: "tool",
+      tool: typeof toolName === "string" ? toolName : "",
+    },
+    media: mediaWireSize(
+      Math.ceil(stateSize.utf8Bytes / ESTIMATED_CHARS_PER_TOKEN) +
+        attachmentTokens +
+        inlineTokens,
+      stateSize.utf8Bytes + modelVisibleToolAttachmentBytes(state),
+    ),
+  };
+}
+
+/**
+ * The single description of what opencode transmits for one message. Every
+ * size question — context budget, request bytes, segment weight — is answered
+ * from this one traversal, so the answers cannot disagree with each other.
+ */
+export function modelWireSizeOfMessage(
+  message: OpenCodeMessage,
+): ModelWireSize {
+  if (!isModelVisibleMessage(message)) return EMPTY_WIRE_SIZE;
+  let media = EMPTY_WIRE_SIZE;
+  const sent: unknown[] = [];
+  for (const part of message.parts) {
+    if (!isModelVisiblePart(message, part)) continue;
+    if (part.type === "text" || part.type === "reasoning") {
+      sent.push({ type: part.type, text: part.text ?? "" });
+      continue;
+    }
+    if (part.type === "tool") {
+      const tool = toolPartWire(part);
+      sent.push(tool.sent);
+      media = addWireSize(media, tool.media);
+      continue;
+    }
+    if (part.type === "file") {
+      const tokens = modelVisibleMediaTokens(part);
+      sent.push({
+        type: "file",
+        filename: part.filename?.slice(0, 500),
+        mime: part.mime?.slice(0, 200),
+      });
+      media = addWireSize(
+        media,
+        mediaWireSize(tokens, modelVisibleMediaBytes(part)),
+      );
+    }
+  }
+  if (sent.length === 0 && media === EMPTY_WIRE_SIZE) return EMPTY_WIRE_SIZE;
+  const serialized = serializedWireBytes({
+    role: message.info.role,
+    parts: sent,
+  });
+  return addWireSize(media, {
+    tokens: Math.ceil(serialized / ESTIMATED_CHARS_PER_TOKEN),
+    bytes: serialized,
+  });
+}
+
+export function modelWireSize(
+  messages: readonly OpenCodeMessage[],
+): ModelWireSize {
+  let total = EMPTY_WIRE_SIZE;
+  for (const message of messages) {
+    total = addWireSize(total, modelWireSizeOfMessage(message));
+  }
+  return total;
+}
+
+function serializedWireBytes(value: unknown): number {
+  try {
+    const serialized = JSON.stringify(value);
+    return serialized === undefined ? 0 : Buffer.byteLength(serialized, "utf8");
+  } catch {
+    return Number.POSITIVE_INFINITY;
+  }
+}
+
+/**
+ * Segment weight answers a different question from request size: it measures
+ * the rendered source a summary is built from, not the payload the provider
+ * receives. The two diverge wherever rendering and transmission differ, so
+ * they are measured separately on purpose.
+ */
 export function modelVisibleCharWeightOf(message: OpenCodeMessage): number {
   if (!isModelVisibleMessage(message)) return 0;
   let weight = 0;

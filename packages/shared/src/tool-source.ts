@@ -484,3 +484,48 @@ export function modelVisibleToolInlineDataTokens(value: unknown): number {
     return Number.POSITIVE_INFINITY;
   }
 }
+
+function mediaUrlBytes(value: unknown): number {
+  if (typeof value !== "object" || value === null) return 0;
+  const item = value as Record<string, unknown>;
+  if (typeof item.url !== "string") return 0;
+  // Encoded media is ASCII, where length and byte length agree. Measuring by
+  // length keeps this O(1) instead of walking megabytes of base64 on a path
+  // that runs for every request.
+  return item.url.startsWith("data:")
+    ? item.url.length
+    : Buffer.byteLength(item.url, "utf8");
+}
+
+/**
+ * Wire bytes for the media a tool result carries. Measured from the encoded
+ * URL rather than derived from the token estimate: image tokens are priced by
+ * resolution, so the two quantities have no fixed ratio.
+ */
+export function modelVisibleToolAttachmentBytes(value: unknown): number {
+  try {
+    if (typeof value !== "object" || value === null) return 0;
+    const state = value as Record<string, unknown>;
+    const time =
+      typeof state.time === "object" && state.time !== null
+        ? (state.time as Record<string, unknown>)
+        : {};
+    if (
+      state.status !== "completed" ||
+      typeof time.compacted === "number" ||
+      !Array.isArray(state.attachments)
+    ) {
+      return 0;
+    }
+    return state.attachments.reduce<number>(
+      (total, attachment) => total + mediaUrlBytes(attachment),
+      0,
+    );
+  } catch {
+    return Number.POSITIVE_INFINITY;
+  }
+}
+
+export function modelVisibleMediaBytes(value: unknown): number {
+  return mediaUrlBytes(value);
+}

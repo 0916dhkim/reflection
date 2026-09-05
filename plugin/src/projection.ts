@@ -5,6 +5,7 @@ import {
   isModelVisiblePart,
   isNormalUserMessage,
   isProjectionLossWarningMessage,
+  modelWireSize,
   PROJECTION_LOSS_WARNING,
   submissionSourceFingerprint,
   textOf,
@@ -77,6 +78,8 @@ export interface ProjectionResult {
   messages: OpenCodeMessage[];
   state: ProjectionSessionState;
   estimatedTokens: number;
+  /** Serialized size of the returned payload, which no token budget bounds. */
+  estimatedBytes: number;
   thresholdTokens: number;
   hardLimitTokens: number;
   reset: boolean;
@@ -110,45 +113,11 @@ export function estimateTokens(value: unknown): number {
 }
 
 function estimateMessageTokens(messages: readonly OpenCodeMessage[]): number {
-  let mediaTokens = 0;
-  const visible = messages.flatMap((message) =>
-    isModelVisibleMessage(message)
-      ? [
-          {
-            role: message.info.role,
-            parts: message.parts
-              .map((part): unknown => {
-                if (!isModelVisiblePart(message, part)) return null;
-                if (part.type === "text" || part.type === "reasoning") {
-                  return { type: part.type, text: part.text ?? "" };
-                }
-                if (part.type === "file") {
-                  mediaTokens += modelVisibleMediaTokens(part);
-                  return {
-                    type: "file",
-                    filename: part.filename?.slice(0, 500),
-                    mime: part.mime?.slice(0, 200),
-                  };
-                }
-                if (part.type === "tool") {
-                  const stateSize = modelVisibleToolStateSize(part.state);
-                  mediaTokens +=
-                    Math.ceil(stateSize.utf8Bytes / ESTIMATED_CHARS_PER_TOKEN) +
-                    modelVisibleToolAttachmentTokens(part.state) +
-                    modelVisibleToolInlineDataTokens(part.state);
-                  return {
-                    type: "tool",
-                    tool: part.tool,
-                  };
-                }
-                return null;
-              })
-              .filter((part) => part !== null),
-          },
-        ]
-      : [],
-  );
-  return estimateTokens(visible) + mediaTokens;
+  return modelWireSize(messages).tokens;
+}
+
+function estimateMessageBytes(messages: readonly OpenCodeMessage[]): number {
+  return modelWireSize(messages).bytes;
 }
 
 function contributesModelContent(
@@ -1004,6 +973,7 @@ export async function projectMessages(
       checkpoint,
     },
     estimatedTokens,
+    estimatedBytes: estimateMessageBytes(projected),
     thresholdTokens: threshold,
     hardLimitTokens: hardLimit,
     reset: false,
@@ -1112,6 +1082,7 @@ export async function projectMessages(
       messages: nextProjected,
       state: { contextLimit: input.contextLimit, checkpoint: nextCheckpoint },
       estimatedTokens: nextEstimatedTokens,
+      estimatedBytes: estimateMessageBytes(nextProjected),
       thresholdTokens: threshold,
       hardLimitTokens: hardLimit,
       reset: true,
