@@ -496,12 +496,19 @@ describe("ModelClient", () => {
     );
     expect(messages[0]!.content).toContain("Normative words");
     expect(messages[0]!.content).toContain("attributed report claims");
+    expect(messages[0]!.content).toContain("do not transcribe code");
+    expect(messages[0]!.content).toContain(
+      "at most three attributed report claims",
+    );
+    expect(messages[0]!.content).toContain(
+      "Documentation, design notes, architecture descriptions",
+    );
     expect(messages[0]!.content).toContain("one homogeneous record");
     expect(messages[0]!.content).toContain(
       "Never paraphrase or shorten an identifier",
     );
     expect(sha256(messages[0]?.content ?? "")).toBe(
-      "fb8330a18f53e0f7b2bbe8dc696329c8d1be6ef4c3008fe0b7ff1d7428e6953a",
+      "44e2bf884777a770c62939d21b403bd7a3214591042c62531124e2f56c9403e2",
     );
     expect(result).toEqual({
       summary: "A short summary",
@@ -583,6 +590,115 @@ describe("ModelClient", () => {
         },
       ],
     });
+  });
+
+  test("bounds report-subject claims while preserving other claims", async () => {
+    const logger: ClientLogger = { info: vi.fn(), warn: vi.fn() };
+    const fetcher: FetchLike = async () =>
+      modelResponse({
+        summary: "Summary",
+        claims: [
+          {
+            subject: "Foo review report",
+            predicate: "reported blocker",
+            confidence: 0.9,
+            object_kind: "literal",
+            object_text: "first report claim",
+          },
+          {
+            subject: "ideogram-ui BrowsingState",
+            predicate: "has state",
+            confidence: 0.9,
+            object_kind: "literal",
+            object_text: "first non-report claim",
+          },
+          {
+            subject: "Foo review report",
+            predicate: "reported verdict",
+            confidence: 0.9,
+            object_kind: "literal",
+            object_text: "second report claim",
+          },
+          {
+            subject: "Foo review report",
+            predicate: "recommended",
+            confidence: 0.9,
+            object_kind: "literal",
+            object_text: "third report claim",
+          },
+          {
+            subject: "ideogram-ui BrowsingState",
+            predicate: "has state",
+            confidence: 0.9,
+            object_kind: "literal",
+            object_text: "second non-report claim",
+          },
+          {
+            subject: "Foo review report",
+            predicate: "reported blocker",
+            confidence: 0.9,
+            object_kind: "literal",
+            object_text: "fourth report claim",
+          },
+          {
+            subject: "Foo review report",
+            predicate: "reported blocker",
+            confidence: 0.9,
+            object_kind: "literal",
+            object_text: "fifth report claim",
+          },
+        ],
+      });
+
+    await expect(
+      new ModelClient(settings(), fetcher, logger).extract(
+        segmentRequest(),
+        [],
+      ),
+    ).resolves.toEqual({
+      summary: "Summary",
+      claims: [
+        {
+          subject: "Foo review report",
+          predicate: "reported blocker",
+          confidence: 0.9,
+          object_entity: null,
+          object_value: "first report claim",
+        },
+        {
+          subject: "ideogram-ui BrowsingState",
+          predicate: "has state",
+          confidence: 0.9,
+          object_entity: null,
+          object_value: "first non-report claim",
+        },
+        {
+          subject: "Foo review report",
+          predicate: "reported verdict",
+          confidence: 0.9,
+          object_entity: null,
+          object_value: "second report claim",
+        },
+        {
+          subject: "Foo review report",
+          predicate: "recommended",
+          confidence: 0.9,
+          object_entity: null,
+          object_value: "third report claim",
+        },
+        {
+          subject: "ideogram-ui BrowsingState",
+          predicate: "has state",
+          confidence: 0.9,
+          object_entity: null,
+          object_value: "second non-report claim",
+        },
+      ],
+    });
+    expect(logger.warn).toHaveBeenCalledWith(
+      "dropped report-subject claims over the bound",
+      { model: "openai/gpt-5.6-luna", dropped: 2, kept: 3 },
+    );
   });
 
   test("allows deterministic normalization of an exact whole predicate", async () => {
@@ -1784,8 +1900,8 @@ describe("ModelClient", () => {
     ).rejects.toBeInstanceOf(UpstreamValidationError);
   });
 
-  test("exposes extraction validation version 2", () => {
-    expect(EXTRACTION_VALIDATION_VERSION).toBe(2);
+  test("exposes extraction validation version 3", () => {
+    expect(EXTRACTION_VALIDATION_VERSION).toBe(3);
   });
 
   test("enforces a wall-clock timeout across the complete response body", async () => {

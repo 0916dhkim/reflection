@@ -25,7 +25,11 @@ import {
 } from "@reflection/shared/domain";
 import type { Settings } from "./config.js";
 import { normalizeExtractedPaths } from "./extraction-normalization.js";
-import type { ValidatedExtractionResult } from "./extraction-validation.js";
+import {
+  MAX_REPORT_SUBJECT_CLAIMS,
+  boundReportSubjectClaims,
+  type ValidatedExtractionResult,
+} from "./extraction-validation.js";
 
 export const MAX_EMBEDDING_INPUT_BYTES = 30_000;
 export const MAX_EMBEDDING_BATCH_BYTES = 100_000;
@@ -125,11 +129,19 @@ const EXTRACTION_SYSTEM_PROMPT = [
   "explicitly supplied by the source. A branch name, worktree path, line number, ",
   "'current', 'latest', or tool status is not an immutable version. When an external ",
   "anchor exists, include it in every affected claim. When mutable code or review ",
-  "material has no external anchor, do not assert it as timeless code truth. Instead, ",
-  "preserve a small number of attributed report claims: make the named review or ",
-  "research report the subject, use predicates such as 'reported blocker', 'reported ",
-  "finding', or 'recommended', and phrase the object as a report outcome rather than ",
-  "repository state. Reflection attaches source-segment provenance and storage time ",
+  "material has no external anchor, do not assert it as timeless code truth, and do not ",
+  "transcribe code: reading, listing, grepping, or quoting source code, tests, build or ",
+  "deployment configuration, or tool output produces no claims about what that code ",
+  "contains or does. Such inspection contributes to the summary only. Documentation, ",
+  "design notes, architecture descriptions, runbooks, and policy text are different: ",
+  "they may yield claims about decisions, constraints, planned architecture, and stated ",
+  "rules, with the fully qualified document as the subject. Unanchored review or audit ",
+  "material may yield at most three attributed report claims per segment, limited to the ",
+  "verdict, blocking findings, and adopted decisions: make the named review or research ",
+  "report the subject, use predicates such as 'reported verdict', 'reported blocker', or ",
+  "'recommended', and phrase the object as a report outcome rather than repository ",
+  "state. Omit non-blocking findings, test gaps, style notes, and passing-check ",
+  "inventories from unanchored material. Reflection attaches source-segment provenance and storage time ",
   "structurally; never copy source_context IDs into user-facing claim fields or invent a ",
   "missing date. The summary must name the reviewed feature and main reported topics. ",
   "Treat changing observations as snapshots. Scope benchmarks to their named source and ",
@@ -645,6 +657,15 @@ export class ModelClient {
       this.#logger.warn("normalized extracted paths to source filenames", {
         model: this.#settings.extractionModel,
         paths: normalized.normalizedPaths,
+      });
+    }
+    const bounded = boundReportSubjectClaims(result);
+    result = bounded.result;
+    if (bounded.dropped > 0) {
+      this.#logger.warn("dropped report-subject claims over the bound", {
+        model: this.#settings.extractionModel,
+        dropped: bounded.dropped,
+        kept: MAX_REPORT_SUBJECT_CLAIMS,
       });
     }
     try {
