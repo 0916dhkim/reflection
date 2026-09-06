@@ -23,7 +23,10 @@ import {
   JobNotRetryableError,
   type ClaimedJob,
 } from "../src/database.js";
-import type { ValidatedExtractionResult } from "../src/extraction-validation.js";
+import {
+  EXTRACTION_VALIDATION_VERSION,
+  type ValidatedExtractionResult,
+} from "../src/extraction-validation.js";
 
 type DatabaseSettings = ConstructorParameters<typeof Database>[0];
 
@@ -3488,7 +3491,9 @@ describe.sequential("Database PostgreSQL integration", () => {
           ).rows[0],
         );
         expect(targetBeforeFail.extraction_result).toEqual(staged);
-        expect(targetBeforeFail.extraction_validation_version).toBe(2);
+        expect(targetBeforeFail.extraction_validation_version).toBe(
+          EXTRACTION_VALIDATION_VERSION,
+        );
         expect(targetBeforeFail.extraction_validation_fingerprint).toMatch(
           /^[0-9a-f]{64}$/,
         );
@@ -3533,7 +3538,9 @@ describe.sequential("Database PostgreSQL integration", () => {
           ).rows[0],
         );
         expect(targetAfterRetry.extraction_result).toEqual(staged);
-        expect(targetAfterRetry.extraction_validation_version).toBe(2);
+        expect(targetAfterRetry.extraction_validation_version).toBe(
+          EXTRACTION_VALIDATION_VERSION,
+        );
         expect(targetAfterRetry.extraction_validation_fingerprint).toBe(
           targetBeforeFail.extraction_validation_fingerprint,
         );
