@@ -1,0 +1,44 @@
+{
+  "model": "probe/mock",
+  "update": "disable",
+  "share": "disabled",
+  "snapshots": false,
+  "warming": false,
+  "compaction": {
+    "auto": false
+  },
+  "providers": {
+    "probe": {
+      "package": "@opencode/ai/providers/openai-compatible",
+      "transport": "http",
+      "settings": {
+        "baseURL": "http://127.0.0.1:4100/v1",
+        "apiKey": "fixture-only"
+      },
+      "models": {
+        "mock": {
+          "capabilities": {
+            "tools": true,
+            "input": ["text"],
+            "output": ["text"]
+          },
+          "limit": {
+            "context": 32768,
+            "output": 1024
+          }
+        },
+        "mock-small": {
+          "capabilities": {
+            "tools": true,
+            "input": ["text"],
+            "output": ["text"]
+          },
+          "limit": {
+            "context": 16384,
+            "output": 1024
+          }
+        }
+      }
+    }
+  }
+}

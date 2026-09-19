@@ -128,6 +128,16 @@ export const SegmentCreateSchema = Type.Object(SegmentCreateInputProperties, {
   additionalProperties: false,
 });
 
+// source_id is accepted only at the HTTP boundary for compatibility. It is
+// intentionally removed before canonical parsing and persistence.
+export const SegmentCreateTransportSchema = Type.Object(
+  {
+    ...SegmentCreateInputProperties,
+    source_id: Type.Optional(IdentifierSchema),
+  },
+  { additionalProperties: false },
+);
+
 const CanonicalSegmentCreateProperties = {
   session_id: IdentifierSchema,
   start_user_message_id: IdentifierSchema,
@@ -249,6 +259,25 @@ export function parseSegmentCreate(value: unknown): SegmentCreate {
     });
   }
   return result;
+}
+
+export function parseSegmentTransport(value: unknown): SegmentCreate {
+  const transport = record(trimProperty(value, "source_id"));
+  if (!transport || !hasOwn(transport, "source_id")) {
+    return parseSegmentCreate(value);
+  }
+  // Validate just the transport extension here. The canonical parser must
+  // still perform its existing normalization (including legacy booleans).
+  parse(
+    "segment transport source",
+    Type.Object(
+      { source_id: IdentifierSchema },
+      { additionalProperties: false },
+    ),
+    { source_id: transport.source_id },
+  );
+  const { source_id: _sourceId, ...canonical } = transport;
+  return parseSegmentCreate(canonical);
 }
 
 export const JobStatusSchema = Type.Union([
