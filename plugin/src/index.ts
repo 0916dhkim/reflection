@@ -69,7 +69,14 @@ const FOREGROUND_PROCESSING_PRIORITY = 100;
 interface ReflectionConfig {
   url: string;
   apiKey: string;
+  sourceId: string;
   contextProjection: boolean;
+}
+
+interface ConfigLoadResult {
+  config: ReflectionConfig | null;
+  error: string;
+  projectionRequested: boolean;
 }
 
 interface ApiResult {
@@ -142,47 +149,83 @@ class SegmentListingUnavailableError extends Error {
   }
 }
 
-function loadConfig(): ReflectionConfig | null {
+function loadConfig(): ConfigLoadResult {
   try {
     const value: unknown = JSON.parse(readFileSync(CONFIG_PATH, "utf8"));
-    if (
+    const projectionRequested =
       typeof value === "object" &&
       value !== null &&
-      "url" in value &&
-      typeof value.url === "string" &&
-      value.url.length > 0 &&
-      "apiKey" in value &&
-      typeof value.apiKey === "string" &&
-      value.apiKey.length > 0
+      "contextProjection" in value &&
+      typeof value.contextProjection === "object" &&
+      value.contextProjection !== null &&
+      "enabled" in value.contextProjection &&
+      value.contextProjection.enabled === true;
+    if (
+      typeof value !== "object" ||
+      value === null ||
+      Array.isArray(value) ||
+      !("url" in value) ||
+      typeof value.url !== "string" ||
+      value.url.length === 0 ||
+      !("apiKey" in value) ||
+      typeof value.apiKey !== "string" ||
+      value.apiKey.length === 0
     ) {
-      const projection =
-        "contextProjection" in value &&
-        typeof value.contextProjection === "object" &&
-        value.contextProjection !== null &&
-        "enabled" in value.contextProjection &&
-        value.contextProjection.enabled === true;
       return {
-        url: value.url.replace(/\/$/, ""),
-        apiKey: value.apiKey,
-        contextProjection: projection,
+        config: null,
+        error: `missing or invalid config at ${CONFIG_PATH}`,
+        projectionRequested,
       };
     }
+    const sourceId =
+      "sourceId" in value && typeof value.sourceId === "string"
+        ? value.sourceId.trim()
+        : null;
+    if (sourceId !== null && sourceId.length > 0 && sourceId.length <= 500) {
+      return {
+        config: {
+          url: value.url.replace(/\/$/, ""),
+          apiKey: value.apiKey,
+          sourceId,
+          contextProjection: projectionRequested,
+        },
+        error: "",
+        projectionRequested,
+      };
+    }
+    if (!("sourceId" in value) || value.sourceId === undefined) {
+      return {
+        config: null,
+        error: `missing required sourceId in config at ${CONFIG_PATH}`,
+        projectionRequested,
+      };
+    }
+    return {
+      config: null,
+      error: `invalid sourceId in config at ${CONFIG_PATH}: expected a nonblank string up to 500 characters`,
+      projectionRequested,
+    };
   } catch {}
-  return null;
+  return {
+    config: null,
+    error: `missing or invalid config at ${CONFIG_PATH}`,
+    projectionRequested: false,
+  };
 }
 
 async function apiCall(
   path: string,
   init: RequestInit,
   timeoutMs?: number,
+  configResult: ConfigLoadResult = loadConfig(),
 ): Promise<ApiResult> {
-  const config = loadConfig();
+  const { config, error: configError } = configResult;
   if (!config) {
     return {
       ok: false,
       status: 0,
       data: null,
-      detail: `missing or invalid config at ${CONFIG_PATH}`,
+      detail: configError,
     };
   }
 
@@ -377,7 +420,8 @@ async function waitForDelay(
 
 export const Reflection: Plugin = async ({ client, directory }) => {
   const initialConfig = loadConfig();
-  const projectionEnabled = initialConfig?.contextProjection === true;
+  const writerConfig = initialConfig;
+  const projectionEnabled = initialConfig.projectionRequested;
   const projectionState = new ProjectionStateStore(PROJECTION_STATE_PATH);
   const modelLimits = new Map<string, ModelLimits>();
   const compactingSessions = new Map<string, number>();
@@ -593,6 +637,13 @@ export const Reflection: Plugin = async ({ client, directory }) => {
         );
         continue;
       }
+      const { config, error: configError } = writerConfig;
+      if (!config) {
+        await fail(
+          `segment submission for ${sessionId} refused: ${configError}`,
+        );
+        continue;
+      }
       const previous = fingerprints.get(segmentKey);
       if (
         previous?.fingerprint === fingerprint &&
@@ -606,10 +657,11 @@ export const Reflection: Plugin = async ({ client, directory }) => {
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(body),
+          body: JSON.stringify({ ...body, source_id: config.sourceId }),
           signal,
         },
         TARGET_POST_TIMEOUT_MS,
+        writerConfig,
       );
       if (!response.ok) {
         const failure = formatApiFailure(
@@ -649,8 +701,14 @@ export const Reflection: Plugin = async ({ client, directory }) => {
         sessionRetries.set(segmentKey, fingerprint);
         const retry = await apiCall(
           `/v1/jobs/${job.id}/retry`,
-          { method: "POST", signal },
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ source_id: config.sourceId }),
+            signal,
+          },
           TARGET_POST_TIMEOUT_MS,
+          writerConfig,
         );
         if (!retry.ok) {
           await fail(formatApiFailure(`segment retry for ${sessionId}`, retry));
@@ -755,6 +813,7 @@ export const Reflection: Plugin = async ({ client, directory }) => {
       `/v1/sessions/${encodeURIComponent(sessionId)}/segments`,
       { method: "GET", signal },
       timeoutMs,
+      writerConfig,
     );
     if (!response.ok) {
       throw new SegmentListingUnavailableError(
@@ -1137,6 +1196,11 @@ export const Reflection: Plugin = async ({ client, directory }) => {
 
     "experimental.chat.messages.transform": async (_input, output) => {
       if (!projectionEnabled || output.messages.length === 0) return;
+      if (!writerConfig.config) {
+        throw new Error(
+          `Reflection context projection refused: ${writerConfig.error}`,
+        );
+      }
       const messages = output.messages as OpenCodeMessage[];
       const model = activeModel(messages);
       if (!model) {

@@ -948,6 +948,7 @@ export interface ReflectionService {
 export interface ReflectionServiceOptions {
   url: string;
   headers: Record<string, string>;
+  sourceId: string;
   jobPollMs: number;
   requestTimeoutMs?: number;
   fetchImpl?: typeof globalThis.fetch;
@@ -1036,7 +1037,14 @@ export function createReflectionService(
       await runRevalidation(revalidate);
       const { response, body } = await fetchJson(
         `${options.url}/v1/jobs/${jobId}/retry`,
-        { method: "POST", headers: options.headers },
+        {
+          method: "POST",
+          headers: {
+            ...options.headers,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({ source_id: options.sourceId }),
+        },
         1,
         fetchDependencies,
       );
@@ -1305,13 +1313,58 @@ export function cleanupLaunchAgentCommand(
   };
 }
 
-interface ReflectionConfig {
+export interface ReflectionConfig {
   url: string;
   apiKey: string;
+  sourceId: string;
 }
 
 function loadJson(path: string): unknown {
   return JSON.parse(readFileSync(path, "utf8")) as unknown;
+}
+
+export function parseReflectionConfig(
+  value: unknown,
+  configPath: string,
+): ReflectionConfig {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new Error(
+      `invalid Reflection config at ${configPath}: expected an object`,
+    );
+  }
+  const config = value as Record<string, unknown>;
+  if (typeof config.url !== "string" || config.url.length === 0) {
+    throw new Error(`invalid Reflection config at ${configPath}: missing url`);
+  }
+  if (typeof config.apiKey !== "string" || config.apiKey.length === 0) {
+    throw new Error(
+      `invalid Reflection config at ${configPath}: missing apiKey`,
+    );
+  }
+  if (!("sourceId" in config)) {
+    throw new Error(
+      `invalid Reflection config at ${configPath}: missing required sourceId`,
+    );
+  }
+  if (typeof config.sourceId !== "string") {
+    throw new Error(
+      `invalid Reflection config at ${configPath}: sourceId must be a nonblank string up to 500 characters`,
+    );
+  }
+  const sourceId = config.sourceId.trim();
+  if (sourceId.length === 0 || sourceId.length > 500) {
+    throw new Error(
+      `invalid Reflection config at ${configPath}: sourceId must be a nonblank string up to 500 characters`,
+    );
+  }
+  return { url: config.url, apiKey: config.apiKey, sourceId };
+}
+
+export function serializeSegmentTransport(
+  submission: SegmentCreate,
+  sourceId: string,
+): string {
+  return JSON.stringify({ ...submission, source_id: sourceId });
 }
 
 function createLogger(clock: Pick<Clock, "nowIso">): Log {
@@ -1506,6 +1559,7 @@ export interface ProcessingContext {
   clock: Clock;
   providerPollMs: number;
   jobPollMs: number;
+  sourceId: string;
   priorityJobIds: readonly number[];
   completedSnapshots: Set<string>;
   attemptedSnapshots: Set<string>;
@@ -1783,7 +1837,7 @@ export async function processSession(
       const submission: ServiceRequestInit = {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: segment.serializedSubmission,
+        body: serializeSegmentTransport(segment.submission, context.sourceId),
       };
       let job = validateJobForSubmission(
         validatedJob(
@@ -2023,6 +2077,10 @@ export async function main(
   environment: NodeJS.ProcessEnv = process.env,
 ): Promise<number> {
   const options = resolveBackfillOptions(argv, environment);
+  const reflectionConfig = parseReflectionConfig(
+    loadJson(options.reflectionConfigPath),
+    options.reflectionConfigPath,
+  );
   const clock = SYSTEM_CLOCK;
   const logger = createLogger(clock);
   const processId = process.pid;
@@ -2042,12 +2100,10 @@ export async function main(
   const sessions = store.sessions;
   state.sessionsTotal = sessions.length;
 
-  const reflectionConfig = loadJson(
-    options.reflectionConfigPath,
-  ) as ReflectionConfig;
   const service = createReflectionService({
     url: reflectionConfig.url,
     headers: { "X-Api-Key": reflectionConfig.apiKey },
+    sourceId: reflectionConfig.sourceId,
     jobPollMs: options.jobPollMs,
     requestTimeoutMs: options.requestTimeoutMs,
     log: logger,
@@ -2079,6 +2135,7 @@ export async function main(
     clock,
     providerPollMs: options.providerPollMs,
     jobPollMs: options.jobPollMs,
+    sourceId: reflectionConfig.sourceId,
     priorityJobIds: options.priorityJobIds,
     completedSnapshots: new Set(),
     attemptedSnapshots: new Set(),

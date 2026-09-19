@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   ContractValidationError,
+  parseSegmentCreate,
   type SegmentBoundary,
   type SegmentCreate,
   type SegmentTargetBoundary,
@@ -41,6 +42,7 @@ import {
   fetchJson,
   hydrateSessionMessages,
   manifestHasExpectedSnapshot,
+  parseReflectionConfig,
   parsePriorityJobIds,
   planSessionSegments,
   processPriorityJobs,
@@ -51,6 +53,7 @@ import {
   runBackfill,
   segmentSubmission,
   serializeState,
+  serializeSegmentTransport,
   sessionRemainsStable,
   stableSessionSnapshot,
   validateJobForSubmission,
@@ -240,6 +243,7 @@ function processingContext(
     },
     providerPollMs: 5_000,
     jobPollMs: 10,
+    sourceId: "test-opencode-source",
     priorityJobIds: options.priorityJobIds ?? [],
     completedSnapshots: new Set(),
     attemptedSnapshots: new Set(),
@@ -1014,6 +1018,7 @@ describe("strict jobs and exact submissions", () => {
       source_boundary_version: 1,
       start_source_message_id: null,
       end_source_message_id: null,
+      source_id: "test-opencode-source",
     });
     expect(context.state.currentSegment).toMatchObject({
       segmentId: segmentIdForRequest(segmentSubmission(SESSION_ID, local)),
@@ -1053,6 +1058,7 @@ describe("request retries and timeouts", () => {
     const service = createReflectionService({
       url: "https://reflection.example",
       headers: { "X-Api-Key": "secret" },
+      sourceId: "test-backfill-source",
       jobPollMs: 10,
       requestTimeoutMs: 100,
       fetchImpl: fetchMock as unknown as typeof fetch,
@@ -1120,6 +1126,7 @@ describe("request retries and timeouts", () => {
     const service = createReflectionService({
       url: "https://reflection.example",
       headers: {},
+      sourceId: "test-backfill-source",
       jobPollMs: 10,
       requestTimeoutMs: 100,
       fetchImpl: fetchMock as unknown as typeof fetch,
@@ -1150,6 +1157,7 @@ describe("request retries and timeouts", () => {
     const service = createReflectionService({
       url: "https://reflection.example",
       headers: {},
+      sourceId: "test-backfill-source",
       jobPollMs: 10,
       requestTimeoutMs: 100,
       fetchImpl: fetchMock as unknown as typeof fetch,
@@ -1160,7 +1168,7 @@ describe("request retries and timeouts", () => {
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
-  it("retries the persisted target without replacing its exact request body", async () => {
+  it("retries the persisted target with its source ID without replacing its identity", async () => {
     const submission = v1Submission();
     const pending = jobFor(submission, {
       status: "pending",
@@ -1174,6 +1182,7 @@ describe("request retries and timeouts", () => {
     const service = createReflectionService({
       url: "https://reflection.example",
       headers: { "X-Api-Key": "secret" },
+      sourceId: "test-backfill-source",
       jobPollMs: 10,
       requestTimeoutMs: 100,
       fetchImpl: fetchMock as unknown as typeof fetch,
@@ -1183,9 +1192,14 @@ describe("request retries and timeouts", () => {
     const init = fetchMock.mock.calls[0]?.[1] as RequestInit;
     expect(init).toMatchObject({
       method: "POST",
-      headers: { "X-Api-Key": "secret" },
+      headers: {
+        "X-Api-Key": "secret",
+        "Content-Type": "application/json",
+      },
     });
-    expect(init.body).toBeUndefined();
+    expect(init.body).toBe(
+      JSON.stringify({ source_id: "test-backfill-source" }),
+    );
     expect(validateJobForSubmission(pending, submission)).toBe(pending);
   });
 });
@@ -1638,6 +1652,63 @@ describe("job completion fencing", () => {
 });
 
 describe("configuration and retained recovery jobs", () => {
+  it("requires and trims the explicit Reflection sourceId", () => {
+    expect(
+      parseReflectionConfig(
+        {
+          url: "https://reflection.example",
+          apiKey: "test",
+          sourceId: "  backfill-source  ",
+        },
+        "/home/test/.config/opencode/reflection.json",
+      ),
+    ).toEqual({
+      url: "https://reflection.example",
+      apiKey: "test",
+      sourceId: "backfill-source",
+    });
+    expect(() =>
+      parseReflectionConfig(
+        { url: "https://reflection.example", apiKey: "test" },
+        "/home/test/.config/opencode/reflection.json",
+      ),
+    ).toThrow("missing required sourceId");
+    expect(() =>
+      parseReflectionConfig(
+        {
+          url: "https://reflection.example",
+          apiKey: "test",
+          sourceId: " ",
+        },
+        "/home/test/.config/opencode/reflection.json",
+      ),
+    ).toThrow("sourceId must be a nonblank string up to 500 characters");
+    expect(() =>
+      parseReflectionConfig(
+        {
+          url: "https://reflection.example",
+          apiKey: "test",
+          sourceId: "x".repeat(501),
+        },
+        "/home/test/.config/opencode/reflection.json",
+      ),
+    ).toThrow("sourceId must be a nonblank string up to 500 characters");
+  });
+
+  it("adds source_id only to the transport payload", () => {
+    const submission = v1Submission();
+    const payload = JSON.parse(
+      serializeSegmentTransport(submission, "backfill-source"),
+    ) as Record<string, unknown>;
+
+    expect(payload).toMatchObject({ source_id: "backfill-source" });
+    expect(submission).not.toHaveProperty("source_id");
+    expect(sourceFingerprint(submission)).toBe(
+      sourceFingerprint(v1Submission()),
+    );
+    expect(() => parseSegmentCreate(payload)).toThrow(ContractValidationError);
+  });
+
   it("defaults to no priority jobs and parses an optional de-duplicated list", () => {
     const defaults = resolveBackfillOptions([], {}, "/home/test");
     expect(defaults.allowFailures).toBe(false);
