@@ -1,6 +1,7 @@
 {
   "url": "https://reflection.example.com",
   "apiKey": "replace-with-your-api-key",
+  "sourceId": "opencode-local",
   "contextProjection": {
     "enabled": false
   }

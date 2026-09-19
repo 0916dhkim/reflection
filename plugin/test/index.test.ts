@@ -113,16 +113,22 @@ function segmentFingerprint(
   return submissionSourceFingerprint(sessionId, segment);
 }
 
-beforeAll(() => {
-  mkdirSync(join(paths.home, ".config", "opencode"), { recursive: true });
+function writeConfig(overrides: Record<string, unknown> = {}): void {
   writeFileSync(
     join(paths.home, ".config", "opencode", "reflection.json"),
     JSON.stringify({
       url: "https://reflection.example.com",
       apiKey: "test",
+      sourceId: "test-opencode-source",
       contextProjection: { enabled: true },
+      ...overrides,
     }),
   );
+}
+
+beforeAll(() => {
+  mkdirSync(join(paths.home, ".config", "opencode"), { recursive: true });
+  writeConfig();
 });
 
 afterAll(() => {
@@ -130,6 +136,7 @@ afterAll(() => {
 });
 
 afterEach(() => {
+  writeConfig();
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
   vi.useRealTimers();
@@ -395,6 +402,122 @@ function emptyListing(
 }
 
 describe("Reflection plugin hooks", () => {
+  it.each([
+    [undefined, "missing required sourceId"],
+    [null, "invalid sourceId"],
+    ["   ", "invalid sourceId"],
+  ])(
+    "fails closed when projection is requested without a valid sourceId",
+    async (sourceId, expectedError) => {
+      writeConfig({ sourceId });
+      const sessionId = "missing-source-id-session";
+      const messages = projectionMessages(sessionId);
+      const client = clientFor(messages);
+      const fetchMock = vi.fn(async () => ok());
+      vi.stubGlobal("fetch", fetchMock);
+      const hooks = await Reflection(pluginInput(client));
+      const config = {};
+      const transform = hooks["experimental.chat.messages.transform"];
+      const event = hooks.event;
+      if (!transform || !event) throw new Error("Reflection hook is missing");
+
+      await hooks.config?.(config);
+      expect(Reflect.get(config, "compaction")).toEqual({ auto: false });
+
+      await expect(
+        Reflect.apply(transform, undefined, [
+          {},
+          { messages: structuredClone(messages) },
+        ]),
+      ).rejects.toThrow(expectedError);
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(client.provider.list).not.toHaveBeenCalled();
+      expect(client.session.messages).not.toHaveBeenCalled();
+
+      await Reflect.apply(event, undefined, [
+        {
+          event: {
+            type: "session.idle",
+            properties: { sessionID: sessionId },
+          },
+        },
+      ]);
+
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(client.app.log).toHaveBeenCalledWith(
+        expect.objectContaining({
+          body: expect.objectContaining({
+            message: expect.stringContaining(expectedError),
+          }),
+        }),
+      );
+    },
+  );
+
+  it("does not label valid sourceId as invalid when another config field is invalid", async () => {
+    writeConfig({ url: "" });
+    const sessionId = "invalid-url-session";
+    const client = clientFor(projectionMessages(sessionId));
+    const hooks = await Reflection(pluginInput(client));
+    const transform = hooks["experimental.chat.messages.transform"];
+    if (!transform) throw new Error("Reflection transform hook is missing");
+
+    await expect(
+      Reflect.apply(transform, undefined, [
+        {},
+        { messages: projectionMessages(sessionId) },
+      ]),
+    ).rejects.toThrow("missing or invalid config");
+    await expect(
+      Reflect.apply(transform, undefined, [
+        {},
+        { messages: projectionMessages(sessionId) },
+      ]),
+    ).rejects.not.toThrow("sourceId");
+  });
+
+  it("pins writer credentials and sourceId until OpenCode restarts", async () => {
+    const sessionId = "pinned-writer-config-session";
+    const messages = projectionMessages(sessionId);
+    const client = clientFor(messages);
+    const requests: Array<{ url: string; init: RequestInit | undefined }> = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+        requests.push({ url: String(url), init });
+        return emptyListing(url, init);
+      }),
+    );
+    const hooks = await Reflection(pluginInput(client));
+    const event = hooks.event;
+    if (!event) throw new Error("Reflection event hook is missing");
+
+    writeConfig({
+      url: "https://different-reflection.example.com",
+      apiKey: "changed-api-key",
+      sourceId: "changed-source-id",
+    });
+    await Reflect.apply(event, undefined, [
+      {
+        event: {
+          type: "session.idle",
+          properties: { sessionID: sessionId },
+        },
+      },
+    ]);
+
+    expect(requests).toHaveLength(2);
+    expect(requests[0]?.url).toBe(
+      `https://reflection.example.com/v1/sessions/${sessionId}/segments`,
+    );
+    expect(new Headers(requests[0]?.init?.headers).get("X-Api-Key")).toBe(
+      "test",
+    );
+    expect(JSON.parse(String(requests[1]?.init?.body))).toMatchObject({
+      source_id: "test-opencode-source",
+    });
+  });
+
   it("disables automatic compaction but bypasses projection for manual compaction", async () => {
     const providerList = vi.fn(() => {
       throw new Error("provider lookup must not run during manual compaction");
@@ -673,6 +796,11 @@ describe("Reflection plugin hooks", () => {
     expect(submittedBodies.map((body) => body.processing_priority)).toEqual([
       50, 100,
     ]);
+    expect(
+      submittedBodies.every(
+        (body) => body.source_id === "test-opencode-source",
+      ),
+    ).toBe(true);
     expect(summaryGets).toBe(4);
     expect(client.session.messages).toHaveBeenCalledTimes(3);
     expect(client.session.status).toHaveBeenCalledTimes(4);
@@ -1161,6 +1289,7 @@ describe("Reflection plugin hooks", () => {
     );
     expect(inactiveBodies).toHaveLength(2);
     expect(inactiveBodies[1]).toMatchObject({
+      source_id: "test-opencode-source",
       messages: [{ role: "user", text: "open request updated" }],
     });
   });
@@ -2561,6 +2690,7 @@ describe("Reflection plugin hooks", () => {
     const closed = segmentMessages(messages)[0]!;
     const client = clientFor(messages);
     let submitted: Parameters<typeof sourceFingerprint>[0] | undefined;
+    let retryBody: unknown;
     let segmentPosts = 0;
     let retryPosts = 0;
     vi.stubGlobal(
@@ -2568,6 +2698,7 @@ describe("Reflection plugin hooks", () => {
       vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
         if (String(url).endsWith("/retry")) {
           retryPosts += 1;
+          retryBody = JSON.parse(String(init?.body));
           if (!submitted) throw new Error("missing submitted source");
           return ok(segmentJob(submitted, "pending"));
         }
@@ -2596,6 +2727,8 @@ describe("Reflection plugin hooks", () => {
 
     expect(segmentPosts).toBe(2);
     expect(retryPosts).toBe(1);
+    expect(submitted).toMatchObject({ source_id: "test-opencode-source" });
+    expect(retryBody).toEqual({ source_id: "test-opencode-source" });
   });
 
   it("clears a failed closed boundary after replacement-history rewind", async () => {

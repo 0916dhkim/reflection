@@ -28,6 +28,7 @@ Create `~/.config/opencode/reflection.json`:
 {
   "url": "https://your-reflection-service.example.com",
   "apiKey": "your-api-key",
+  "sourceId": "your-stable-opencode-source",
   "contextProjection": {
     "enabled": false
   }
@@ -40,7 +41,7 @@ Protect the file as a secret and never commit it:
 chmod 600 ~/.config/opencode/reflection.json
 ```
 
-Every request sends `apiKey` as `X-Api-Key`. Context projection is experimental and defaults to disabled.
+Every request sends `apiKey` as `X-Api-Key`. `sourceId` is required, is trimmed, and must be a nonblank string of at most 500 characters. Choose a stable identifier for this OpenCode writer; Reflection never supplies a v1 default. All ingestion mutations, including retries, send it as `source_id`. The plugin pins its writer configuration at startup, so changing `sourceId` requires an OpenCode restart. Context projection is experimental and defaults to disabled.
 
 ## Memory tools
 
