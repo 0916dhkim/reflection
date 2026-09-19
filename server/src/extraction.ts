@@ -68,6 +68,7 @@ export class ExtractionEngine {
 
   async extract(job: ClaimedJob): Promise<ValidatedExtractionResult> {
     const priorSummaries = await this.#database.priorSummaries(
+      job.sourceId,
       job.request.session_id,
       job.segmentId,
     );

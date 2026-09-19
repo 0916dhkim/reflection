@@ -7,6 +7,7 @@
     "./contracts": "./src/contracts.ts",
     "./domain": "./src/domain.ts",
     "./segmentation": "./src/segmentation.ts",
+    "./sources": "./src/sources.ts",
     "./tool-source": "./src/tool-source.ts"
   },
   "scripts": {

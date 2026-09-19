@@ -1,4 +1,6 @@
 import { randomUUID } from "node:crypto";
+import { execFile, execFileSync } from "node:child_process";
+import { promisify } from "node:util";
 import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 
@@ -16,6 +18,10 @@ import {
   type PreparedSegment,
 } from "@reflection/shared/domain";
 import { Client, type PoolClient, type QueryResultRow } from "pg";
+import {
+  sourceSegmentIdForRequest,
+  type SourceInfo,
+} from "@reflection/shared/sources";
 import { describe, expect, test, vi } from "vitest";
 
 import {
@@ -27,10 +33,38 @@ import {
   EXTRACTION_VALIDATION_VERSION,
   type ValidatedExtractionResult,
 } from "../src/extraction-validation.js";
+import { createApp } from "../src/app.js";
+import { loadSettings } from "../src/config.js";
 
 type DatabaseSettings = ConstructorParameters<typeof Database>[0];
 
 const DATABASE_URL = process.env.REFLECTION_TEST_DATABASE_URL;
+const SOURCE_ID = "test-source";
+async function openDatabase(database: Database): Promise<void> {
+  await database.applyMigrations(MIGRATIONS_DIR);
+  await database.pool.query(
+    "INSERT INTO reflection_sources(source_id, kind, identity_scheme) VALUES ($1, 'opencode-v1', 'legacy') ON CONFLICT DO NOTHING",
+    [SOURCE_ID],
+  );
+  for (const args of [
+    ["install-indexes"],
+    ["cutover", "--old-writers-stopped"],
+  ]) {
+    execFileSync(
+      process.execPath,
+      [
+        fileURLToPath(
+          new URL("../../scripts/source-ownership.mjs", import.meta.url),
+        ),
+        ...args,
+      ],
+      {
+        env: { ...process.env, DATABASE_URL: databaseUrl() },
+      },
+    );
+  }
+  await database.open();
+}
 const MIGRATIONS_DIR = fileURLToPath(
   new URL("../../migrations", import.meta.url),
 );
@@ -224,10 +258,1163 @@ async function within<T>(
 
 describe.sequential("Database PostgreSQL integration", () => {
   test.skipIf(!DATABASE_URL)(
+    "expands a fresh database through the operator without starting or preparing the application",
+    async () => {
+      const database = new Database(settings());
+      const run = (...args: string[]) =>
+        promisify(execFile)(
+          process.execPath,
+          [
+            fileURLToPath(
+              new URL("../../scripts/source-ownership.mjs", import.meta.url),
+            ),
+            ...args,
+          ],
+          {
+            env: {
+              ...process.env,
+              DATABASE_URL: databaseUrl(),
+              MIGRATIONS_DIR,
+            },
+          },
+        );
+      try {
+        // This suite requires an explicitly disposable database and already
+        // recreates legacy schemas. Exercise expansion from a genuinely empty one.
+        await database.pool.query(
+          "DROP SCHEMA public CASCADE; CREATE SCHEMA public",
+        );
+        expect((await run("expand")).stdout).toContain(
+          "transactional schema expansion complete",
+        );
+        expect(await database.listSources()).toEqual([]);
+        const ledger = (
+          await database.pool.query(
+            "SELECT * FROM reflection_schema_migrations ORDER BY name",
+          )
+        ).rows;
+        expect(ledger).toHaveLength(9);
+        expect(ledger[8]).toMatchObject({
+          name: "009_source_ownership_expansion.sql",
+          checksum: expect.stringMatching(/^[a-f0-9]{64}$/),
+        });
+        expect(
+          (
+            await database.pool.query(
+              "SELECT to_regclass('extraction_jobs_source_v1_boundary_key') AS new_index, to_regclass('extraction_jobs_v1_boundary_key') AS old_index",
+            )
+          ).rows[0],
+        ).toEqual({
+          new_index: null,
+          old_index: "extraction_jobs_v1_boundary_key",
+        });
+        const legacy = request({
+          session_id: "old-writer",
+          start_user_message_id: "start",
+          end_user_message_id: "end",
+          messages: [{ role: "user", text: "legacy source" }],
+        });
+        const write = () =>
+          database.pool.query(
+            `INSERT INTO extraction_jobs (segment_id, session_id, start_user_message_id, end_user_message_id, payload)
+        VALUES ($1, $2, $3, $4, $5::jsonb)
+        ON CONFLICT (session_id, start_user_message_id, end_user_message_id) WHERE source_boundary_version = 1
+        DO UPDATE SET payload = EXCLUDED.payload RETURNING id, source_id, status, attempts`,
+            [
+              segmentIdForRequest(legacy),
+              legacy.session_id,
+              legacy.start_user_message_id,
+              legacy.end_user_message_id,
+              JSON.stringify(legacy),
+            ],
+          );
+        const first = (await write()).rows[0];
+        expect(first).toMatchObject({
+          source_id: null,
+          status: "pending",
+          attempts: 0,
+        });
+        expect((await write()).rows[0]).toEqual(first);
+        await run("expand");
+        expect(
+          (
+            await database.pool.query(
+              "SELECT * FROM reflection_schema_migrations ORDER BY name",
+            )
+          ).rows,
+        ).toEqual(ledger);
+        expect(await database.listSources()).toEqual([]);
+        await expect(database.open()).rejects.toThrow(
+          "source indexes are not ready",
+        );
+        await run("install-indexes");
+        await expect(database.open()).rejects.toThrow("stop old writers");
+        expect(await database.listSources()).toEqual([]);
+        await run(
+          "register",
+          "--id",
+          SOURCE_ID,
+          "--kind",
+          "opencode-v1",
+          "--identity-scheme",
+          "legacy",
+        );
+        await run("cutover", "--old-writers-stopped");
+        await database.open();
+        expect(
+          (await database.getJob(SOURCE_ID, Number(first.id)))?.status,
+        ).toBe("pending");
+        await database.pool.query(
+          "UPDATE reflection_schema_migrations SET checksum = repeat('0', 64) WHERE name = '009_source_ownership_expansion.sql'",
+        );
+        await expect(run("expand")).rejects.toThrow();
+        await expect(database.applyMigrations(MIGRATIONS_DIR)).rejects.toThrow(
+          "migration checksum mismatch",
+        );
+        await database.pool.query(
+          "UPDATE reflection_schema_migrations SET checksum = $1 WHERE name = '009_source_ownership_expansion.sql'",
+          [ledger[8].checksum],
+        );
+      } finally {
+        await database.close();
+      }
+    },
+  );
+  test
+    .skipIf(!DATABASE_URL)
+    .each(["current", "historical", "fingerprint", "ownership"])(
+    "quarantines %s corruption without losing retained data or starving another session",
+    async (corruption) => {
+      const database = new Database(settings());
+      await openDatabase(database);
+      try {
+        await truncate(database);
+        const source = {
+          ...request({
+            session_id: "poisoned",
+            start_user_message_id: "start",
+            end_user_message_id: "old",
+            messages: [{ role: "user", text: "original" }],
+          }),
+          source_id: SOURCE_ID,
+        };
+        const historical = await database.enqueue(source);
+        const initial = required(
+          await withClient(database, (client) =>
+            database.claimOldestJob(client),
+          ),
+        );
+        await completeResolution(
+          database,
+          initial,
+          preparedSegment(initial, {
+            endId: "old",
+            summary: "committed",
+            subjectId: randomUUID(),
+            objectId: randomUUID(),
+            entitiesAreNew: true,
+          }),
+        );
+        const current = await database.enqueue({
+          ...source,
+          end_user_message_id: "new",
+          processing_priority: 100,
+        });
+        const running = required(
+          await withClient(database, (client) =>
+            database.claimOldestJob(client),
+          ),
+        );
+        await database.publishExtraction(
+          running,
+          validatedExtractionResult({ summary: "retained stage", claims: [] }),
+        );
+        await database.finishFailedAttempt(running, "retry", {
+          retryAfterSeconds: 0,
+        });
+        await database.pool.query(
+          "UPDATE extraction_jobs SET next_attempt_at = now() - INTERVAL '1 second' WHERE id = $1",
+          [current.id],
+        );
+        const healthy = await database.enqueue({
+          ...source,
+          session_id: "healthy",
+        });
+        if (corruption === "ownership") {
+          await database.pool.query(
+            "INSERT INTO reflection_sources VALUES ('quarantine-other', 'opencode-v2', 'source-v1') ON CONFLICT DO NOTHING",
+          );
+          await database.pool.query(
+            "UPDATE segment_targets SET source_id = 'quarantine-other' WHERE segment_id = $1",
+            [current.segment_id],
+          );
+        } else if (corruption === "fingerprint") {
+          await database.pool.query(
+            "UPDATE extraction_jobs SET payload = jsonb_set(payload, '{messages,0,text}', '\"changed\"') WHERE id = $1",
+            [current.id],
+          );
+        } else {
+          await database.pool.query(
+            "UPDATE extraction_jobs SET payload = '{}'::jsonb WHERE id = $1",
+            [corruption === "historical" ? historical.id : current.id],
+          );
+        }
+        const retained = async () => ({
+          targets: (
+            await database.pool.query(
+              "SELECT * FROM segment_targets ORDER BY segment_id",
+            )
+          ).rows,
+          claims: (
+            await database.pool.query("SELECT * FROM claims ORDER BY id")
+          ).rows,
+          segments: (
+            await database.pool.query("SELECT * FROM segments ORDER BY id")
+          ).rows,
+          jobs: (
+            await database.pool.query(
+              "SELECT id, segment_id, source_id, payload, source_fingerprint, source_generation FROM extraction_jobs ORDER BY id",
+            )
+          ).rows,
+        });
+        const before = await retained();
+        const oldJob = await database.getJob(SOURCE_ID, historical.id);
+        const healthyBefore = await database.getJob(SOURCE_ID, healthy.id);
+        expect(
+          await withClient(database, (client) =>
+            database.claimOldestJob(client),
+          ),
+        ).toBeNull();
+        expect(await database.getJob(SOURCE_ID, current.id)).toMatchObject({
+          status: "failed",
+          error:
+            "OwnershipValidationError: persisted segment group quarantined",
+          finished_at: expect.any(String),
+        });
+        expect(await database.getJob(SOURCE_ID, historical.id)).toEqual(oldJob);
+        expect(await database.getJob(SOURCE_ID, healthy.id)).toEqual(
+          healthyBefore,
+        );
+        expect(await retained()).toEqual(before);
+        expect(
+          required(
+            await withClient(database, (client) =>
+              database.claimOldestJob(client),
+            ),
+          ).id,
+        ).toBe(healthy.id);
+        expect(
+          await withClient(database, (client) =>
+            database.claimOldestJob(client),
+          ),
+        ).toBeNull();
+      } finally {
+        await database.close();
+      }
+    },
+  );
+
+  test.skipIf(!DATABASE_URL)(
+    "isolates a corrupt running group while recovering healthy groups",
+    async () => {
+      const database = new Database(settings());
+      await openDatabase(database);
+      try {
+        await truncate(database);
+        const source = {
+          ...request({
+            session_id: "bad-recovery",
+            start_user_message_id: "start",
+            end_user_message_id: "end",
+            messages: [{ role: "user", text: "source" }],
+          }),
+          source_id: SOURCE_ID,
+        };
+        const bad = await database.enqueue(source);
+        const badClaim = required(
+          await withClient(database, (client) =>
+            database.claimOldestJob(client),
+          ),
+        );
+        await database.publishExtraction(
+          badClaim,
+          validatedExtractionResult({ summary: "preserved stage", claims: [] }),
+        );
+        const good = await database.enqueue({
+          ...source,
+          session_id: "good-recovery",
+        });
+        await withClient(database, (client) => database.claimOldestJob(client));
+        await database.pool.query(
+          "UPDATE extraction_jobs SET payload = '{}'::jsonb WHERE id = $1",
+          [bad.id],
+        );
+        const before = (
+          await database.pool.query(
+            "SELECT * FROM segment_targets ORDER BY segment_id",
+          )
+        ).rows;
+        expect(
+          await withClient(database, (client) =>
+            database.recoverRunningJobs(client),
+          ),
+        ).toBe(1);
+        expect(await database.getJob(SOURCE_ID, bad.id)).toMatchObject({
+          status: "failed",
+          error:
+            "OwnershipValidationError: persisted segment group quarantined",
+        });
+        expect(
+          (
+            await database.pool.query(
+              "SELECT payload, lease_id FROM extraction_jobs WHERE id = $1",
+              [bad.id],
+            )
+          ).rows[0],
+        ).toEqual({ payload: {}, lease_id: null });
+        expect(
+          (
+            await database.pool.query(
+              "SELECT * FROM segment_targets ORDER BY segment_id",
+            )
+          ).rows,
+        ).toEqual(before);
+        expect(
+          required(
+            await withClient(database, (client) =>
+              database.claimOldestJob(client),
+            ),
+          ).id,
+        ).toBe(good.id);
+      } finally {
+        await database.close();
+      }
+    },
+  );
+
+  test.skipIf(!DATABASE_URL).each(["claim", "recovery"])(
+    "does not quarantine operational or registry errors during %s",
+    async (operation) => {
+      const database = new Database(settings());
+      await openDatabase(database);
+      try {
+        await truncate(database);
+        const job = await database.enqueue({
+          ...request({
+            session_id: "operational-error",
+            start_user_message_id: "start",
+            end_user_message_id: "end",
+            messages: [{ role: "user", text: "source" }],
+          }),
+          source_id: SOURCE_ID,
+        });
+        if (operation === "recovery")
+          await withClient(database, (client) =>
+            database.claimOldestJob(client),
+          );
+        const failure = Object.assign(new Error("connection interrupted"), {
+          code: "08006",
+        });
+        for (const kind of ["database", "registry", "legacy"]) {
+          if (kind === "legacy")
+            await database.pool.query(
+              "UPDATE extraction_jobs SET source_id = NULL; UPDATE segment_targets SET source_id = NULL",
+            );
+          const before = (
+            await database.pool.query("SELECT * FROM extraction_jobs")
+          ).rows;
+          await withClient(database, async (client) => {
+            const query = client.query.bind(client);
+            const spy = vi.spyOn(client, "query").mockImplementation((async (
+              text: string,
+              values?: unknown[],
+            ) => {
+              if (
+                kind === "database" &&
+                text.includes("SELECT * FROM segments")
+              )
+                throw failure;
+              if (
+                kind !== "database" &&
+                text.includes("SELECT source_id, kind, identity_scheme")
+              )
+                return { rows: [] };
+              return query(text, values);
+            }) as typeof client.query);
+            try {
+              const result =
+                operation === "claim"
+                  ? database.claimOldestJob(client)
+                  : database.recoverRunningJobs(client);
+              if (kind === "database")
+                await expect(result).rejects.toBe(failure);
+              else
+                await expect(result).rejects.toThrow(
+                  kind === "legacy"
+                    ? "registered legacy source"
+                    : "unknown source",
+                );
+            } finally {
+              spy.mockRestore();
+            }
+          });
+          expect(
+            (await database.pool.query("SELECT * FROM extraction_jobs")).rows,
+          ).toEqual(before);
+        }
+        expect((await database.getJob(SOURCE_ID, job.id))?.status).toBe(
+          operation === "claim" ? "pending" : "running",
+        );
+      } finally {
+        await database.close();
+      }
+    },
+  );
+  test.skipIf(!DATABASE_URL)(
+    "routes job mutations using only strict source bodies and fences wrong owners",
+    async () => {
+      const database = new Database(settings());
+      await openDatabase(database);
+      const worker = {
+        start: vi.fn(),
+        stop: vi.fn(async () => {}),
+        wake: vi.fn(),
+      };
+      const app = createApp({
+        settings: loadSettings({
+          DATABASE_URL: databaseUrl(),
+          REFLECTION_API_KEY: "test-key",
+          OPENROUTER_API_KEY: "synthetic",
+          VOYAGE_API_KEY: "synthetic",
+          MIGRATIONS_DIR,
+        }),
+        dependencies: {
+          database,
+          worker,
+          searchService: { search: async () => ({ claims: [] }) },
+        },
+        logger: false,
+      });
+      try {
+        await truncate(database);
+        await database.pool.query(
+          "INSERT INTO reflection_sources VALUES ('route-other', 'opencode-v2', 'source-v1') ON CONFLICT DO NOTHING",
+        );
+        const job = await database.enqueue({
+          ...request({
+            session_id: "route",
+            start_user_message_id: "start",
+            end_user_message_id: "end",
+            messages: [{ role: "user", text: "source" }],
+          }),
+          source_id: SOURCE_ID,
+        });
+        const claim = required(
+          await withClient(database, (client) =>
+            database.claimOldestJob(client),
+          ),
+        );
+        await database.finishFailedAttempt(claim, "failure", {
+          retryAfterSeconds: null,
+        });
+        const snapshot = await database.getJob(SOURCE_ID, job.id);
+        for (const action of ["retry", "restart", "supersede"]) {
+          const url = `/v1/jobs/${job.id}/${action}`;
+          const headers = { "x-api-key": "test-key" };
+          expect(
+            (await app.inject({ method: "POST", url, headers })).statusCode,
+          ).toBe(422);
+          expect(
+            (
+              await app.inject({
+                method: "POST",
+                url: `${url}?source_id=${SOURCE_ID}`,
+                headers,
+              })
+            ).statusCode,
+          ).toBe(422);
+          expect(
+            (
+              await app.inject({
+                method: "POST",
+                url,
+                headers,
+                payload: { source_id: SOURCE_ID, extra: true },
+              })
+            ).statusCode,
+          ).toBe(422);
+          expect(
+            (
+              await app.inject({
+                method: "POST",
+                url,
+                headers,
+                payload: { source_id: "route-other" },
+              })
+            ).statusCode,
+          ).toBe(404);
+          expect(await database.getJob(SOURCE_ID, job.id)).toEqual(snapshot);
+        }
+        expect(worker.wake).not.toHaveBeenCalled();
+        expect(
+          (
+            await app.inject({
+              method: "POST",
+              url: `/v1/jobs/${job.id}/retry`,
+              headers: { "x-api-key": "test-key" },
+              payload: { source_id: SOURCE_ID },
+            })
+          ).statusCode,
+        ).toBe(202);
+        expect((await database.getJob(SOURCE_ID, job.id))?.status).toBe(
+          "pending",
+        );
+      } finally {
+        await app.close();
+      }
+    },
+  );
+
+  test.skipIf(!DATABASE_URL)(
+    "bounds concurrent operator waits, backfill locks, and expansion DDL waits",
+    async () => {
+      const database = new Database(settings());
+      await openDatabase(database);
+      const blocker = await database.pool.connect();
+      const run = (...args: string[]) =>
+        promisify(execFile)(
+          process.execPath,
+          [
+            fileURLToPath(
+              new URL("../../scripts/source-ownership.mjs", import.meta.url),
+            ),
+            ...args,
+          ],
+          {
+            env: { ...process.env, DATABASE_URL: databaseUrl() },
+            timeout: 12000,
+          },
+        );
+      try {
+        await truncate(database);
+        await blocker.query("SELECT pg_advisory_lock($1)", [
+          settings().migrationLockId,
+        ]);
+        const started = Date.now();
+        const results = await Promise.allSettled([
+          run("install-indexes"),
+          run(
+            "register",
+            "--id",
+            "blocked",
+            "--kind",
+            "opencode-v2",
+            "--identity-scheme",
+            "source-v1",
+          ),
+        ]);
+        for (const result of results) {
+          expect(result.status).toBe("rejected");
+          if (result.status === "rejected")
+            expect(result.reason.stderr).toContain("55P03");
+        }
+        expect(Date.now() - started).toBeLessThan(11000);
+        await blocker.query("SELECT pg_advisory_unlock($1)", [
+          settings().migrationLockId,
+        ]);
+        const job = await database.enqueue({
+          ...request({
+            session_id: "locked",
+            start_user_message_id: "start",
+            end_user_message_id: "end",
+            messages: [{ role: "user", text: "source" }],
+          }),
+          source_id: SOURCE_ID,
+        });
+        await database.pool.query(
+          "UPDATE extraction_jobs SET source_id = NULL; UPDATE segment_targets SET source_id = NULL",
+        );
+        await blocker.query("BEGIN");
+        await blocker.query(
+          "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+          [job.segment_id],
+        );
+        await expect(
+          run("backfill", "--legacy-source", SOURCE_ID),
+        ).rejects.toMatchObject({ stderr: expect.stringContaining("55P03") });
+        await blocker.query("ROLLBACK");
+        await blocker.query(
+          "BEGIN; LOCK TABLE segments IN ACCESS EXCLUSIVE MODE",
+        );
+        await withClient(database, async (client) => {
+          await client.query("BEGIN");
+          try {
+            await expect(
+              client.query(
+                await readFile(
+                  `${MIGRATIONS_DIR}/009_source_ownership_expansion.sql`,
+                  "utf8",
+                ),
+              ),
+            ).rejects.toMatchObject({ code: "55P03" });
+          } finally {
+            await client.query("ROLLBACK");
+          }
+        });
+        await blocker.query("ROLLBACK");
+        await run("backfill", "--legacy-source", SOURCE_ID);
+        const secret = "secret-should-never-appear";
+        await expect(
+          promisify(execFile)(
+            process.execPath,
+            [
+              fileURLToPath(
+                new URL("../../scripts/source-ownership.mjs", import.meta.url),
+              ),
+              "register",
+            ],
+            {
+              env: {
+                ...process.env,
+                DATABASE_URL: `postgresql://invalid:${secret}@127.0.0.1:1/db`,
+              },
+              timeout: 7000,
+            },
+          ),
+        ).rejects.toMatchObject({
+          stderr: expect.not.stringContaining(secret),
+        });
+      } finally {
+        await blocker.query("ROLLBACK");
+        await blocker.query("SELECT pg_advisory_unlock_all()");
+        blocker.release();
+        await database.close();
+      }
+    },
+    30000,
+  );
+
+  test.skipIf(!DATABASE_URL)(
+    "backfill rejects malformed canonical data without changing IDs or hashes",
+    async () => {
+      const database = new Database(settings());
+      await openDatabase(database);
+      const run = () =>
+        promisify(execFile)(
+          process.execPath,
+          [
+            fileURLToPath(
+              new URL("../../scripts/source-ownership.mjs", import.meta.url),
+            ),
+            "backfill",
+            "--legacy-source",
+            SOURCE_ID,
+          ],
+          { env: { ...process.env, DATABASE_URL: databaseUrl() } },
+        );
+      try {
+        await truncate(database);
+        const original = request({
+          session_id: "canonical",
+          start_user_message_id: "start",
+          end_user_message_id: "end",
+          messages: [{ role: "user", text: "original" }],
+        });
+        const job = await database.enqueue({
+          ...original,
+          source_id: SOURCE_ID,
+        });
+        await database.pool.query(
+          "UPDATE extraction_jobs SET source_id = NULL; UPDATE segment_targets SET source_id = NULL",
+        );
+        await database.pool.query(
+          "UPDATE extraction_jobs SET payload = jsonb_set(payload, '{messages,0,text}', '\"tampered\"')",
+        );
+        const before = (
+          await database.pool.query("SELECT * FROM extraction_jobs")
+        ).rows;
+        await expect(run()).rejects.toThrow();
+        expect(
+          (await database.pool.query("SELECT * FROM extraction_jobs")).rows,
+        ).toEqual(before);
+        await database.pool.query(
+          "UPDATE extraction_jobs SET payload = $1::jsonb",
+          [JSON.stringify(original)],
+        );
+        const invalidId = randomUUID();
+        await database.pool.query(
+          "UPDATE extraction_jobs SET segment_id = $1",
+          [invalidId],
+        );
+        await database.pool.query(
+          "UPDATE segment_targets SET segment_id = $1",
+          [invalidId],
+        );
+        await expect(run()).rejects.toThrow();
+        expect(
+          (
+            await database.pool.query(
+              "SELECT segment_id, source_id, source_fingerprint FROM extraction_jobs",
+            )
+          ).rows,
+        ).toEqual([
+          {
+            segment_id: invalidId,
+            source_id: null,
+            source_fingerprint: sourceFingerprint(original),
+          },
+        ]);
+        await database.pool.query(
+          "UPDATE extraction_jobs SET segment_id = $1",
+          [job.segment_id],
+        );
+        await database.pool.query(
+          "UPDATE segment_targets SET segment_id = $1",
+          [job.segment_id],
+        );
+        await run();
+        const after = (
+          await database.pool.query(
+            "SELECT segment_id, source_fingerprint, payload, source_id FROM extraction_jobs",
+          )
+        ).rows[0];
+        expect(after).toEqual({
+          segment_id: job.segment_id,
+          source_fingerprint: sourceFingerprint(original),
+          payload: original,
+          source_id: SOURCE_ID,
+        });
+      } finally {
+        await database.close();
+      }
+    },
+  );
+  test.skipIf(!DATABASE_URL)(
+    "guards index cutover and resumes ownership enforcement without replacing UUID keys",
+    async () => {
+      const database = new Database(settings());
+      await openDatabase(database);
+      const run = (...args: string[]) =>
+        execFileSync(
+          process.execPath,
+          [
+            fileURLToPath(
+              new URL("../../scripts/source-ownership.mjs", import.meta.url),
+            ),
+            ...args,
+          ],
+          {
+            env: { ...process.env, DATABASE_URL: databaseUrl() },
+            stdio: "pipe",
+          },
+        ).toString();
+      try {
+        await truncate(database);
+        await database.pool.query("DROP INDEX segments_source_v1_start_key");
+        await expect(database.open()).rejects.toThrow("indexes are not ready");
+        await database.pool.query(
+          "CREATE UNIQUE INDEX segments_source_v1_start_key ON segments(id)",
+        );
+        expect(() => run("install-indexes")).toThrow();
+        await database.pool.query("DROP INDEX segments_source_v1_start_key");
+        run("install-indexes");
+        expect(() => run("enforce")).toThrow();
+        const enqueued = await database.enqueue({
+          ...request({
+            session_id: "enforce",
+            start_user_message_id: "start",
+            end_user_message_id: "end",
+            messages: [{ role: "user", text: "source" }],
+          }),
+          source_id: SOURCE_ID,
+        });
+        await database.pool.query(
+          "UPDATE extraction_jobs SET source_id = NULL; UPDATE segment_targets SET source_id = NULL",
+        );
+        expect(() => run("enforce", "--old-writers-stopped")).toThrow();
+        await database.pool.query(
+          'UPDATE segment_targets SET payload = payload || \'{"source_id":"wrong"}\'::jsonb',
+        );
+        expect(() => run("backfill", "--legacy-source", SOURCE_ID)).toThrow();
+        expect(
+          (
+            await database.pool.query(
+              "SELECT source_id FROM extraction_jobs WHERE id = $1",
+              [enqueued.id],
+            )
+          ).rows[0]?.source_id,
+        ).toBeNull();
+        await database.pool.query(
+          "UPDATE segment_targets SET payload = payload - 'source_id'",
+        );
+        run("backfill", "--legacy-source", SOURCE_ID, "--batch-size", "1");
+        expect(run("enforce", "--old-writers-stopped")).toContain(
+          "ownership enforced",
+        );
+        expect(run("enforce", "--old-writers-stopped")).toContain(
+          "ownership enforced",
+        );
+        await expect(
+          database.pool.query("UPDATE extraction_jobs SET source_id = NULL"),
+        ).rejects.toThrow();
+        const primary = (
+          await database.pool.query(
+            "SELECT pg_get_constraintdef(oid) AS definition FROM pg_constraint WHERE conrelid = 'segments'::regclass AND contype = 'p'",
+          )
+        ).rows[0];
+        expect(primary?.definition).toBe("PRIMARY KEY (id)");
+        const claimsFk = (
+          await database.pool.query(
+            "SELECT pg_get_constraintdef(oid) AS definition FROM pg_constraint WHERE conrelid = 'claims'::regclass AND confrelid = 'segments'::regclass",
+          )
+        ).rows[0];
+        expect(claimsFk?.definition).toContain(
+          "FOREIGN KEY (segment_id) REFERENCES segments(id)",
+        );
+      } finally {
+        // Restore the expansion phase for the historical raw-SQL fixtures below.
+        await database.pool.query(
+          "ALTER TABLE segment_targets DROP CONSTRAINT IF EXISTS segment_targets_owned_job_fkey",
+        );
+        for (const table of [
+          "segments",
+          "extraction_jobs",
+          "segment_targets",
+        ]) {
+          await database.pool.query(
+            `ALTER TABLE ${table} ALTER COLUMN source_id DROP NOT NULL, DROP CONSTRAINT IF EXISTS ${table}_source_owned`,
+          );
+        }
+        await database.close();
+      }
+    },
+  );
+
+  test.skipIf(!DATABASE_URL)(
+    "isolates identical boundaries and rejects forged claims and contradictory payload owners",
+    async () => {
+      const database = new Database(settings());
+      await openDatabase(database);
+      try {
+        await truncate(database);
+        const secondSource: SourceInfo = {
+          id: "test-v2",
+          kind: "opencode-v2",
+          identity_scheme: "source-v1",
+        };
+        await database.pool.query(
+          "INSERT INTO reflection_sources VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+          [secondSource.id, secondSource.kind, secondSource.identity_scheme],
+        );
+        const legacy = {
+          ...request({
+            session_id: "same",
+            start_user_message_id: "start",
+            end_user_message_id: "end",
+            messages: [{ role: "user", text: "same content" }],
+          }),
+          source_id: SOURCE_ID,
+        };
+        const modern = { ...legacy, source_id: secondSource.id };
+        await expect(
+          database.enqueue({ ...modern, source_id: "unknown" }),
+        ).rejects.toThrow("unknown source");
+        const first = await database.enqueue(legacy);
+        const second = await database.enqueue(modern);
+        expect(first.segment_id).toBe(segmentIdForRequest(legacy));
+        expect(second.segment_id).toBe(
+          sourceSegmentIdForRequest(modern, secondSource),
+        );
+        expect(second.segment_id).not.toBe(first.segment_id);
+        expect(await database.getJob(secondSource.id, first.id)).toBeNull();
+        expect(
+          await database.retryFailedJob(secondSource.id, first.id),
+        ).toBeNull();
+        expect(
+          await database.supersedeFailedJob(secondSource.id, first.id),
+        ).toBeNull();
+        await expect(database.getJob("unknown", first.id)).rejects.toThrow(
+          "unknown source",
+        );
+        await expect(
+          database.getSegment("unknown", first.segment_id),
+        ).rejects.toThrow("unknown source");
+        await expect(
+          database.sessionSegmentListing("unknown", "same"),
+        ).rejects.toThrow("unknown source");
+        await expect(
+          database.priorSummaries("unknown", "same", first.segment_id),
+        ).rejects.toThrow("unknown source");
+        const modernClaim = required(
+          await withClient(database, (client) =>
+            database.claimOldestJob(client, [
+              { sourceId: SOURCE_ID, sessionId: "same" },
+            ]),
+          ),
+        );
+        expect(modernClaim.id).toBe(second.id);
+        expect(modernClaim.sourceId).toBe(secondSource.id);
+        const legacyClaim = required(
+          await withClient(database, (client) =>
+            database.claimOldestJob(client),
+          ),
+        );
+        const extraction = validatedExtractionResult({
+          summary: "modern summary",
+          claims: [],
+        });
+        for (const forged of [
+          { ...modernClaim, sourceId: SOURCE_ID },
+          { ...modernClaim, id: legacyClaim.id },
+          { ...modernClaim, segmentId: first.segment_id },
+          {
+            ...modernClaim,
+            request: { ...modernClaim.request, source_id: SOURCE_ID },
+          },
+        ]) {
+          await expect(
+            database.publishExtraction(forged, extraction),
+          ).rejects.toThrow();
+          await expect(
+            database.finishFailedAttempt(forged, "forged", {
+              retryAfterSeconds: null,
+            }),
+          ).rejects.toThrow();
+          await expect(
+            database.commitResolution(
+              forged,
+              extraction,
+              emptyPrepared(forged, extraction.summary),
+            ),
+          ).rejects.toThrow();
+        }
+        expect(
+          (await database.getJob(secondSource.id, second.id))?.status,
+        ).toBe("running");
+        await database.publishExtraction(modernClaim, extraction);
+        await database.commitResolution(
+          modernClaim,
+          extraction,
+          emptyPrepared(modernClaim, extraction.summary),
+        );
+        expect(
+          await database.getSegment(SOURCE_ID, second.segment_id),
+        ).toBeNull();
+        expect(
+          (await database.getSegment(secondSource.id, second.segment_id))
+            ?.source_id,
+        ).toBe(secondSource.id);
+        expect(await database.segmentSummaries(SOURCE_ID, "same")).toEqual([]);
+        expect(
+          (await database.segmentSummaries(secondSource.id, "same"))[0]
+            ?.summary,
+        ).toBe(extraction.summary);
+        await database.pool.query(
+          "UPDATE segments SET source_id = $1 WHERE id = $2",
+          [SOURCE_ID, second.segment_id],
+        );
+        await expect(database.enqueue(modern)).rejects.toThrow(
+          "contradictory segment ownership",
+        );
+        await database.pool.query(
+          "UPDATE segments SET source_id = $1 WHERE id = $2",
+          [secondSource.id, second.segment_id],
+        );
+        await database.pool.query(
+          "UPDATE segment_targets SET source_id = $1 WHERE segment_id = $2",
+          [secondSource.id, first.segment_id],
+        );
+        await expect(
+          database.publishExtraction(legacyClaim, extraction),
+        ).rejects.toThrow("contradictory segment ownership");
+        expect((await database.getJob(SOURCE_ID, first.id))?.status).toBe(
+          "running",
+        );
+        await database.pool.query(
+          "UPDATE segment_targets SET source_id = $1 WHERE segment_id = $2",
+          [SOURCE_ID, first.segment_id],
+        );
+        await database.finishFailedAttempt(legacyClaim, "failed", {
+          retryAfterSeconds: null,
+        });
+        await database.pool.query(
+          "UPDATE segment_targets SET payload = payload || jsonb_build_object('source_id', $1::text) WHERE segment_id = $2",
+          [secondSource.id, first.segment_id],
+        );
+        for (const operation of [
+          () => database.enqueue(legacy),
+          () => database.retryFailedJob(SOURCE_ID, first.id),
+          () => database.supersedeFailedJob(SOURCE_ID, first.id),
+        ])
+          await expect(operation()).rejects.toThrow();
+        expect((await database.getJob(SOURCE_ID, first.id))?.status).toBe(
+          "failed",
+        );
+        expect(
+          (
+            await database.pool.query(
+              "SELECT payload->>'source_id' AS source FROM segment_targets WHERE segment_id = $1",
+              [first.segment_id],
+            )
+          ).rows[0]?.source,
+        ).toBe(secondSource.id);
+      } finally {
+        await database.close();
+      }
+    },
+  );
+
+  test.skipIf(!DATABASE_URL)(
+    "keeps null-owned legacy jobs, manifests, and recall available during bounded backfill",
+    async () => {
+      const database = new Database(settings());
+      await openDatabase(database);
+      const run = (...args: string[]) =>
+        execFileSync(
+          process.execPath,
+          [
+            fileURLToPath(
+              new URL("../../scripts/source-ownership.mjs", import.meta.url),
+            ),
+            ...args,
+          ],
+          { env: { ...process.env, DATABASE_URL: databaseUrl() } },
+        ).toString();
+      try {
+        await truncate(database);
+        const source = {
+          ...request({
+            session_id: "legacy-backfill",
+            start_user_message_id: "start",
+            end_user_message_id: "end",
+            messages: [{ role: "user", text: "source" }],
+          }),
+          source_id: SOURCE_ID,
+        };
+        const enqueued = await database.enqueue(source);
+        await database.pool.query(
+          "UPDATE extraction_jobs SET source_id = NULL; UPDATE segment_targets SET source_id = NULL",
+        );
+        expect((await database.getJob(SOURCE_ID, enqueued.id))?.source_id).toBe(
+          SOURCE_ID,
+        );
+        expect(
+          (
+            await database.sessionSegmentListing(SOURCE_ID, source.session_id)
+          )[2],
+        ).toHaveLength(1);
+        expect(
+          await withClient(database, (client) =>
+            database.claimOldestJob(client, [
+              { sourceId: SOURCE_ID, sessionId: source.session_id },
+            ]),
+          ),
+        ).toBeNull();
+        const claim = required(
+          await withClient(database, (client) =>
+            database.claimOldestJob(client),
+          ),
+        );
+        expect(claim.sourceId).toBe(SOURCE_ID);
+        await completeResolution(
+          database,
+          claim,
+          preparedSegment(claim, {
+            endId: "end",
+            summary: "legacy summary",
+            subjectId: randomUUID(),
+            objectId: randomUUID(),
+            entitiesAreNew: true,
+          }),
+        );
+        await database.pool.query("UPDATE segments SET source_id = NULL");
+        const direct = await database.directClaims(EMBEDDING);
+        expect(direct).toHaveLength(2);
+        expect(direct.every((row) => row.sourceId === SOURCE_ID)).toBe(true);
+        const neighbor = await database.neighboringClaims(
+          required(direct[0]).subjectEntityId,
+          EMBEDDING,
+          0.8,
+        );
+        expect(neighbor.every((row) => row.sourceId === SOURCE_ID)).toBe(true);
+        const support = await database.supportForEquivalenceKeys(
+          direct.map((row) => row.equivalenceKey),
+        );
+        expect([...support.values()][0]?.segments).toEqual([
+          { source_id: SOURCE_ID, segment_id: enqueued.segment_id },
+        ]);
+        await database.pool.query(
+          "INSERT INTO reflection_sources VALUES ('backfill-v2', 'opencode-v2', 'source-v1') ON CONFLICT DO NOTHING",
+        );
+        const modernJob = await database.enqueue({
+          ...source,
+          source_id: "backfill-v2",
+        });
+        const modernClaim = required(
+          await withClient(database, (client) =>
+            database.claimOldestJob(client),
+          ),
+        );
+        const shared = required(
+          direct.find((row) => row.objectEntityId !== null),
+        );
+        await completeResolution(
+          database,
+          modernClaim,
+          preparedSegment(modernClaim, {
+            endId: "end",
+            summary: "modern summary",
+            subjectId: shared.subjectEntityId,
+            objectId: required(shared.objectEntityId),
+            entitiesAreNew: false,
+          }),
+        );
+        const combined = required(
+          (
+            await database.supportForEquivalenceKeys([shared.equivalenceKey])
+          ).get(shared.equivalenceKey),
+        );
+        expect(combined.sessionCount).toBe(2);
+        expect(combined.supportCount).toBe(2);
+        expect(combined.segments).toEqual(
+          expect.arrayContaining([
+            { source_id: SOURCE_ID, segment_id: enqueued.segment_id },
+            { source_id: "backfill-v2", segment_id: modernJob.segment_id },
+          ]),
+        );
+        expect(
+          run("backfill", "--legacy-source", SOURCE_ID, "--batch-size", "1"),
+        ).toContain("backfilled 1");
+        expect(
+          run("backfill", "--legacy-source", SOURCE_ID, "--batch-size", "1"),
+        ).toContain("backfilled 0");
+        expect(
+          (await database.directClaims(EMBEDDING)).filter(
+            (row) => row.sourceId === SOURCE_ID,
+          ),
+        ).toEqual(direct);
+        expect(
+          (
+            await database.sessionSegmentListing(SOURCE_ID, source.session_id)
+          )[0][0]?.summary,
+        ).toBe("legacy summary");
+        await expect(
+          database.pool.query(
+            "UPDATE reflection_sources SET identity_scheme = 'source-v1' WHERE source_id = $1",
+            [SOURCE_ID],
+          ),
+        ).rejects.toThrow("immutable");
+      } finally {
+        await database.close();
+      }
+    },
+  );
+
+  test.skipIf(!DATABASE_URL)(
     "reports bounded queue diagnostics without source payloads or raw errors",
     async () => {
       const database = new Database(settings());
-      await database.open();
+      await openDatabase(database);
       try {
         await truncate(database);
         const jobs = [];
@@ -241,14 +1428,15 @@ describe.sequential("Database PostgreSQL integration", () => {
           "superseded",
         ]) {
           jobs.push(
-            await database.enqueue(
-              request({
+            await database.enqueue({
+              ...request({
                 session_id: "queue-status",
                 start_user_message_id: name,
                 end_user_message_id: name,
                 messages: [{ role: "user", text: name }],
               }),
-            ),
+              source_id: SOURCE_ID,
+            }),
           );
         }
         const due = required(jobs[0]);
@@ -408,7 +1596,7 @@ describe.sequential("Database PostgreSQL integration", () => {
     "preserves queue fencing, replacement, retry, and recall semantics",
     async () => {
       const database = new Database(settings());
-      await database.open();
+      await openDatabase(database);
       try {
         await truncate(database);
         const firstRequest = request({
@@ -419,10 +1607,14 @@ describe.sequential("Database PostgreSQL integration", () => {
           messages: [{ role: "user", text: "hello" }],
         });
 
-        const first = await database.enqueue(firstRequest);
-        const duplicate = await database.enqueue(
-          updateRequest(firstRequest, { messages: firstRequest.messages }),
-        );
+        const first = await database.enqueue({
+          ...firstRequest,
+          source_id: SOURCE_ID,
+        });
+        const duplicate = await database.enqueue({
+          ...updateRequest(firstRequest, { messages: firstRequest.messages }),
+          source_id: SOURCE_ID,
+        });
         expect(duplicate.id).toBe(first.id);
         const identity = required(
           (
@@ -460,11 +1652,16 @@ describe.sequential("Database PostgreSQL integration", () => {
         const changedRequest = updateRequest(firstRequest, {
           messages: [{ role: "user", text: "hello, corrected" }],
         });
-        const changed = await database.enqueue(changedRequest);
+        const changed = await database.enqueue({
+          ...changedRequest,
+          source_id: SOURCE_ID,
+        });
         expect(changed.id).toBe(first.id);
         expect(changed.status).toBe("running");
 
-        expect(await database.segmentSummaries("session")).toEqual([]);
+        expect(await database.segmentSummaries(SOURCE_ID, "session")).toEqual(
+          [],
+        );
         const [recovered, currentClaimValue] = await withClient(
           database,
           async (client) => [
@@ -501,12 +1698,15 @@ describe.sequential("Database PostgreSQL integration", () => {
         await expect(
           completeResolution(database, staleClaim, firstPrepared),
         ).resolves.toBe(false);
-        expect(await database.getSegment(first.segment_id)).toBeNull();
+        expect(
+          await database.getSegment(SOURCE_ID, first.segment_id),
+        ).toBeNull();
 
         await completeResolution(database, currentClaim, firstPrepared);
-        const tail = await database.enqueue(
-          updateRequest(changedRequest, { end_user_message_id: "end-2" }),
-        );
+        const tail = await database.enqueue({
+          ...updateRequest(changedRequest, { end_user_message_id: "end-2" }),
+          source_id: SOURCE_ID,
+        });
         expect(tail.id).not.toBe(first.id);
         expect(tail.segment_id).toBe(first.segment_id);
         const tailClaim = required(
@@ -555,7 +1755,9 @@ describe.sequential("Database PostgreSQL integration", () => {
         );
         expect(committedIdentity.target_cleared).toBe(true);
 
-        const segment = required(await database.getSegment(first.segment_id));
+        const segment = required(
+          await database.getSegment(SOURCE_ID, first.segment_id),
+        );
         const candidates = await database.entityCandidates(
           "Postgres",
           EMBEDDING,
@@ -567,10 +1769,14 @@ describe.sequential("Database PostgreSQL integration", () => {
           0.75,
         );
         const summaries = await database.priorSummaries(
+          SOURCE_ID,
           "session",
           first.segment_id,
         );
-        const segmentSummaries = await database.segmentSummaries("session");
+        const segmentSummaries = await database.segmentSummaries(
+          SOURCE_ID,
+          "session",
+        );
 
         expect(segment.end_user_message_id).toBe("end-2");
         expect(segment.summary).toBe("Latest tail snapshot");
@@ -607,7 +1813,10 @@ describe.sequential("Database PostgreSQL integration", () => {
           end_user_message_id: "legacy-end",
           messages: [{ role: "user", text: "legacy" }],
         });
-        const legacyJob = await database.enqueue(legacyRequest);
+        const legacyJob = await database.enqueue({
+          ...legacyRequest,
+          source_id: SOURCE_ID,
+        });
         const legacyClaim = required(
           await withClient(database, (client) =>
             database.claimOldestJob(client),
@@ -618,7 +1827,10 @@ describe.sequential("Database PostgreSQL integration", () => {
           legacyClaim,
           emptyPrepared(legacyClaim, "Unsafe legacy summary"),
         );
-        const mixedSummaries = await database.segmentSummaries("session");
+        const mixedSummaries = await database.segmentSummaries(
+          SOURCE_ID,
+          "session",
+        );
         expect(new Set(mixedSummaries.map((item) => item.id))).toEqual(
           new Set([first.segment_id, legacyJob.segment_id]),
         );
@@ -626,14 +1838,15 @@ describe.sequential("Database PostgreSQL integration", () => {
           new Set(mixedSummaries.map((item) => item.projection_version)),
         ).toEqual(new Set([0, 1]));
 
-        const safeJob = await database.enqueue(
-          updateRequest(legacyRequest, { projection_version: 1 }),
-        );
+        const safeJob = await database.enqueue({
+          ...updateRequest(legacyRequest, { projection_version: 1 }),
+          source_id: SOURCE_ID,
+        });
         expect(safeJob.id).toBe(legacyJob.id);
         expect(safeJob.status).toBe("pending");
         expect(
           new Set(
-            (await database.segmentSummaries("session")).map(
+            (await database.segmentSummaries(SOURCE_ID, "session")).map(
               (item) => item.summary,
             ),
           ),
@@ -650,13 +1863,13 @@ describe.sequential("Database PostgreSQL integration", () => {
         ).toBe(true);
         expect(
           new Set(
-            (await database.segmentSummaries("session")).map(
+            (await database.segmentSummaries(SOURCE_ID, "session")).map(
               (item) => item.summary,
             ),
           ),
         ).not.toContain("Unsafe legacy summary");
         const retriedSafeJob = required(
-          await database.retryFailedJob(safeJob.id),
+          await database.retryFailedJob(SOURCE_ID, safeJob.id),
         );
         expect(retriedSafeJob.status).toBe("pending");
         expect(retriedSafeJob.attempts).toBe(0);
@@ -672,30 +1885,34 @@ describe.sequential("Database PostgreSQL integration", () => {
         );
         expect(
           new Set(
-            (await database.segmentSummaries("session")).map(
+            (await database.segmentSummaries(SOURCE_ID, "session")).map(
               (item) => item.summary,
             ),
           ),
         ).toEqual(new Set(["Latest tail snapshot", "Projection-safe summary"]));
-        const downgradeJob = await database.enqueue(
-          updateRequest(legacyRequest, { end_user_message_id: "legacy-end-2" }),
-        );
+        const downgradeJob = await database.enqueue({
+          ...updateRequest(legacyRequest, {
+            end_user_message_id: "legacy-end-2",
+          }),
+          source_id: SOURCE_ID,
+        });
         expect(downgradeJob).toMatchObject({
           status: "superseded",
           error: "snapshot was superseded",
         });
         const preserved = required(
-          await database.getSegment(safeJob.segment_id),
+          await database.getSegment(SOURCE_ID, safeJob.segment_id),
         );
         expect(preserved.summary).toBe("Projection-safe summary");
         expect(preserved.end_user_message_id).toBe("legacy-end");
 
-        const forwardJob = await database.enqueue(
-          updateRequest(legacyRequest, {
+        const forwardJob = await database.enqueue({
+          ...updateRequest(legacyRequest, {
             end_user_message_id: "legacy-end-2",
             projection_version: 1,
           }),
-        );
+          source_id: SOURCE_ID,
+        });
         expect(forwardJob.id).toBe(downgradeJob.id);
         expect(forwardJob.status).toBe("pending");
         const forwardClaim = required(
@@ -709,9 +1926,10 @@ describe.sequential("Database PostgreSQL integration", () => {
           emptyPrepared(forwardClaim, "Projection-safe forward snapshot"),
         );
 
-        const rewindJob = await database.enqueue(
-          updateRequest(legacyRequest, { projection_version: 1 }),
-        );
+        const rewindJob = await database.enqueue({
+          ...updateRequest(legacyRequest, { projection_version: 1 }),
+          source_id: SOURCE_ID,
+        });
         expect(rewindJob.id).toBe(safeJob.id);
         expect(rewindJob.status).toBe("pending");
         const rewindClaim = required(
@@ -724,21 +1942,27 @@ describe.sequential("Database PostgreSQL integration", () => {
           rewindClaim,
           emptyPrepared(rewindClaim, "Projection-safe rewind snapshot"),
         );
-        const rewound = required(await database.getSegment(safeJob.segment_id));
+        const rewound = required(
+          await database.getSegment(SOURCE_ID, safeJob.segment_id),
+        );
         expect(rewound.summary).toBe("Projection-safe rewind snapshot");
         expect(rewound.end_user_message_id).toBe("legacy-end");
 
-        const pendingFuture = await database.enqueue(
-          updateRequest(legacyRequest, {
+        const pendingFuture = await database.enqueue({
+          ...updateRequest(legacyRequest, {
             end_user_message_id: "legacy-end-3",
             projection_version: 1,
           }),
-        );
-        const replayCurrent = await database.enqueue(
-          updateRequest(legacyRequest, { projection_version: 1 }),
-        );
+          source_id: SOURCE_ID,
+        });
+        const replayCurrent = await database.enqueue({
+          ...updateRequest(legacyRequest, { projection_version: 1 }),
+          source_id: SOURCE_ID,
+        });
         expect(replayCurrent.status).toBe("pending");
-        expect(await database.getJob(pendingFuture.id)).toMatchObject({
+        expect(
+          await database.getJob(SOURCE_ID, pendingFuture.id),
+        ).toMatchObject({
           status: "superseded",
           error: "snapshot was superseded",
         });
@@ -768,18 +1992,23 @@ describe.sequential("Database PostgreSQL integration", () => {
           end_user_message_id: "pending-upgrade-end",
           messages: [{ role: "user", text: "upgrade" }],
         });
-        const pendingLegacy = await database.enqueue(pendingUpgradeRequest);
-        const pendingSafe = await database.enqueue(
-          updateRequest(pendingUpgradeRequest, { projection_version: 2 }),
-        );
+        const pendingLegacy = await database.enqueue({
+          ...pendingUpgradeRequest,
+          source_id: SOURCE_ID,
+        });
+        const pendingSafe = await database.enqueue({
+          ...updateRequest(pendingUpgradeRequest, { projection_version: 2 }),
+          source_id: SOURCE_ID,
+        });
         expect(pendingSafe.id).toBe(pendingLegacy.id);
         expect(pendingSafe.projection_version).toBe(2);
-        const pendingDowngrade = await database.enqueue(
-          updateRequest(pendingUpgradeRequest, {
+        const pendingDowngrade = await database.enqueue({
+          ...updateRequest(pendingUpgradeRequest, {
             end_user_message_id: "pending-downgrade",
             projection_version: 1,
           }),
-        );
+          source_id: SOURCE_ID,
+        });
         expect(pendingDowngrade.status).toBe("superseded");
         const pendingSafeClaim = required(
           await withClient(database, (client) =>
@@ -800,7 +2029,10 @@ describe.sequential("Database PostgreSQL integration", () => {
           end_user_message_id: "support-end",
           messages: [{ role: "user", text: "same claim" }],
         });
-        const supportJob = await database.enqueue(supportRequest);
+        const supportJob = await database.enqueue({
+          ...supportRequest,
+          source_id: SOURCE_ID,
+        });
         const supportClaim = required(
           await withClient(database, (client) =>
             database.claimOldestJob(client),
@@ -826,13 +2058,14 @@ describe.sequential("Database PostgreSQL integration", () => {
         );
         expect(support.supportCount).toBe(2);
         expect(support.sessionCount).toBe(2);
-        expect(new Set(support.segmentIds)).toEqual(
-          new Set([first.segment_id, supportJob.segment_id]),
-        );
+        expect(
+          new Set(support.segments.map((segment) => segment.segment_id)),
+        ).toEqual(new Set([first.segment_id, supportJob.segment_id]));
 
-        const emptySharedJob = await database.enqueue(
-          updateRequest(firstRequest, { end_user_message_id: "end-3" }),
-        );
+        const emptySharedJob = await database.enqueue({
+          ...updateRequest(firstRequest, { end_user_message_id: "end-3" }),
+          source_id: SOURCE_ID,
+        });
         expect(
           (await database.directClaims(EMBEDDING)).some(
             (claim) => claim.segmentId === first.segment_id,
@@ -847,7 +2080,9 @@ describe.sequential("Database PostgreSQL integration", () => {
           (await database.supportForEquivalenceKeys([usesKey])).get(usesKey),
         );
         expect(pendingSupport.supportCount).toBe(1);
-        expect(pendingSupport.segmentIds).toEqual([supportJob.segment_id]);
+        expect(
+          pendingSupport.segments.map((segment) => segment.segment_id),
+        ).toEqual([supportJob.segment_id]);
 
         let emptySharedClaim = required(
           await withClient(database, (client) =>
@@ -872,7 +2107,7 @@ describe.sequential("Database PostgreSQL integration", () => {
           ).supportCount,
         ).toBe(1);
 
-        await database.retryFailedJob(emptySharedJob.id);
+        await database.retryFailedJob(SOURCE_ID, emptySharedJob.id);
         emptySharedClaim = required(
           await withClient(database, (client) =>
             database.claimOldestJob(client),
@@ -899,7 +2134,7 @@ describe.sequential("Database PostgreSQL integration", () => {
           end_user_message_id: "orphan-end-1",
           messages: [{ role: "user", text: "temporary claim" }],
         });
-        await database.enqueue(orphanRequest);
+        await database.enqueue({ ...orphanRequest, source_id: SOURCE_ID });
         const orphanClaim = required(
           await withClient(database, (client) =>
             database.claimOldestJob(client),
@@ -918,11 +2153,12 @@ describe.sequential("Database PostgreSQL integration", () => {
             entitiesAreNew: true,
           }),
         );
-        await database.enqueue(
-          updateRequest(orphanRequest, {
+        await database.enqueue({
+          ...updateRequest(orphanRequest, {
             end_user_message_id: "orphan-end-2",
           }),
-        );
+          source_id: SOURCE_ID,
+        });
         const emptyClaim = required(
           await withClient(database, (client) =>
             database.claimOldestJob(client),
@@ -951,12 +2187,13 @@ describe.sequential("Database PostgreSQL integration", () => {
           true,
         );
 
-        const oldSnapshot = await database.enqueue(
-          updateRequest(firstRequest, {
+        const oldSnapshot = await database.enqueue({
+          ...updateRequest(firstRequest, {
             start_user_message_id: "blocked-tail",
             end_user_message_id: "old",
           }),
-        );
+          source_id: SOURCE_ID,
+        });
         const oldSnapshotClaim = required(
           await withClient(database, (client) =>
             database.claimOldestJob(client),
@@ -969,14 +2206,15 @@ describe.sequential("Database PostgreSQL integration", () => {
             { retryAfterSeconds: null },
           ),
         ).toBe(true);
-        const newerSnapshot = await database.enqueue(
-          updateRequest(firstRequest, {
+        const newerSnapshot = await database.enqueue({
+          ...updateRequest(firstRequest, {
             start_user_message_id: "blocked-tail",
             end_user_message_id: "new",
           }),
-        );
+          source_id: SOURCE_ID,
+        });
         const retryError = await database
-          .retryFailedJob(oldSnapshot.id)
+          .retryFailedJob(SOURCE_ID, oldSnapshot.id)
           .catch((error: unknown) => error);
         expect(retryError).toBeInstanceOf(JobNotRetryableError);
         if (!(retryError instanceof Error))
@@ -1018,7 +2256,10 @@ describe.sequential("Database PostgreSQL integration", () => {
           start_user_message_id: "retry-start",
           end_user_message_id: "retry-end",
         });
-        const retryJob = await database.enqueue(retryRequest);
+        const retryJob = await database.enqueue({
+          ...retryRequest,
+          source_id: SOURCE_ID,
+        });
         const terminalClaim = required(
           await withClient(database, (client) =>
             database.claimOldestJob(client),
@@ -1029,16 +2270,19 @@ describe.sequential("Database PostgreSQL integration", () => {
             retryAfterSeconds: null,
           }),
         ).toBe(true);
-        const exactFailedReplay = await database.enqueue(
-          updateRequest(retryRequest, { processing_priority: 100 }),
-        );
+        const exactFailedReplay = await database.enqueue({
+          ...updateRequest(retryRequest, { processing_priority: 100 }),
+          source_id: SOURCE_ID,
+        });
         expect(exactFailedReplay).toMatchObject({
           id: retryJob.id,
           status: "failed",
           attempts: terminalClaim.attempts,
           error: "terminal",
         });
-        const retried = required(await database.retryFailedJob(retryJob.id));
+        const retried = required(
+          await database.retryFailedJob(SOURCE_ID, retryJob.id),
+        );
         expect(retried.attempts).toBe(0);
         const retriedClaim = required(
           await withClient(database, (client) =>
@@ -1047,7 +2291,9 @@ describe.sequential("Database PostgreSQL integration", () => {
         );
         expect(retriedClaim.leaseId).not.toBe(terminalClaim.leaseId);
         await database.applyMigrations(MIGRATIONS_DIR);
-        const stillRunning = required(await database.getJob(retriedClaim.id));
+        const stillRunning = required(
+          await database.getJob(SOURCE_ID, retriedClaim.id),
+        );
         expect(stillRunning.status).toBe("running");
         expect(
           await database.finishFailedAttempt(
@@ -1057,12 +2303,13 @@ describe.sequential("Database PostgreSQL integration", () => {
           ),
         ).toBe(false);
 
-        const newer = await database.enqueue(
-          updateRequest(firstRequest, {
+        const newer = await database.enqueue({
+          ...updateRequest(firstRequest, {
             start_user_message_id: "newer",
             end_user_message_id: "newer-end",
           }),
-        );
+          source_id: SOURCE_ID,
+        });
         expect(
           await database.finishFailedAttempt(retriedClaim, "transient", {
             retryAfterSeconds: 60,
@@ -1074,9 +2321,9 @@ describe.sequential("Database PostgreSQL integration", () => {
           ),
         );
         expect(newerClaim.id).toBe(newer.id);
-        expect(required(await database.getJob(retried.id)).status).toBe(
-          "pending",
-        );
+        expect(
+          required(await database.getJob(SOURCE_ID, retried.id)).status,
+        ).toBe("pending");
       } finally {
         await database.close();
       }
@@ -1088,7 +2335,7 @@ describe.sequential("Database PostgreSQL integration", () => {
     "does not rewrite existing aliases and persists newly learned aliases",
     async () => {
       const database = new Database(settings());
-      await database.open();
+      await openDatabase(database);
       try {
         await truncate(database);
         const firstRequest = request({
@@ -1098,7 +2345,10 @@ describe.sequential("Database PostgreSQL integration", () => {
           projection_version: 1,
           messages: [{ role: "user", text: "Reflection uses PostgreSQL." }],
         });
-        const firstJob = await database.enqueue(firstRequest);
+        const firstJob = await database.enqueue({
+          ...firstRequest,
+          source_id: SOURCE_ID,
+        });
         const firstClaim = required(
           await withClient(database, (client) =>
             database.claimOldestJob(client),
@@ -1149,9 +2399,10 @@ describe.sequential("Database PostgreSQL integration", () => {
         expect(required(boundedCandidate).aliases).toHaveLength(10);
         expect(required(boundedCandidate).aliases).toContain("Postgres");
 
-        const secondJob = await database.enqueue(
-          updateRequest(firstRequest, { end_user_message_id: "end-2" }),
-        );
+        const secondJob = await database.enqueue({
+          ...updateRequest(firstRequest, { end_user_message_id: "end-2" }),
+          source_id: SOURCE_ID,
+        });
         const secondClaim = required(
           await withClient(database, (client) =>
             database.claimOldestJob(client),
@@ -1218,7 +2469,7 @@ describe.sequential("Database PostgreSQL integration", () => {
     "keeps running targets recoverable across replays and projection upgrades",
     async () => {
       const database = new Database(settings());
-      await database.open();
+      await openDatabase(database);
       try {
         await truncate(database);
         const firstRequest = request({
@@ -1228,7 +2479,10 @@ describe.sequential("Database PostgreSQL integration", () => {
           projection_version: 1,
           messages: [{ role: "user", text: "A" }],
         });
-        const firstJob = await database.enqueue(firstRequest);
+        const firstJob = await database.enqueue({
+          ...firstRequest,
+          source_id: SOURCE_ID,
+        });
         let firstClaim = required(
           await withClient(database, (client) =>
             database.claimOldestJob(client),
@@ -1250,20 +2504,28 @@ describe.sequential("Database PostgreSQL integration", () => {
           emptyPrepared(firstClaim, "A"),
         );
 
-        const secondJob = await database.enqueue(
-          updateRequest(firstRequest, { end_user_message_id: "B" }),
-        );
+        const secondJob = await database.enqueue({
+          ...updateRequest(firstRequest, { end_user_message_id: "B" }),
+          source_id: SOURCE_ID,
+        });
         const secondClaim = required(
           await withClient(database, (client) =>
             database.claimOldestJob(client),
           ),
         );
         expect(secondClaim.id).toBe(secondJob.id);
-        expect(await database.segmentSummaries("running-session")).toEqual([]);
-        const replay = await database.enqueue(firstRequest);
+        expect(
+          await database.segmentSummaries(SOURCE_ID, "running-session"),
+        ).toEqual([]);
+        const replay = await database.enqueue({
+          ...firstRequest,
+          source_id: SOURCE_ID,
+        });
         expect(replay.id).toBe(firstJob.id);
         expect(replay.status).toBe("pending");
-        expect(await database.segmentSummaries("running-session")).toEqual([]);
+        expect(
+          await database.segmentSummaries(SOURCE_ID, "running-session"),
+        ).toEqual([]);
 
         expect(
           await completeResolution(
@@ -1272,13 +2534,15 @@ describe.sequential("Database PostgreSQL integration", () => {
             emptyPrepared(secondClaim, "stale B"),
           ),
         ).toBe(false);
-        const supersededJob = required(await database.getJob(secondJob.id));
+        const supersededJob = required(
+          await database.getJob(SOURCE_ID, secondJob.id),
+        );
         expect(supersededJob).toMatchObject({
           status: "superseded",
           error: "snapshot was superseded",
         });
         const staleResult = required(
-          await database.getSegment(firstJob.segment_id),
+          await database.getSegment(SOURCE_ID, firstJob.segment_id),
         );
         expect(staleResult.end_user_message_id).toBe("A");
         expect(staleResult.summary).toBe("A");
@@ -1295,27 +2559,30 @@ describe.sequential("Database PostgreSQL integration", () => {
           emptyPrepared(replayClaim, "A after stale B"),
         );
         const rewound = required(
-          await database.getSegment(firstJob.segment_id),
+          await database.getSegment(SOURCE_ID, firstJob.segment_id),
         );
         expect(rewound.end_user_message_id).toBe("A");
         expect(rewound.summary).toBe("A after stale B");
 
-        const failingJob = await database.enqueue(
-          updateRequest(firstRequest, { end_user_message_id: "failing-B" }),
-        );
+        const failingJob = await database.enqueue({
+          ...updateRequest(firstRequest, { end_user_message_id: "failing-B" }),
+          source_id: SOURCE_ID,
+        });
         const failingClaim = required(
           await withClient(database, (client) =>
             database.claimOldestJob(client),
           ),
         );
         expect(failingClaim.id).toBe(failingJob.id);
-        await database.enqueue(firstRequest);
+        await database.enqueue({ ...firstRequest, source_id: SOURCE_ID });
         expect(
           await database.finishFailedAttempt(failingClaim, "terminal failure", {
             retryAfterSeconds: null,
           }),
         ).toBe(true);
-        expect(await database.segmentSummaries("running-session")).toEqual([]);
+        expect(
+          await database.segmentSummaries(SOURCE_ID, "running-session"),
+        ).toEqual([]);
         const recoveredA = required(
           await withClient(database, (client) =>
             database.claimOldestJob(client),
@@ -1343,16 +2610,20 @@ describe.sequential("Database PostgreSQL integration", () => {
           end_user_message_id: "upgrade-end",
           messages: [{ role: "user", text: "upgrade" }],
         });
-        const upgradeJob = await database.enqueue(upgradeRequest);
+        const upgradeJob = await database.enqueue({
+          ...upgradeRequest,
+          source_id: SOURCE_ID,
+        });
         const legacyClaim = required(
           await withClient(database, (client) =>
             database.claimOldestJob(client),
           ),
         );
         expect(legacyClaim.id).toBe(upgradeJob.id);
-        const deferredUpgrade = await database.enqueue(
-          updateRequest(upgradeRequest, { projection_version: 1 }),
-        );
+        const deferredUpgrade = await database.enqueue({
+          ...updateRequest(upgradeRequest, { projection_version: 1 }),
+          source_id: SOURCE_ID,
+        });
         expect(deferredUpgrade.status).toBe("running");
         expect(deferredUpgrade.projection_version).toBe(0);
         expect(
@@ -1362,7 +2633,9 @@ describe.sequential("Database PostgreSQL integration", () => {
             emptyPrepared(legacyClaim, "Legacy"),
           ),
         ).toBe(false);
-        const upgradedJob = required(await database.getJob(upgradeJob.id));
+        const upgradedJob = required(
+          await database.getJob(SOURCE_ID, upgradeJob.id),
+        );
         expect(upgradedJob.status).toBe("pending");
         expect(upgradedJob.projection_version).toBe(1);
         const upgradedClaim = required(
@@ -1385,9 +2658,9 @@ describe.sequential("Database PostgreSQL integration", () => {
           );
           expect(
             new Set(
-              (await database.segmentSummaries("running-session")).map(
-                (item) => item.summary,
-              ),
+              (
+                await database.segmentSummaries(SOURCE_ID, "running-session")
+              ).map((item) => item.summary),
             ),
           ).toEqual(new Set(["A after failed B", "Safe"]));
           await rollbackConnection.query(
@@ -1407,14 +2680,15 @@ describe.sequential("Database PostgreSQL integration", () => {
         }
         expect(
           new Set(
-            (await database.segmentSummaries("running-session")).map(
+            (await database.segmentSummaries(SOURCE_ID, "running-session")).map(
               (item) => item.summary,
             ),
           ),
         ).toEqual(new Set(["A after failed B"]));
-        const repaired = await database.enqueue(
-          updateRequest(upgradeRequest, { projection_version: 1 }),
-        );
+        const repaired = await database.enqueue({
+          ...updateRequest(upgradeRequest, { projection_version: 1 }),
+          source_id: SOURCE_ID,
+        });
         expect(repaired.status).toBe("pending");
       } finally {
         await database.close();
@@ -1427,7 +2701,7 @@ describe.sequential("Database PostgreSQL integration", () => {
     "filters prior summaries using each committed segment's current eligibility",
     async () => {
       const database = new Database(settings());
-      await database.open();
+      await openDatabase(database);
       try {
         await truncate(database);
         const firstRequest = request({
@@ -1448,7 +2722,7 @@ describe.sequential("Database PostgreSQL integration", () => {
           [firstRequest, "First summary"],
           [secondRequest, "Second summary"],
         ] as const) {
-          await database.enqueue(source);
+          await database.enqueue({ ...source, source_id: SOURCE_ID });
           const claim = required(
             await withClient(database, (client) =>
               database.claimOldestJob(client),
@@ -1464,23 +2738,31 @@ describe.sequential("Database PostgreSQL integration", () => {
         const firstSegmentId = segmentIdFor("summary-session", "first");
         const secondSegmentId = segmentIdFor("summary-session", "second");
         expect(
-          await database.priorSummaries("summary-session", firstSegmentId),
+          await database.priorSummaries(
+            SOURCE_ID,
+            "summary-session",
+            firstSegmentId,
+          ),
         ).toEqual(["Second summary"]);
 
         const changedSecond = updateRequest(secondRequest, {
           messages: [{ role: "user", text: "second corrected" }],
         });
-        await database.enqueue(changedSecond);
+        await database.enqueue({ ...changedSecond, source_id: SOURCE_ID });
         expect(
-          await database.priorSummaries("summary-session", firstSegmentId),
+          await database.priorSummaries(
+            SOURCE_ID,
+            "summary-session",
+            firstSegmentId,
+          ),
         ).toEqual([]);
         expect(
-          (await database.segmentSummaries("summary-session")).map(
+          (await database.segmentSummaries(SOURCE_ID, "summary-session")).map(
             (segment) => segment.id,
           ),
         ).toEqual([firstSegmentId]);
         let [summaries, boundaries, targets] =
-          await database.sessionSegmentListing("summary-session");
+          await database.sessionSegmentListing(SOURCE_ID, "summary-session");
         expect(summaries.map((summary) => summary.id)).toEqual([
           firstSegmentId,
         ]);
@@ -1503,9 +2785,11 @@ describe.sequential("Database PostgreSQL integration", () => {
             { role: "assistant", text: "future" },
           ],
         });
-        await database.enqueue(futureSecond);
-        [, boundaries, targets] =
-          await database.sessionSegmentListing("summary-session");
+        await database.enqueue({ ...futureSecond, source_id: SOURCE_ID });
+        [, boundaries, targets] = await database.sessionSegmentListing(
+          SOURCE_ID,
+          "summary-session",
+        );
         const secondBoundary = required(
           boundaries.find((boundary) => boundary.id === secondSegmentId),
         );
@@ -1515,7 +2799,7 @@ describe.sequential("Database PostgreSQL integration", () => {
           "second-future-end",
         ]);
 
-        await database.enqueue(secondRequest);
+        await database.enqueue({ ...secondRequest, source_id: SOURCE_ID });
         const stagedSecond = required(
           await withClient(database, (client) =>
             database.claimOldestJob(client),
@@ -1531,29 +2815,43 @@ describe.sequential("Database PostgreSQL integration", () => {
           ),
         ).toBe(true);
         expect(
-          await database.priorSummaries("summary-session", firstSegmentId),
+          await database.priorSummaries(
+            SOURCE_ID,
+            "summary-session",
+            firstSegmentId,
+          ),
         ).toEqual(["Staged second summary"]);
         await database.pool.query(
           "UPDATE segments SET summary = 'corrupted' WHERE id = $1",
           [secondSegmentId],
         );
         expect(
-          await database.priorSummaries("summary-session", firstSegmentId),
+          await database.priorSummaries(
+            SOURCE_ID,
+            "summary-session",
+            firstSegmentId,
+          ),
         ).toEqual(["Staged second summary"]);
         await database.pool.query(
           "UPDATE segment_targets SET summary_commit_fingerprint = repeat('0', 64) WHERE segment_id = $1",
           [secondSegmentId],
         );
         expect(
-          await database.priorSummaries("summary-session", firstSegmentId),
+          await database.priorSummaries(
+            SOURCE_ID,
+            "summary-session",
+            firstSegmentId,
+          ),
         ).toEqual([]);
         expect(
-          (await database.segmentSummaries("summary-session")).map(
+          (await database.segmentSummaries(SOURCE_ID, "summary-session")).map(
             (segment) => segment.id,
           ),
         ).toEqual([firstSegmentId]);
-        [summaries, boundaries] =
-          await database.sessionSegmentListing("summary-session");
+        [summaries, boundaries] = await database.sessionSegmentListing(
+          SOURCE_ID,
+          "summary-session",
+        );
         expect(summaries.map((summary) => summary.id)).toEqual([
           firstSegmentId,
         ]);
@@ -1576,7 +2874,7 @@ describe.sequential("Database PostgreSQL integration", () => {
     "requeues an exact committed source when its summary is empty",
     async () => {
       const database = new Database(settings());
-      await database.open();
+      await openDatabase(database);
       try {
         await truncate(database);
         const source = request({
@@ -1586,7 +2884,10 @@ describe.sequential("Database PostgreSQL integration", () => {
           projection_version: 1,
           messages: [{ role: "user", text: "source" }],
         });
-        const initial = await database.enqueue(source);
+        const initial = await database.enqueue({
+          ...source,
+          source_id: SOURCE_ID,
+        });
         const claim = required(
           await withClient(database, (client) =>
             database.claimOldestJob(client),
@@ -1615,6 +2916,7 @@ describe.sequential("Database PostgreSQL integration", () => {
         );
 
         const [summaries, boundaries] = await database.sessionSegmentListing(
+          SOURCE_ID,
           "empty-summary-session",
         );
         expect(summaries).toEqual([]);
@@ -1622,7 +2924,10 @@ describe.sequential("Database PostgreSQL integration", () => {
           { id: initial.segment_id, source_eligible: false },
         ]);
 
-        const requeued = await database.enqueue(source);
+        const requeued = await database.enqueue({
+          ...source,
+          source_id: SOURCE_ID,
+        });
         expect(requeued).toMatchObject({
           id: initial.id,
           segment_id: initial.segment_id,
@@ -1669,9 +2974,9 @@ describe.sequential("Database PostgreSQL integration", () => {
           emptyPrepared(repairClaim, "Repaired summary"),
         );
         expect(
-          (await database.segmentSummaries("empty-summary-session")).map(
-            (segment) => segment.summary,
-          ),
+          (
+            await database.segmentSummaries(SOURCE_ID, "empty-summary-session")
+          ).map((segment) => segment.summary),
         ).toEqual(["Repaired summary"]);
       } finally {
         await database.close();
@@ -1684,7 +2989,7 @@ describe.sequential("Database PostgreSQL integration", () => {
     "requeues a failed exact target when its staged extraction is stale",
     async () => {
       const database = new Database(settings());
-      await database.open();
+      await openDatabase(database);
       try {
         await truncate(database);
         const source = request({
@@ -1693,7 +2998,10 @@ describe.sequential("Database PostgreSQL integration", () => {
           end_user_message_id: "turn",
           messages: [{ role: "user", text: "stale staged source" }],
         });
-        const enqueued = await database.enqueue(source);
+        const enqueued = await database.enqueue({
+          ...source,
+          source_id: SOURCE_ID,
+        });
         const claim = required(
           await withClient(database, (client) =>
             database.claimOldestJob(client),
@@ -1720,8 +3028,13 @@ describe.sequential("Database PostgreSQL integration", () => {
           [enqueued.segment_id],
         );
 
-        expect(await database.segmentSummaries(source.session_id)).toEqual([]);
-        const replayed = await database.enqueue(source);
+        expect(
+          await database.segmentSummaries(SOURCE_ID, source.session_id),
+        ).toEqual([]);
+        const replayed = await database.enqueue({
+          ...source,
+          source_id: SOURCE_ID,
+        });
         expect(replayed).toMatchObject({ id: enqueued.id, status: "pending" });
         const target = required(
           (
@@ -1750,7 +3063,7 @@ describe.sequential("Database PostgreSQL integration", () => {
     "supports v2 siblings, priority, staged summaries, retries, and stale fencing",
     async () => {
       const database = new Database(settings());
-      await database.open();
+      await openDatabase(database);
       try {
         await truncate(database);
         const lowPriority = request({
@@ -1774,8 +3087,14 @@ describe.sequential("Database PostgreSQL integration", () => {
           processing_priority: 100,
           messages: [{ role: "assistant", text: "foreground sibling" }],
         });
-        const foregroundJob = await database.enqueue(foreground);
-        const lowJob = await database.enqueue(lowPriority);
+        const foregroundJob = await database.enqueue({
+          ...foreground,
+          source_id: SOURCE_ID,
+        });
+        const lowJob = await database.enqueue({
+          ...lowPriority,
+          source_id: SOURCE_ID,
+        });
         expect(lowJob.segment_id).not.toBe(foregroundJob.segment_id);
         expect(lowJob.start_user_message_id).toBe("turn");
         expect(foregroundJob).toMatchObject({
@@ -1802,7 +3121,7 @@ describe.sequential("Database PostgreSQL integration", () => {
           ),
         ).toBe(true);
         let [summaries, boundaries, targets] =
-          await database.sessionSegmentListing("v2-session");
+          await database.sessionSegmentListing(SOURCE_ID, "v2-session");
         expect(summaries).toEqual([
           {
             id: foregroundJob.segment_id,
@@ -1817,7 +3136,9 @@ describe.sequential("Database PostgreSQL integration", () => {
         ]);
         expect(boundaries).toEqual([]);
         expect(targets).toHaveLength(2);
-        expect(await database.getSegment(foregroundJob.segment_id)).toBeNull();
+        expect(
+          await database.getSegment(SOURCE_ID, foregroundJob.segment_id),
+        ).toBeNull();
 
         expect(
           await database.finishFailedAttempt(
@@ -1827,12 +3148,13 @@ describe.sequential("Database PostgreSQL integration", () => {
           ),
         ).toBe(true);
         expect(
-          (await database.segmentSummaries("v2-session")).map(
+          (await database.segmentSummaries(SOURCE_ID, "v2-session")).map(
             (summary) => summary.summary,
           ),
         ).toEqual(["Foreground staged summary"]);
         expect(
-          required(await database.retryFailedJob(foregroundJob.id)).status,
+          required(await database.retryFailedJob(SOURCE_ID, foregroundJob.id))
+            .status,
         ).toBe("pending");
         const foregroundRetry = required(
           await withClient(database, (client) =>
@@ -1846,9 +3168,10 @@ describe.sequential("Database PostgreSQL integration", () => {
           emptyPrepared(foregroundRetry, foregroundExtraction.summary),
         );
 
-        const promoted = await database.enqueue(
-          updateRequest(lowPriority, { processing_priority: 100 }),
-        );
+        const promoted = await database.enqueue({
+          ...updateRequest(lowPriority, { processing_priority: 100 }),
+          source_id: SOURCE_ID,
+        });
         expect(promoted.id).toBe(lowJob.id);
         const lowClaim = required(
           await withClient(database, (client) =>
@@ -1892,11 +3215,11 @@ describe.sequential("Database PostgreSQL integration", () => {
           [lowJob.segment_id],
         );
         expect(
-          (await database.segmentSummaries("v2-session")).some(
+          (await database.segmentSummaries(SOURCE_ID, "v2-session")).some(
             (summary) => summary.id === lowJob.segment_id,
           ),
         ).toBe(false);
-        await database.retryFailedJob(lowJob.id);
+        await database.retryFailedJob(SOURCE_ID, lowJob.id);
         const lowRetry = required(
           await withClient(database, (client) =>
             database.claimOldestJob(client),
@@ -1916,7 +3239,7 @@ describe.sequential("Database PostgreSQL integration", () => {
           }),
         );
         const committed = required(
-          await database.getSegment(lowJob.segment_id),
+          await database.getSegment(SOURCE_ID, lowJob.segment_id),
         );
         expect(committed.claims).toHaveLength(2);
 
@@ -1924,16 +3247,20 @@ describe.sequential("Database PostgreSQL integration", () => {
           end_source_message_id: "source-b2",
           messages: [{ role: "user", text: "advanced sibling" }],
         });
-        const advancedJob = await database.enqueue(advanced);
+        const advancedJob = await database.enqueue({
+          ...advanced,
+          source_id: SOURCE_ID,
+        });
         expect(advancedJob.segment_id).toBe(lowJob.segment_id);
         expect(advancedJob.id).not.toBe(lowJob.id);
         expect(
-          (await database.segmentSummaries("v2-session")).some(
+          (await database.segmentSummaries(SOURCE_ID, "v2-session")).some(
             (summary) => summary.id === lowJob.segment_id,
           ),
         ).toBe(false);
         expect(
-          required(await database.getSegment(lowJob.segment_id)).claims,
+          required(await database.getSegment(SOURCE_ID, lowJob.segment_id))
+            .claims,
         ).toHaveLength(2);
         const advancedClaim = required(
           await withClient(database, (client) =>
@@ -1947,9 +3274,10 @@ describe.sequential("Database PostgreSQL integration", () => {
         expect(
           await database.publishExtraction(advancedClaim, advancedExtraction),
         ).toBe(true);
-        const advancedDuplicate = await database.enqueue(
-          updateRequest(advanced, { processing_priority: 100 }),
-        );
+        const advancedDuplicate = await database.enqueue({
+          ...updateRequest(advanced, { processing_priority: 100 }),
+          source_id: SOURCE_ID,
+        });
         expect(advancedDuplicate).toMatchObject({
           id: advancedJob.id,
           status: "running",
@@ -1977,19 +3305,20 @@ describe.sequential("Database PostgreSQL integration", () => {
         );
         expect(stagedIdentity.processing_priority).toBe(100);
         expect(stagedIdentity.extraction_result).toEqual(advancedExtraction);
-        summaries = await database.segmentSummaries("v2-session");
+        summaries = await database.segmentSummaries(SOURCE_ID, "v2-session");
         expect(
           summaries.find((summary) => summary.id === lowJob.segment_id)
             ?.summary,
         ).toBe("Advanced staged summary");
         expect(
-          required(await database.getSegment(lowJob.segment_id)).summary,
+          required(await database.getSegment(SOURCE_ID, lowJob.segment_id))
+            .summary,
         ).toBe("First sibling committed");
 
         const newest = updateRequest(advanced, {
           messages: [{ role: "user", text: "newest corrected source" }],
         });
-        await database.enqueue(newest);
+        await database.enqueue({ ...newest, source_id: SOURCE_ID });
         expect(
           await database.publishExtraction(advancedClaim, advancedExtraction),
         ).toBe(false);
@@ -2001,7 +3330,8 @@ describe.sequential("Database PostgreSQL integration", () => {
           ),
         ).rejects.toThrow("lease changed");
         expect(
-          required(await database.getSegment(lowJob.segment_id)).claims,
+          required(await database.getSegment(SOURCE_ID, lowJob.segment_id))
+            .claims,
         ).toHaveLength(2);
 
         const newestClaim = required(
@@ -2015,13 +3345,16 @@ describe.sequential("Database PostgreSQL integration", () => {
         });
         await database.publishExtraction(newestClaim, newestExtraction);
         expect(
-          required(await database.getSegment(lowJob.segment_id)).claims,
+          required(await database.getSegment(SOURCE_ID, lowJob.segment_id))
+            .claims,
         ).toHaveLength(2);
         await database.finishFailedAttempt(newestClaim, "terminal resolution", {
           retryAfterSeconds: null,
         });
-        [summaries, boundaries, targets] =
-          await database.sessionSegmentListing("v2-session");
+        [summaries, boundaries, targets] = await database.sessionSegmentListing(
+          SOURCE_ID,
+          "v2-session",
+        );
         expect(
           summaries.find((summary) => summary.id === lowJob.segment_id)
             ?.summary,
@@ -2044,7 +3377,7 @@ describe.sequential("Database PostgreSQL integration", () => {
     "records checksummed migrations once and matches JavaScript fingerprints",
     async () => {
       const database = new Database(settings());
-      await database.open();
+      await openDatabase(database);
       try {
         await truncate(database);
         const source = request({
@@ -2060,7 +3393,7 @@ describe.sequential("Database PostgreSQL integration", () => {
             { role: "assistant", text: "東京" },
           ],
         });
-        const job = await database.enqueue(source);
+        const job = await database.enqueue({ ...source, source_id: SOURCE_ID });
         const claim = required(
           await withClient(database, (client) =>
             database.claimOldestJob(client),
@@ -2132,6 +3465,7 @@ describe.sequential("Database PostgreSQL integration", () => {
           "006_canonical_source_spans.sql",
           "007_superseded_job_status.sql",
           "008_extraction_validation.sql",
+          "009_source_ownership_expansion.sql",
         ]);
         expect(
           ledger.every((row) => /^[0-9a-f]{64}$/u.test(row.checksum)),
@@ -2212,7 +3546,10 @@ describe.sequential("Database PostgreSQL integration", () => {
           end_user_message_id: "turn",
           messages: [{ role: "user", text: "The service uses ModelClient." }],
         });
-        const unstaged = await database.enqueue(unstagedSource);
+        const unstaged = await database.enqueue({
+          ...unstagedSource,
+          source_id: SOURCE_ID,
+        });
         const oldWriterExtraction = {
           summary: "The service uses ModelClinet.",
           claims: [],
@@ -2262,7 +3599,7 @@ describe.sequential("Database PostgreSQL integration", () => {
     "invalidates and requeues failed staged extraction in migration 008",
     async () => {
       const database = new Database(settings());
-      await database.open();
+      await openDatabase(database);
       try {
         await truncate(database);
         const source = request({
@@ -2271,7 +3608,7 @@ describe.sequential("Database PostgreSQL integration", () => {
           end_user_message_id: "turn",
           messages: [{ role: "user", text: "The service uses ModelClient." }],
         });
-        const job = await database.enqueue(source);
+        const job = await database.enqueue({ ...source, source_id: SOURCE_ID });
         const claim = required(
           await withClient(database, (client) =>
             database.claimOldestJob(client),
@@ -2366,7 +3703,7 @@ describe.sequential("Database PostgreSQL integration", () => {
     "serializes concurrent target mutations without wedging or deadlocking",
     async () => {
       const database = new Database(settings());
-      await database.open();
+      await openDatabase(database);
       try {
         await truncate(database);
         const firstRequest = request({
@@ -2376,7 +3713,7 @@ describe.sequential("Database PostgreSQL integration", () => {
           projection_version: 1,
           messages: [{ role: "user", text: "A" }],
         });
-        await database.enqueue(firstRequest);
+        await database.enqueue({ ...firstRequest, source_id: SOURCE_ID });
         const recoveryConnection = await database.pool.connect();
         let running: ClaimedJob;
         let changedRequest: SegmentCreate;
@@ -2388,7 +3725,7 @@ describe.sequential("Database PostgreSQL integration", () => {
           const [recovered, changed] = await within(
             Promise.all([
               database.recoverRunningJobs(recoveryConnection),
-              database.enqueue(changedRequest),
+              database.enqueue({ ...changedRequest, source_id: SOURCE_ID }),
             ]),
             5_000,
           );
@@ -2440,7 +3777,7 @@ describe.sequential("Database PostgreSQL integration", () => {
               changedClaim,
               emptyPrepared(changedClaim, "Changed A"),
             ),
-            database.enqueue(nextRequest),
+            database.enqueue({ ...nextRequest, source_id: SOURCE_ID }),
           ]),
           5_000,
         );
@@ -2463,7 +3800,7 @@ describe.sequential("Database PostgreSQL integration", () => {
               "terminal concurrent failure",
               { retryAfterSeconds: null },
             ),
-            database.enqueue(finalRequest),
+            database.enqueue({ ...finalRequest, source_id: SOURCE_ID }),
           ]),
           5_000,
         );
@@ -2549,7 +3886,8 @@ describe.sequential("Database PostgreSQL integration", () => {
       try {
         await connection.query(`
           DROP TABLE IF EXISTS reflection_schema_migrations, segment_targets,
-              claims, entity_aliases, entities, segments, extraction_jobs CASCADE;
+              claims, entity_aliases, entities, segments, extraction_jobs, reflection_sources CASCADE;
+          DROP FUNCTION IF EXISTS reflection_immutable_source();
           DROP FUNCTION IF EXISTS reflection_source_fingerprint(TEXT, TEXT, TEXT, JSONB);
         `);
         for (const migrationName of [
@@ -2704,7 +4042,7 @@ describe.sequential("Database PostgreSQL integration", () => {
       }
 
       const database = new Database(settings());
-      await database.open();
+      await openDatabase(database);
       try {
         await database.applyMigrations(MIGRATIONS_DIR);
         const identity = required(
@@ -2840,7 +4178,7 @@ describe.sequential("Database PostgreSQL integration", () => {
         expect(changedFailedClaim.request).toEqual(changedFailedLatestRequest);
         expect(changedFailedClaim.attempts).toBe(1);
         const unchangedAfterClaims = required(
-          await database.getJob(Number(unchangedFailedJobId)),
+          await database.getJob(SOURCE_ID, Number(unchangedFailedJobId)),
         );
         expect(unchangedAfterClaims.status).toBe("failed");
         expect(unchangedAfterClaims.attempts).toBe(4);
@@ -2860,7 +4198,8 @@ describe.sequential("Database PostgreSQL integration", () => {
       try {
         await connection.query(`
           DROP TABLE IF EXISTS reflection_schema_migrations, segment_targets,
-              claims, entity_aliases, entities, segments, extraction_jobs CASCADE;
+              claims, entity_aliases, entities, segments, extraction_jobs, reflection_sources CASCADE;
+          DROP FUNCTION IF EXISTS reflection_immutable_source();
           CREATE EXTENSION IF NOT EXISTS vector;
           CREATE EXTENSION IF NOT EXISTS pg_trgm;
           CREATE TABLE extraction_jobs (
@@ -2960,7 +4299,7 @@ describe.sequential("Database PostgreSQL integration", () => {
       }
 
       const database = new Database(settings());
-      await database.open();
+      await openDatabase(database);
       try {
         const migratedJob = required(
           (
@@ -3044,13 +4383,15 @@ describe.sequential("Database PostgreSQL integration", () => {
             database.claimOldestJob(client),
           ),
         ).toBeNull();
-        const invalidPayloadJob = required(await database.getJob(1));
+        const invalidPayloadJob = required(await database.getJob(SOURCE_ID, 1));
         expect(invalidPayloadJob.status).toBe("failed");
         expect(invalidPayloadJob.error).toBe(
           "invalid persisted payload: payload is null",
         );
-        const [, legacyBoundaries] =
-          await database.sessionSegmentListing("legacy");
+        const [, legacyBoundaries] = await database.sessionSegmentListing(
+          SOURCE_ID,
+          "legacy",
+        );
         expect(legacyBoundaries).toHaveLength(1);
         expect(required(legacyBoundaries[0]).source_fingerprint).toBeNull();
 
@@ -3415,11 +4756,14 @@ describe.sequential("Database PostgreSQL integration", () => {
         expect(v0Target.status).toBe("failed");
         expect(v0Target.end_user_message_id).toBe("v0-target-end");
 
-        const replayedV0Target = await database.enqueue(v0TargetRequest);
+        const replayedV0Target = await database.enqueue({
+          ...v0TargetRequest,
+          source_id: SOURCE_ID,
+        });
         expect(replayedV0Target.status).toBe("failed");
         expect(replayedV0Target.attempts).toBe(3);
         const retriedFailed = required(
-          await database.retryFailedJob(Number(failedTarget.job_id)),
+          await database.retryFailedJob(SOURCE_ID, Number(failedTarget.job_id)),
         );
         expect(retriedFailed.status).toBe("pending");
         expect(retriedFailed.attempts).toBe(0);
@@ -3434,7 +4778,7 @@ describe.sequential("Database PostgreSQL integration", () => {
     "preserves staged extraction on ordinary retry and clears staged fields on restart extraction",
     async () => {
       const database = new Database(settings());
-      await database.open();
+      await openDatabase(database);
       try {
         await truncate(database);
         const req = request({
@@ -3448,7 +4792,7 @@ describe.sequential("Database PostgreSQL integration", () => {
           processing_priority: 75,
           messages: [{ role: "user", text: "test source content" }],
         });
-        const job = await database.enqueue(req);
+        const job = await database.enqueue({ ...req, source_id: SOURCE_ID });
 
         const claim = required(
           await withClient(database, (client) =>
@@ -3509,12 +4853,14 @@ describe.sequential("Database PostgreSQL integration", () => {
             { retryAfterSeconds: null },
           ),
         ).toBe(true);
-        const failedJob = required(await database.getJob(job.id));
+        const failedJob = required(await database.getJob(SOURCE_ID, job.id));
         expect(failedJob.status).toBe("failed");
         expect(failedJob.attempts).toBe(1);
 
         // Ordinary retry preserves staged extraction
-        const retried = required(await database.retryFailedJob(job.id));
+        const retried = required(
+          await database.retryFailedJob(SOURCE_ID, job.id),
+        );
         expect(retried.status).toBe("pending");
         expect(retried.attempts).toBe(0);
         expect(retried.error).toBeNull();
@@ -3569,7 +4915,9 @@ describe.sequential("Database PostgreSQL integration", () => {
 
         // Restart extraction clears all four stage fields and resets job to pending
         const restarted = required(
-          await database.retryFailedJob(job.id, { restartExtraction: true }),
+          await database.retryFailedJob(SOURCE_ID, job.id, {
+            restartExtraction: true,
+          }),
         );
         expect(restarted.status).toBe("pending");
         expect(restarted.attempts).toBe(0);
@@ -3629,12 +4977,14 @@ describe.sequential("Database PostgreSQL integration", () => {
     "supersedes failed jobs, removes targets from manifest, preserves committed segments, and rejects unretryable jobs",
     async () => {
       const database = new Database(settings());
-      await database.open();
+      await openDatabase(database);
       try {
         await truncate(database);
 
         // Missing job returns null
-        expect(await database.supersedeFailedJob(999_999)).toBeNull();
+        expect(
+          await database.supersedeFailedJob(SOURCE_ID, 999_999),
+        ).toBeNull();
 
         // 1. Terminal failed job supersede
         const seg1Req = request({
@@ -3645,7 +4995,10 @@ describe.sequential("Database PostgreSQL integration", () => {
           projection_version: 1,
           messages: [{ role: "user", text: "obsolete segment content" }],
         });
-        const job1 = await database.enqueue(seg1Req);
+        const job1 = await database.enqueue({
+          ...seg1Req,
+          source_id: SOURCE_ID,
+        });
         const claim1 = required(
           await withClient(database, (client) =>
             database.claimOldestJob(client),
@@ -3657,14 +5010,16 @@ describe.sequential("Database PostgreSQL integration", () => {
           }),
         ).toBe(true);
 
-        const [, , targets1] =
-          await database.sessionSegmentListing("supersede-session");
+        const [, , targets1] = await database.sessionSegmentListing(
+          SOURCE_ID,
+          "supersede-session",
+        );
         expect(targets1).toHaveLength(1);
         expect(required(targets1[0]).id).toBe(job1.segment_id);
         expect(required(targets1[0]).status).toBe("failed");
 
         const superseded1 = required(
-          await database.supersedeFailedJob(job1.id),
+          await database.supersedeFailedJob(SOURCE_ID, job1.id),
         );
         expect(superseded1.id).toBe(job1.id);
         expect(superseded1.status).toBe("superseded");
@@ -3702,23 +5057,25 @@ describe.sequential("Database PostgreSQL integration", () => {
         ).rows;
         expect(targetRows1).toHaveLength(0);
 
-        const [, , targetsAfter] =
-          await database.sessionSegmentListing("supersede-session");
+        const [, , targetsAfter] = await database.sessionSegmentListing(
+          SOURCE_ID,
+          "supersede-session",
+        );
         expect(targetsAfter).toHaveLength(0);
 
         // Cannot supersede already superseded job
-        await expect(database.supersedeFailedJob(job1.id)).rejects.toThrow(
-          JobNotRetryableError,
-        );
+        await expect(
+          database.supersedeFailedJob(SOURCE_ID, job1.id),
+        ).rejects.toThrow(JobNotRetryableError);
 
         // Cannot retry already superseded job
-        await expect(database.retryFailedJob(job1.id)).rejects.toThrow(
-          JobNotRetryableError,
-        );
+        await expect(
+          database.retryFailedJob(SOURCE_ID, job1.id),
+        ).rejects.toThrow(JobNotRetryableError);
 
         // 2. Reject pending, running, succeeded jobs
-        const pendingJob = await database.enqueue(
-          request({
+        const pendingJob = await database.enqueue({
+          ...request({
             session_id: "supersede-session",
             start_user_message_id: "turn2",
             end_user_message_id: "turn2",
@@ -3726,9 +5083,10 @@ describe.sequential("Database PostgreSQL integration", () => {
             projection_version: 1,
             messages: [{ role: "user", text: "pending job content" }],
           }),
-        );
+          source_id: SOURCE_ID,
+        });
         await expect(
-          database.supersedeFailedJob(pendingJob.id),
+          database.supersedeFailedJob(SOURCE_ID, pendingJob.id),
         ).rejects.toThrow(/only terminal failed jobs can be retried/);
 
         const runningClaim = required(
@@ -3738,7 +5096,7 @@ describe.sequential("Database PostgreSQL integration", () => {
         );
         expect(runningClaim.id).toBe(pendingJob.id);
         await expect(
-          database.supersedeFailedJob(pendingJob.id),
+          database.supersedeFailedJob(SOURCE_ID, pendingJob.id),
         ).rejects.toThrow(/only terminal failed jobs can be retried/);
 
         const succExtraction = validatedExtractionResult({
@@ -3752,12 +5110,12 @@ describe.sequential("Database PostgreSQL integration", () => {
           emptyPrepared(runningClaim, succExtraction.summary),
         );
         await expect(
-          database.supersedeFailedJob(pendingJob.id),
+          database.supersedeFailedJob(SOURCE_ID, pendingJob.id),
         ).rejects.toThrow(/only terminal failed jobs can be retried/);
 
         // 3. Preserve committed segment when newer failed update is superseded
         const committedBefore = required(
-          await database.getSegment(pendingJob.segment_id),
+          await database.getSegment(SOURCE_ID, pendingJob.segment_id),
         );
         expect(committedBefore.summary).toBe("Succeeded summary");
 
@@ -3772,7 +5130,10 @@ describe.sequential("Database PostgreSQL integration", () => {
             { role: "assistant", text: "v2 reply" },
           ],
         });
-        const v2Job = await database.enqueue(updateV2);
+        const v2Job = await database.enqueue({
+          ...updateV2,
+          source_id: SOURCE_ID,
+        });
         expect(v2Job.segment_id).toBe(pendingJob.segment_id);
 
         const v2Claim = required(
@@ -3786,24 +5147,26 @@ describe.sequential("Database PostgreSQL integration", () => {
           }),
         ).toBe(true);
 
-        const [, , manifestTargets] =
-          await database.sessionSegmentListing("supersede-session");
+        const [, , manifestTargets] = await database.sessionSegmentListing(
+          SOURCE_ID,
+          "supersede-session",
+        );
         expect(manifestTargets).toHaveLength(1);
         expect(required(manifestTargets[0]).id).toBe(pendingJob.segment_id);
 
         const supersededV2 = required(
-          await database.supersedeFailedJob(v2Job.id),
+          await database.supersedeFailedJob(SOURCE_ID, v2Job.id),
         );
         expect(supersededV2.status).toBe("superseded");
 
         const committedAfter = required(
-          await database.getSegment(pendingJob.segment_id),
+          await database.getSegment(SOURCE_ID, pendingJob.segment_id),
         );
         expect(committedAfter.summary).toBe("Succeeded summary");
         expect(committedAfter.id).toBe(pendingJob.segment_id);
 
         const [cleanSummaries, , cleanTargets] =
-          await database.sessionSegmentListing("supersede-session");
+          await database.sessionSegmentListing(SOURCE_ID, "supersede-session");
         expect(cleanTargets).toHaveLength(0);
         expect(cleanSummaries).toHaveLength(1);
         expect(required(cleanSummaries[0]).summary).toBe("Succeeded summary");
@@ -3817,7 +5180,10 @@ describe.sequential("Database PostgreSQL integration", () => {
           projection_version: 1,
           messages: [{ role: "user", text: "stale v1" }],
         });
-        const staleJob = await database.enqueue(staleV1Req);
+        const staleJob = await database.enqueue({
+          ...staleV1Req,
+          source_id: SOURCE_ID,
+        });
         const staleClaim = required(
           await withClient(database, (client) =>
             database.claimOldestJob(client),
@@ -3835,12 +5201,15 @@ describe.sequential("Database PostgreSQL integration", () => {
           projection_version: 1,
           messages: [{ role: "user", text: "newer v2" }],
         });
-        const newerJob = await database.enqueue(newerV2Req);
+        const newerJob = await database.enqueue({
+          ...newerV2Req,
+          source_id: SOURCE_ID,
+        });
         expect(newerJob.segment_id).toBe(staleJob.segment_id);
 
-        await expect(database.supersedeFailedJob(staleJob.id)).rejects.toThrow(
-          /newer snapshot exists/,
-        );
+        await expect(
+          database.supersedeFailedJob(SOURCE_ID, staleJob.id),
+        ).rejects.toThrow(/newer snapshot exists/);
       } finally {
         await database.close();
       }
@@ -3852,12 +5221,12 @@ describe.sequential("Database PostgreSQL integration", () => {
     "excludes in-flight sessions during claiming and claims them once unblocked",
     async () => {
       const database = new Database(settings());
-      await database.open();
+      await openDatabase(database);
       try {
         await truncate(database);
 
-        const sessionA1 = await database.enqueue(
-          request({
+        const sessionA1 = await database.enqueue({
+          ...request({
             session_id: "session-A",
             start_user_message_id: "a1",
             end_user_message_id: "a1-end",
@@ -3865,9 +5234,10 @@ describe.sequential("Database PostgreSQL integration", () => {
             processing_priority: 50,
             messages: [{ role: "user", text: "session A job 1" }],
           }),
-        );
-        const sessionA2 = await database.enqueue(
-          request({
+          source_id: SOURCE_ID,
+        });
+        const sessionA2 = await database.enqueue({
+          ...request({
             session_id: "session-A",
             start_user_message_id: "a2",
             end_user_message_id: "a2-end",
@@ -3875,9 +5245,10 @@ describe.sequential("Database PostgreSQL integration", () => {
             processing_priority: 50,
             messages: [{ role: "user", text: "session A job 2" }],
           }),
-        );
-        const sessionB1 = await database.enqueue(
-          request({
+          source_id: SOURCE_ID,
+        });
+        const sessionB1 = await database.enqueue({
+          ...request({
             session_id: "session-B",
             start_user_message_id: "b1",
             end_user_message_id: "b1-end",
@@ -3885,31 +5256,56 @@ describe.sequential("Database PostgreSQL integration", () => {
             processing_priority: 10,
             messages: [{ role: "user", text: "session B job 1" }],
           }),
-        );
+          source_id: SOURCE_ID,
+        });
 
         const claimedB = required(
           await withClient(database, (client) =>
-            database.claimOldestJob(client, ["session-A"]),
+            database.claimOldestJob(
+              client,
+              ["session-A"].map((sessionId) => ({
+                sourceId: SOURCE_ID,
+                sessionId,
+              })),
+            ),
           ),
         );
         expect(claimedB.id).toBe(sessionB1.id);
         expect(claimedB.request.session_id).toBe("session-B");
 
         const claimedNone = await withClient(database, (client) =>
-          database.claimOldestJob(client, ["session-A", "session-B"]),
+          database.claimOldestJob(
+            client,
+            ["session-A", "session-B"].map((sessionId) => ({
+              sourceId: SOURCE_ID,
+              sessionId,
+            })),
+          ),
         );
         expect(claimedNone).toBeNull();
 
         const claimedA1 = required(
           await withClient(database, (client) =>
-            database.claimOldestJob(client, ["session-B"]),
+            database.claimOldestJob(
+              client,
+              ["session-B"].map((sessionId) => ({
+                sourceId: SOURCE_ID,
+                sessionId,
+              })),
+            ),
           ),
         );
         expect(claimedA1.id).toBe(sessionA1.id);
         expect(claimedA1.request.session_id).toBe("session-A");
 
         const claimedA2Blocked = await withClient(database, (client) =>
-          database.claimOldestJob(client, ["session-A"]),
+          database.claimOldestJob(
+            client,
+            ["session-A"].map((sessionId) => ({
+              sourceId: SOURCE_ID,
+              sessionId,
+            })),
+          ),
         );
         expect(claimedA2Blocked).toBeNull();
 
@@ -3921,7 +5317,10 @@ describe.sequential("Database PostgreSQL integration", () => {
 
         const claimedA2 = required(
           await withClient(database, (client) =>
-            database.claimOldestJob(client, []),
+            database.claimOldestJob(
+              client,
+              [].map((sessionId) => ({ sourceId: SOURCE_ID, sessionId })),
+            ),
           ),
         );
         expect(claimedA2.id).toBe(sessionA2.id);
@@ -3937,12 +5336,12 @@ describe.sequential("Database PostgreSQL integration", () => {
     "inherits urgency across session jobs while maintaining FIFO head selection and preserving explicit priority",
     async () => {
       const database = new Database(settings());
-      await database.open();
+      await openDatabase(database);
       try {
         await truncate(database);
 
-        const backgroundJob = await database.enqueue(
-          request({
+        const backgroundJob = await database.enqueue({
+          ...request({
             session_id: "session-bg",
             start_user_message_id: "bg-1",
             end_user_message_id: "bg-1-end",
@@ -3950,9 +5349,10 @@ describe.sequential("Database PostgreSQL integration", () => {
             processing_priority: 0,
             messages: [{ role: "user", text: "background job" }],
           }),
-        );
-        const urgentHead = await database.enqueue(
-          request({
+          source_id: SOURCE_ID,
+        });
+        const urgentHead = await database.enqueue({
+          ...request({
             session_id: "session-urgent",
             start_user_message_id: "urg-1",
             end_user_message_id: "urg-1-end",
@@ -3960,9 +5360,10 @@ describe.sequential("Database PostgreSQL integration", () => {
             processing_priority: 0,
             messages: [{ role: "user", text: "urgent session head" }],
           }),
-        );
-        const urgentTail = await database.enqueue(
-          request({
+          source_id: SOURCE_ID,
+        });
+        const urgentTail = await database.enqueue({
+          ...request({
             session_id: "session-urgent",
             start_user_message_id: "urg-2",
             end_user_message_id: "urg-2-end",
@@ -3970,7 +5371,8 @@ describe.sequential("Database PostgreSQL integration", () => {
             processing_priority: 100,
             messages: [{ role: "user", text: "urgent session tail" }],
           }),
-        );
+          source_id: SOURCE_ID,
+        });
 
         const claim1 = required(
           await withClient(database, (client) =>
@@ -4045,12 +5447,12 @@ describe.sequential("Database PostgreSQL integration", () => {
     "breaks ties deterministically across session heads with equal inherited urgency using FIFO ordering",
     async () => {
       const database = new Database(settings());
-      await database.open();
+      await openDatabase(database);
       try {
         await truncate(database);
 
-        const sessionC1 = await database.enqueue(
-          request({
+        const sessionC1 = await database.enqueue({
+          ...request({
             session_id: "session-C",
             start_user_message_id: "c1",
             end_user_message_id: "c1-end",
@@ -4058,9 +5460,10 @@ describe.sequential("Database PostgreSQL integration", () => {
             processing_priority: 100,
             messages: [{ role: "user", text: "session C head" }],
           }),
-        );
-        const sessionD1 = await database.enqueue(
-          request({
+          source_id: SOURCE_ID,
+        });
+        const sessionD1 = await database.enqueue({
+          ...request({
             session_id: "session-D",
             start_user_message_id: "d1",
             end_user_message_id: "d1-end",
@@ -4068,9 +5471,10 @@ describe.sequential("Database PostgreSQL integration", () => {
             processing_priority: 0,
             messages: [{ role: "user", text: "session D head" }],
           }),
-        );
-        const sessionD2 = await database.enqueue(
-          request({
+          source_id: SOURCE_ID,
+        });
+        const sessionD2 = await database.enqueue({
+          ...request({
             session_id: "session-D",
             start_user_message_id: "d2",
             end_user_message_id: "d2-end",
@@ -4078,9 +5482,10 @@ describe.sequential("Database PostgreSQL integration", () => {
             processing_priority: 100,
             messages: [{ role: "user", text: "session D tail" }],
           }),
-        );
-        const sessionE1 = await database.enqueue(
-          request({
+          source_id: SOURCE_ID,
+        });
+        const sessionE1 = await database.enqueue({
+          ...request({
             session_id: "session-E",
             start_user_message_id: "e1",
             end_user_message_id: "e1-end",
@@ -4088,7 +5493,8 @@ describe.sequential("Database PostgreSQL integration", () => {
             processing_priority: 100,
             messages: [{ role: "user", text: "session E head" }],
           }),
-        );
+          source_id: SOURCE_ID,
+        });
 
         const claim1 = required(
           await withClient(database, (client) =>
@@ -4143,12 +5549,12 @@ describe.sequential("Database PostgreSQL integration", () => {
     "does not transfer urgency from excluded sessions and selects head when unblocked",
     async () => {
       const database = new Database(settings());
-      await database.open();
+      await openDatabase(database);
       try {
         await truncate(database);
 
-        const urgentExcludedHead = await database.enqueue(
-          request({
+        const urgentExcludedHead = await database.enqueue({
+          ...request({
             session_id: "session-excluded",
             start_user_message_id: "ex-1",
             end_user_message_id: "ex-1-end",
@@ -4156,9 +5562,10 @@ describe.sequential("Database PostgreSQL integration", () => {
             processing_priority: 0,
             messages: [{ role: "user", text: "excluded urgent head" }],
           }),
-        );
-        const urgentExcludedTail = await database.enqueue(
-          request({
+          source_id: SOURCE_ID,
+        });
+        const urgentExcludedTail = await database.enqueue({
+          ...request({
             session_id: "session-excluded",
             start_user_message_id: "ex-2",
             end_user_message_id: "ex-2-end",
@@ -4166,9 +5573,10 @@ describe.sequential("Database PostgreSQL integration", () => {
             processing_priority: 100,
             messages: [{ role: "user", text: "excluded urgent tail" }],
           }),
-        );
-        const normalJob = await database.enqueue(
-          request({
+          source_id: SOURCE_ID,
+        });
+        const normalJob = await database.enqueue({
+          ...request({
             session_id: "session-normal",
             start_user_message_id: "norm-1",
             end_user_message_id: "norm-1-end",
@@ -4176,11 +5584,18 @@ describe.sequential("Database PostgreSQL integration", () => {
             processing_priority: 0,
             messages: [{ role: "user", text: "normal work" }],
           }),
-        );
+          source_id: SOURCE_ID,
+        });
 
         const claimNormal = required(
           await withClient(database, (client) =>
-            database.claimOldestJob(client, ["session-excluded"]),
+            database.claimOldestJob(
+              client,
+              ["session-excluded"].map((sessionId) => ({
+                sourceId: SOURCE_ID,
+                sessionId,
+              })),
+            ),
           ),
         );
         expect(claimNormal.id).toBe(normalJob.id);
@@ -4188,13 +5603,22 @@ describe.sequential("Database PostgreSQL integration", () => {
         expect(claimNormal.request.processing_priority).toBe(0);
 
         const claimBlocked = await withClient(database, (client) =>
-          database.claimOldestJob(client, ["session-excluded"]),
+          database.claimOldestJob(
+            client,
+            ["session-excluded"].map((sessionId) => ({
+              sourceId: SOURCE_ID,
+              sessionId,
+            })),
+          ),
         );
         expect(claimBlocked).toBeNull();
 
         const claimExcluded = required(
           await withClient(database, (client) =>
-            database.claimOldestJob(client, []),
+            database.claimOldestJob(
+              client,
+              [].map((sessionId) => ({ sourceId: SOURCE_ID, sessionId })),
+            ),
           ),
         );
         expect(claimExcluded.id).toBe(urgentExcludedHead.id);
@@ -4224,12 +5648,12 @@ describe.sequential("Database PostgreSQL integration", () => {
     "does not confer urgency from delayed future jobs until they become due",
     async () => {
       const database = new Database(settings());
-      await database.open();
+      await openDatabase(database);
       try {
         await truncate(database);
 
-        const backgroundJob = await database.enqueue(
-          request({
+        const backgroundJob = await database.enqueue({
+          ...request({
             session_id: "session-bg",
             start_user_message_id: "bg-1",
             end_user_message_id: "bg-1-end",
@@ -4237,9 +5661,10 @@ describe.sequential("Database PostgreSQL integration", () => {
             processing_priority: 0,
             messages: [{ role: "user", text: "background job" }],
           }),
-        );
-        const delayedHead = await database.enqueue(
-          request({
+          source_id: SOURCE_ID,
+        });
+        const delayedHead = await database.enqueue({
+          ...request({
             session_id: "session-delayed",
             start_user_message_id: "del-1",
             end_user_message_id: "del-1-end",
@@ -4247,9 +5672,10 @@ describe.sequential("Database PostgreSQL integration", () => {
             processing_priority: 0,
             messages: [{ role: "user", text: "delayed session head" }],
           }),
-        );
-        const delayedTail = await database.enqueue(
-          request({
+          source_id: SOURCE_ID,
+        });
+        const delayedTail = await database.enqueue({
+          ...request({
             session_id: "session-delayed",
             start_user_message_id: "del-2",
             end_user_message_id: "del-2-end",
@@ -4257,7 +5683,8 @@ describe.sequential("Database PostgreSQL integration", () => {
             processing_priority: 100,
             messages: [{ role: "user", text: "delayed session tail" }],
           }),
-        );
+          source_id: SOURCE_ID,
+        });
 
         await database.pool.query(
           "UPDATE extraction_jobs SET next_attempt_at = now() + INTERVAL '1 hour' WHERE id = $1",

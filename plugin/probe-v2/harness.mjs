@@ -924,6 +924,36 @@ async function main() {
     },
   );
 
+  const { readNativeV2History } = await import("./history-reader.mjs");
+  for (const [label, sessionID] of [
+    ["ordinary", ordinary],
+    ["tool", toolSession],
+    ["async", asynchronous],
+    ["compacted", bulk],
+  ]) {
+    const actual = await readNativeV2History(
+      { id: "fixture-v2", kind: "opencode-v2", identity_scheme: "source-v1" },
+      sessionID,
+      {
+        sources: {
+          "fixture-v2": {
+            kind: "opencode-v2",
+            url: serverURL,
+            username: "opencode",
+            password,
+          },
+        },
+      },
+      AbortSignal.timeout(10_000),
+    );
+    const expected = (await history(sessionID)).messages;
+    check(
+      `production v2 reader preserves actual ${label} wire records`,
+      JSON.stringify(actual) === JSON.stringify(expected),
+      { count: actual.length },
+    );
+  }
+
   const failed = assertions.filter((assertion) => !assertion.ok);
   if (failed.length > 0) {
     throw new Error(

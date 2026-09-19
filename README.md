@@ -261,3 +261,18 @@ cmp /tmp/reflection-dry-run-1.json /tmp/reflection-dry-run-2.json
 Once any v2 row exists, old Python, plugin, and backfill binaries cannot safely write to that database. If the Node deployment fails after migration, keep all writers stopped and either fix forward with v2-capable code or restore the pre-migration backup as a coordinated full rollback before starting `aa83637`. Starting only the old binary against the migrated database is not a rollback.
 
 The Node production canary has passed. Removing the Python rollback files remains a separate explicit decision; until then, their presence is intentional.
+
+### CP005/006 source ownership preparation
+
+**No production rollout until CP007.** The historical stop-first checklist above is not authorization to deploy this source-aware revision. Plain `pnpm start` is not sufficient on an unprepared database: startup rejects missing source-aware indexes or retained global boundary indexes.
+
+For an explicitly approved environment, run the operator commands from an installed Node 24 checkout with `DATABASE_URL` exported securely (and the same `MIGRATION_LOCK_ID` as the server, if overridden):
+
+1. Run `node scripts/source-ownership.mjs expand`. This uses the server's checksummed transactional migration runner without starting an API or worker. On a database already at migration008, expansion009 preserves old-writer compatibility; earlier pending migrations retain their own stop-first requirements.
+2. Register each source explicitly: `node scripts/source-ownership.mjs register --id LEGACY_ID --kind opencode-v1 --identity-scheme legacy`, and similarly register new sources using `--kind opencode-v2 --identity-scheme source-v1`. Expansion never inserts sources automatically.
+3. Run `node scripts/source-ownership.mjs install-indexes` to build and verify source-aware indexes concurrently.
+4. Stop all old writers, then run `node scripts/source-ownership.mjs cutover --old-writers-stopped`. This removes only the superseded global boundary indexes, not UUID primary keys or claims foreign keys.
+5. Start the source-aware backend and compatible clients only after the preceding preparation and the CP007 rollout gate.
+6. Run `node scripts/source-ownership.mjs backfill --legacy-source LEGACY_ID --batch-size 100`, then `node scripts/source-ownership.mjs enforce --old-writers-stopped` after confirming old writers remain stopped and ownership is complete.
+
+All operator actions serialize on the migration advisory lock with a five-second lock wait. Concurrent index builds have a 30-minute statement timeout; timed-out operations are retryable after inspecting contention. `MIGRATIONS_DIR` optionally overrides the expansion migration directory. Expansion, index installation, cutover, and enforcement are separate phases; do not use a failing application startup as the expansion mechanism.

@@ -91,6 +91,7 @@ function job(
   };
   return {
     id: options.id ?? 1,
+    sourceId: "test-source",
     segmentId: randomUUID(),
     leaseId: randomUUID(),
     sourceGeneration: 1n,
@@ -446,9 +447,12 @@ describe("ExtractionWorker", () => {
     expect(connection.release).toHaveBeenCalledOnce();
   });
 
-  test("dispatches up to configured concurrency across distinct sessions concurrently", async () => {
+  test("dispatches up to configured concurrency across distinct source/session pairs", async () => {
     const job1 = job(1, null, { id: 1, sessionId: "s1" });
-    const job2 = job(1, null, { id: 2, sessionId: "s2" });
+    const job2 = {
+      ...job(1, null, { id: 2, sessionId: "s1" }),
+      sourceId: "second-source",
+    };
     const job3 = job(1, null, { id: 3, sessionId: "s3" });
     const job4 = job(1, null, { id: 4, sessionId: "s4" });
 
@@ -472,9 +476,17 @@ describe("ExtractionWorker", () => {
     };
 
     const claimOldestJob = vi.fn(
-      async (_conn: unknown, excluded: readonly string[] = []) => {
+      async (
+        _conn: unknown,
+        excluded: readonly { sourceId: string; sessionId: string }[] = [],
+      ) => {
         const idx = queue.findIndex(
-          (j) => !excluded.includes(j.request.session_id),
+          (j) =>
+            !excluded.some(
+              (s) =>
+                s.sourceId === j.sourceId &&
+                s.sessionId === j.request.session_id,
+            ),
         );
         if (idx === -1) return null;
         return queue.splice(idx, 1)[0] ?? null;
@@ -544,9 +556,17 @@ describe("ExtractionWorker", () => {
     };
 
     const claimOldestJob = vi.fn(
-      async (_conn: unknown, excluded: readonly string[] = []) => {
+      async (
+        _conn: unknown,
+        excluded: readonly { sourceId: string; sessionId: string }[] = [],
+      ) => {
         const idx = queue.findIndex(
-          (j) => !excluded.includes(j.request.session_id),
+          (j) =>
+            !excluded.some(
+              (s) =>
+                s.sourceId === j.sourceId &&
+                s.sessionId === j.request.session_id,
+            ),
         );
         if (idx === -1) return null;
         return queue.splice(idx, 1)[0] ?? null;
@@ -629,9 +649,17 @@ describe("ExtractionWorker", () => {
     };
 
     const claimOldestJob = vi.fn(
-      async (_conn: unknown, excluded: readonly string[] = []) => {
+      async (
+        _conn: unknown,
+        excluded: readonly { sourceId: string; sessionId: string }[] = [],
+      ) => {
         const idx = queue.findIndex(
-          (j) => !excluded.includes(j.request.session_id),
+          (j) =>
+            !excluded.some(
+              (s) =>
+                s.sourceId === j.sourceId &&
+                s.sessionId === j.request.session_id,
+            ),
         );
         if (idx === -1) return null;
         return queue.splice(idx, 1)[0] ?? null;
@@ -729,9 +757,17 @@ describe("ExtractionWorker", () => {
     };
 
     const claimOldestJob = vi.fn(
-      async (_conn: unknown, excluded: readonly string[] = []) => {
+      async (
+        _conn: unknown,
+        excluded: readonly { sourceId: string; sessionId: string }[] = [],
+      ) => {
         const idx = queue.findIndex(
-          (j) => !excluded.includes(j.request.session_id),
+          (j) =>
+            !excluded.some(
+              (s) =>
+                s.sourceId === j.sourceId &&
+                s.sessionId === j.request.session_id,
+            ),
         );
         if (idx === -1) return null;
         return queue.splice(idx, 1)[0] ?? null;
@@ -807,9 +843,17 @@ describe("ExtractionWorker", () => {
     };
 
     const claimOldestJob = vi.fn(
-      async (_conn: unknown, excluded: readonly string[] = []) => {
+      async (
+        _conn: unknown,
+        excluded: readonly { sourceId: string; sessionId: string }[] = [],
+      ) => {
         const idx = queue.findIndex(
-          (j) => !excluded.includes(j.request.session_id),
+          (j) =>
+            !excluded.some(
+              (s) =>
+                s.sourceId === j.sourceId &&
+                s.sessionId === j.request.session_id,
+            ),
         );
         if (idx === -1) return null;
         return queue.splice(idx, 1)[0] ?? null;
@@ -889,9 +933,17 @@ describe("ExtractionWorker", () => {
     };
 
     const claimOldestJob = vi.fn(
-      async (_conn: unknown, excluded: readonly string[] = []) => {
+      async (
+        _conn: unknown,
+        excluded: readonly { sourceId: string; sessionId: string }[] = [],
+      ) => {
         const idx = queue.findIndex(
-          (j) => !excluded.includes(j.request.session_id),
+          (j) =>
+            !excluded.some(
+              (s) =>
+                s.sourceId === j.sourceId &&
+                s.sessionId === j.request.session_id,
+            ),
         );
         if (idx === -1) return null;
         return queue.splice(idx, 1)[0] ?? null;

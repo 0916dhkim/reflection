@@ -29,6 +29,7 @@ function recallCandidate(options: {
     objectEntityId,
     objectValue: objectEntityId === null ? "a literal" : null,
     equivalenceKey: options.key,
+    sourceId: "test-source",
     segmentId: randomUUID(),
     similarity: options.similarity,
     seedSimilarity: options.direct ? null : 0.7,
@@ -77,15 +78,33 @@ describe("SearchService", () => {
     const support = new Map<string, ClaimSupport>([
       [
         "direct",
-        { segmentIds: [direct.segmentId], supportCount: 3, sessionCount: 2 },
+        {
+          segments: [
+            { source_id: direct.sourceId, segment_id: direct.segmentId },
+          ],
+          supportCount: 3,
+          sessionCount: 2,
+        },
       ],
       [
         "weaker",
-        { segmentIds: [weaker.segmentId], supportCount: 1, sessionCount: 1 },
+        {
+          segments: [
+            { source_id: weaker.sourceId, segment_id: weaker.segmentId },
+          ],
+          supportCount: 1,
+          sessionCount: 1,
+        },
       ],
       [
         "graph",
-        { segmentIds: [graph.segmentId], supportCount: 1, sessionCount: 1 },
+        {
+          segments: [
+            { source_id: graph.sourceId, segment_id: graph.segmentId },
+          ],
+          supportCount: 1,
+          sessionCount: 1,
+        },
       ],
     ]);
     const database = asDatabase({

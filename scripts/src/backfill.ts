@@ -29,6 +29,13 @@ import {
   sourceFingerprint,
 } from "@reflection/shared/domain";
 import {
+  parseSourceInfo,
+  parseSourceJobResponse,
+  parseSourceSessionSegmentsResponse,
+  sourceSegmentIdForRequest,
+  type SourceInfo,
+} from "@reflection/shared/sources";
+import {
   isSafeSegmentSnapshot,
   segmentMessages,
   type CommittedSegmentBoundary,
@@ -628,8 +635,16 @@ export function segmentSubmission(
 export function validateSegmentManifest(
   value: unknown,
   sessionId: string,
+  source?: SourceInfo,
 ): SegmentManifest {
-  const manifest = parseSessionSegmentsResponse(value);
+  const manifest = (() => {
+    if (!source) {
+      return parseSessionSegmentsResponse(value);
+    }
+    const { source_id: _sourceId, ...owned } =
+      parseSourceSessionSegmentsResponse(value, source.id);
+    return owned;
+  })();
   if (manifest.session_id !== sessionId) {
     throw new Error(
       `invalid segment manifest for ${sessionId}: response session_id was ${manifest.session_id}`,
@@ -641,7 +656,19 @@ export function validateSegmentManifest(
     ...manifest.targets,
   ]) {
     const boundary = canonicalBoundary(anchor);
-    const expectedId = segmentIdForBoundary(sessionId, boundary);
+    // Identity depends only on the explicit start boundary, never on messages.
+    const expectedId = source
+      ? sourceSegmentIdForRequest(
+          {
+            source_id: source.id,
+            session_id: sessionId,
+            source_boundary_version: anchor.source_boundary_version,
+            start_user_message_id: anchor.start_user_message_id,
+            start_source_message_id: anchor.start_source_message_id,
+          },
+          source,
+        )
+      : segmentIdForBoundary(sessionId, boundary);
     if (anchor.id !== expectedId) {
       throw new Error(
         `invalid segment manifest for ${sessionId}: segment ${anchor.id} has non-deterministic identity`,
@@ -656,6 +683,7 @@ export function planSessionSegments(
   messages: readonly OpenCodeMessage[],
   manifest: SegmentManifest,
   maxSegmentChars = MAX_SEGMENT_CHARS,
+  source?: SourceInfo,
 ): PlannedSegment[] {
   const anchors = [...manifest.boundaries, ...manifest.targets].map(
     committedBoundary,
@@ -672,7 +700,12 @@ export function planSessionSegments(
 
   const planned = segments.map((segment): PlannedSegment => {
     const submission = segmentSubmission(sessionId, segment);
-    const segmentId = segmentIdForRequest(submission);
+    const segmentId = source
+      ? sourceSegmentIdForRequest(
+          { ...submission, source_id: source.id },
+          source,
+        )
+      : segmentIdForRequest(submission);
     const localFingerprint = sourceFingerprint(submission);
     const key = sourceSpanKey({
       id: segmentId,
@@ -773,8 +806,18 @@ export function planSessionSegments(
   return planned;
 }
 
-export function validatedJob(value: unknown): ReflectionJob {
-  return parseJobResponse(value);
+export function validatedJob(
+  value: unknown,
+  expectedSourceId?: string,
+): ReflectionJob {
+  if (expectedSourceId === undefined) {
+    return parseJobResponse(value);
+  }
+  const { source_id: _sourceId, ...job } = parseSourceJobResponse(
+    value,
+    expectedSourceId,
+  );
+  return job;
 }
 
 export function isProviderBalanceFailure(job: ReflectionJob): boolean {
@@ -835,7 +878,11 @@ export async function fetchJson(
       const signal = init.signal
         ? AbortSignal.any([init.signal, controller.signal])
         : controller.signal;
-      const response = await fetchImpl(url, { ...init, signal });
+      const response = await fetchImpl(url, {
+        ...init,
+        signal,
+        redirect: "error",
+      });
       const text = await response.text();
       let body: unknown = text;
       if (text) {
@@ -943,6 +990,7 @@ export interface ReflectionService {
     job: ReflectionJob,
     revalidate?: Revalidate,
   ): Promise<ReflectionJob>;
+  getSource(): Promise<SourceInfo>;
 }
 
 export interface ReflectionServiceOptions {
@@ -959,6 +1007,13 @@ export interface ReflectionServiceOptions {
 export function createReflectionService(
   options: ReflectionServiceOptions,
 ): ReflectionService {
+  if (
+    typeof options.sourceId !== "string" ||
+    !options.sourceId.trim() ||
+    options.sourceId.length > 500
+  ) {
+    throw new Error("Reflection service requires an explicit sourceId");
+  }
   const wait = options.sleep ?? sleep;
   const logger = options.log ?? (() => undefined);
   const fetchDependencies: FetchJsonDependencies = {
@@ -1022,11 +1077,30 @@ export function createReflectionService(
     throw lastFailure;
   };
 
+  const getSource = async (): Promise<SourceInfo> => {
+    const value = await request(
+      `/v1/sources/${encodeURIComponent(options.sourceId)}`,
+    );
+    const source = parseSourceInfo(value);
+    if (source.id !== options.sourceId) {
+      throw new Error("source registry returned a mismatched source");
+    }
+    return source;
+  };
+
   const getJob = async (
     jobId: number,
     revalidate?: Revalidate,
   ): Promise<ReflectionJob> =>
-    validatedJob(await request(`/v1/jobs/${jobId}`, {}, 5, revalidate));
+    validatedJob(
+      await request(
+        `/v1/jobs/${jobId}?source_id=${encodeURIComponent(options.sourceId)}`,
+        {},
+        5,
+        revalidate,
+      ),
+      options.sourceId,
+    );
 
   const retryJob = async (
     jobId: number,
@@ -1049,7 +1123,7 @@ export function createReflectionService(
         fetchDependencies,
       );
       await runRevalidation(revalidate);
-      if (response.ok) return validatedJob(body);
+      if (response.ok) return validatedJob(body, options.sourceId);
       if (response.status === 404) throw new SupersededJobError(jobId);
       if (response.status !== 409) {
         throw new ReflectionHttpError(
@@ -1103,7 +1177,7 @@ export function createReflectionService(
     return current;
   };
 
-  return { request, getJob, retryJob, waitForJob };
+  return { request, getSource, getJob, retryJob, waitForJob };
 }
 
 export interface CompleteJobContext {
@@ -1138,8 +1212,11 @@ export function jobSourceDetails(job: ReflectionJob): Record<string, unknown> {
 export function validateJobForSubmission(
   job: ReflectionJob,
   submission: SegmentCreate,
+  source?: SourceInfo,
 ): ReflectionJob {
-  const expectedSegmentId = segmentIdForRequest(submission);
+  const expectedSegmentId = source
+    ? sourceSegmentIdForRequest({ ...submission, source_id: source.id }, source)
+    : segmentIdForRequest(submission);
   const expectedFingerprint = sourceFingerprint(submission);
   if (
     job.segment_id !== expectedSegmentId ||
@@ -1392,10 +1469,12 @@ export async function segmentPlan(
   sessionId: string,
   messages: readonly OpenCodeMessage[],
   service: Pick<ReflectionService, "request">,
+  source: SourceInfo,
   revalidate?: Revalidate,
 ): Promise<PlannedSegment[]> {
+  source = parseSourceInfo(source);
   const response = await service.request(
-    `/v1/sessions/${encodeURIComponent(sessionId)}/segments`,
+    `/v1/sessions/${encodeURIComponent(sessionId)}/segments?source_id=${encodeURIComponent(source.id)}`,
     {},
     5,
     revalidate,
@@ -1404,7 +1483,9 @@ export async function segmentPlan(
     return planSessionSegments(
       sessionId,
       messages,
-      validateSegmentManifest(response, sessionId),
+      validateSegmentManifest(response, sessionId, source),
+      MAX_SEGMENT_CHARS,
+      source,
     );
   } catch (error) {
     throw new SessionPlanningError(sessionId, error);
@@ -1434,9 +1515,11 @@ export async function createDryRunSummary(
   sessions: readonly SessionRow[],
   store: SessionStore,
   service: Pick<ReflectionService, "request">,
+  source: SourceInfo,
   clock: Pick<Clock, "nowMs"> = SYSTEM_CLOCK,
   maxMutableSourceDeferralMs = DEFAULT_MAX_MUTABLE_SOURCE_DEFERRAL_MS,
 ): Promise<DryRunSummary> {
+  source = parseSourceInfo(source);
   let segmentCount = 0;
   let messageCount = 0;
   let deferredSessions = 0;
@@ -1473,7 +1556,12 @@ export async function createDryRunSummary(
     }
     let segments: PlannedSegment[];
     try {
-      segments = await segmentPlan(session.id, snapshot.messages, service);
+      segments = await segmentPlan(
+        session.id,
+        snapshot.messages,
+        service,
+        source,
+      );
     } catch (error) {
       if (
         snapshot.observedUpdatedAt !== undefined &&
@@ -1552,14 +1640,14 @@ export interface ProcessingContext {
   state: BackfillState;
   sessions: readonly SessionRow[];
   store: SessionStore;
-  service: ReflectionService;
+  service: Omit<ReflectionService, "getSource">;
   saveState(): void;
   log: Log;
   sleep: Sleep;
   clock: Clock;
   providerPollMs: number;
   jobPollMs: number;
-  sourceId: string;
+  source: SourceInfo;
   priorityJobIds: readonly number[];
   completedSnapshots: Set<string>;
   attemptedSnapshots: Set<string>;
@@ -1599,7 +1687,8 @@ function completeJobWithContext(
     providerPollMs: context.providerPollMs,
     jobPollMs: context.jobPollMs,
     validateJob: segment
-      ? (current) => validateJobForSubmission(current, segment.submission)
+      ? (current) =>
+          validateJobForSubmission(current, segment.submission, context.source)
       : undefined,
     revalidateSession,
     revalidateExpectedSnapshot: segment
@@ -1713,7 +1802,7 @@ async function revalidateExpectedSnapshot(
 ): Promise<void> {
   await runRevalidation(revalidateSession);
   const response = await context.service.request(
-    `/v1/sessions/${encodeURIComponent(segment.submission.session_id)}/segments`,
+    `/v1/sessions/${encodeURIComponent(segment.submission.session_id)}/segments?source_id=${encodeURIComponent(context.source.id)}`,
     {},
     5,
     revalidateSession,
@@ -1721,6 +1810,7 @@ async function revalidateExpectedSnapshot(
   const manifest = validateSegmentManifest(
     response,
     segment.submission.session_id,
+    context.source,
   );
   await runRevalidation(revalidateSession);
   if (
@@ -1774,6 +1864,7 @@ export async function processSession(
       session.id,
       messages,
       context.service,
+      context.source,
       revalidateSession,
     );
     revalidateSession();
@@ -1837,7 +1928,7 @@ export async function processSession(
       const submission: ServiceRequestInit = {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: serializeSegmentTransport(segment.submission, context.sourceId),
+        body: serializeSegmentTransport(segment.submission, context.source.id),
       };
       let job = validateJobForSubmission(
         validatedJob(
@@ -1847,8 +1938,10 @@ export async function processSession(
             5,
             revalidateSession,
           ),
+          context.source.id,
         ),
         segment.submission,
+        context.source,
       );
       let wasAlreadySucceeded = job.status === "succeeded";
       let completed = await completeJobWithContext(
@@ -1887,8 +1980,10 @@ export async function processSession(
               5,
               revalidateSession,
             ),
+            context.source.id,
           ),
           segment.submission,
+          context.source,
         );
         wasAlreadySucceeded = wasAlreadySucceeded && job.status === "succeeded";
         completed = await completeJobWithContext(
@@ -2108,12 +2203,20 @@ export async function main(
     requestTimeoutMs: options.requestTimeoutMs,
     log: logger,
   });
+  const source = await service.getSource();
+  if (
+    source.id !== reflectionConfig.sourceId ||
+    source.kind !== "opencode-v1"
+  ) {
+    throw new Error("backfill requires its registered opencode-v1 source");
+  }
 
   if (options.dryRun) {
     const summary = await createDryRunSummary(
       sessions,
       store,
       service,
+      source,
       clock,
       options.maxMutableSourceDeferralMs,
     );
@@ -2135,7 +2238,7 @@ export async function main(
     clock,
     providerPollMs: options.providerPollMs,
     jobPollMs: options.jobPollMs,
-    sourceId: reflectionConfig.sourceId,
+    source,
     priorityJobIds: options.priorityJobIds,
     completedSnapshots: new Set(),
     attemptedSnapshots: new Set(),

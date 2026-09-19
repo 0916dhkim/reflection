@@ -710,13 +710,19 @@ function segmentIdentity(
   });
 }
 
+export type SegmentIdentity = (
+  sessionId: string,
+  segment: ReflectionSegment,
+) => string;
+
 function summaryMatchesSegment(
   summary: StoredSegmentSummary,
   segment: ReflectionSegment,
   sessionId: string,
+  identity: SegmentIdentity = segmentIdentity,
 ): boolean {
   return (
-    summary.id === segmentIdentity(sessionId, segment) &&
+    summary.id === identity(sessionId, segment) &&
     summary.start_user_message_id === segment.startUserMessageId &&
     summary.end_user_message_id === segment.endUserMessageId &&
     summary.source_boundary_version === segment.sourceBoundaryVersion &&
@@ -729,10 +735,11 @@ function summaryCoverage(input: {
   sessionId: string;
   archivedSegments: readonly ReflectionSegment[];
   summaries: readonly StoredSegmentSummary[];
+  identity?: SegmentIdentity;
 }): { segments: StoredSegmentSummary[]; complete: boolean } {
   const selected = input.archivedSegments.flatMap((segment) => {
     const summary = input.summaries.find((item) =>
-      summaryMatchesSegment(item, segment, input.sessionId),
+      summaryMatchesSegment(item, segment, input.sessionId, input.identity),
     );
     return summary ? [summary] : [];
   });
@@ -745,10 +752,11 @@ function summaryCoverage(input: {
 export function projectionSourcesFingerprint(input: {
   sessionId: string;
   archivedSegments: readonly ReflectionSegment[];
+  identity?: SegmentIdentity;
 }): string {
   const source = {
     segments: input.archivedSegments.map((segment) => ({
-      id: segmentIdentity(input.sessionId, segment),
+      id: (input.identity ?? segmentIdentity)(input.sessionId, segment),
       sourceFingerprint: submissionSourceFingerprint(input.sessionId, segment),
       sourceMessageIds: segment.sourceMessageIds,
       closed: segment.closed,
@@ -760,9 +768,10 @@ export function projectionSourcesFingerprint(input: {
 export function toProjectionArchivedSegment(
   sessionId: string,
   segment: ReflectionSegment,
+  identity: SegmentIdentity = segmentIdentity,
 ): ProjectionArchivedSegment {
   const common = {
-    id: segmentIdentity(sessionId, segment),
+    id: identity(sessionId, segment),
     startUserMessageId: segment.startUserMessageId,
     endUserMessageId: segment.endUserMessageId,
     sourceFingerprint: submissionSourceFingerprint(sessionId, segment),
@@ -889,6 +898,7 @@ export interface ProjectMessagesInput {
   previous?: ProjectionSessionState;
   validateCheckpoint?: (checkpoint: ProjectionCheckpoint) => Promise<boolean>;
   skipPrefixFingerprint?: boolean;
+  segmentIdentity?: SegmentIdentity;
   loadCanonicalSegments: () => Promise<readonly ReflectionSegment[]>;
   loadSummaries: (
     requiredSegments: readonly ReflectionSegment[],
@@ -901,6 +911,7 @@ export async function projectMessages(
   if (!Number.isFinite(input.contextLimit) || input.contextLimit <= 0) {
     throw new Error("Model context limit must be positive");
   }
+  const identity = input.segmentIdentity ?? segmentIdentity;
 
   let checkpoint = input.previous?.checkpoint;
   if (
@@ -1012,7 +1023,7 @@ export async function projectMessages(
     const tailStart = input.messages[tailIndex];
     if (!tailStart) continue;
     const requiredIds = candidate.archivedSegments.map((segment) =>
-      segmentIdentity(sessionId, segment),
+      identity(sessionId, segment),
     );
     if (
       !summaryServiceFailed &&
@@ -1030,6 +1041,7 @@ export async function projectMessages(
       sessionId,
       archivedSegments: candidate.archivedSegments,
       summaries,
+      identity,
     });
     const omissions = [
       summaryServiceFailed ? "summary-service-unavailable" : "",
@@ -1049,7 +1061,7 @@ export async function projectMessages(
       initialOmissions: omissions,
     });
     const archivedSegmentsMeta = candidate.archivedSegments.map((segment) =>
-      toProjectionArchivedSegment(sessionId, segment),
+      toProjectionArchivedSegment(sessionId, segment, identity),
     );
     const summaryFp = projectionSummaryFingerprint(
       archivedSegmentsMeta,
@@ -1063,6 +1075,7 @@ export async function projectMessages(
       canonicalSourceFingerprint: projectionSourcesFingerprint({
         sessionId,
         archivedSegments: candidate.archivedSegments,
+        identity,
       }),
       archivedSegments: archivedSegmentsMeta,
       summaryFingerprint: summaryFp,

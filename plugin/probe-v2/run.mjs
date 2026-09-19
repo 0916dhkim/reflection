@@ -17,6 +17,26 @@ function docker(args, timeout) {
 }
 
 try {
+  const build = spawnSync(
+    "pnpm",
+    [
+      "exec",
+      "esbuild",
+      fileURLToPath(new URL("../src/history-reader.ts", import.meta.url)),
+      "--bundle",
+      "--platform=node",
+      "--format=esm",
+      "--target=node24",
+      `--outfile=${context}.generated/history-reader.mjs`,
+    ],
+    {
+      cwd: fileURLToPath(new URL("../../", import.meta.url)),
+      stdio: "inherit",
+      timeout: 30_000,
+    },
+  );
+  if (build.error || build.status !== 0)
+    throw new Error("History reader probe build failed");
   docker(
     ["build", "--platform", "linux/arm64", "--tag", image, context],
     300_000,

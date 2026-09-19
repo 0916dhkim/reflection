@@ -2,6 +2,19 @@
   "url": "https://reflection.example.com",
   "apiKey": "replace-with-your-api-key",
   "sourceId": "opencode-local",
+  "sources": {
+    "opencode-local": {
+      "kind": "opencode-v1",
+      "url": "http://127.0.0.1:4096",
+      "directory": "/path/to/workspace"
+    },
+    "remote-opencode": {
+      "kind": "opencode-v2",
+      "url": "http://remote-host:4096",
+      "username": "optional-reader-username",
+      "password": "optional-reader-password"
+    }
+  },
   "contextProjection": {
     "enabled": false
   }

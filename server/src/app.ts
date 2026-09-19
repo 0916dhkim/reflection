@@ -5,20 +5,23 @@ import swaggerUi from "@fastify/swagger-ui";
 import {
   ContractValidationError,
   codePointLength,
-  JobResponseSchema,
   MAX_SEGMENT_TEXT_CHARS,
   QueueStatusResponseSchema,
   SearchRequestSchema,
   SearchResponseSchema,
-  SegmentCreateTransportSchema,
-  SegmentResponseSchema,
-  SessionSegmentsResponseSchema,
   parseSearchRequest,
-  parseSegmentTransport,
-  parseSessionSegmentsResponse,
   type SearchRequest,
-  type SegmentCreate,
 } from "@reflection/shared/contracts";
+import {
+  SourceInfoSchema,
+  SourceJobResponseSchema,
+  SourceSegmentCreateSchema,
+  SourceSegmentResponseSchema,
+  SourceSessionSegmentsResponseSchema,
+  parseSourceSegmentCreate,
+  parseSourceSessionSegmentsResponse,
+  type SourceSegmentCreate,
+} from "@reflection/shared/sources";
 import fastify, {
   type FastifyError,
   type FastifyInstance,
@@ -40,6 +43,7 @@ import { Database, JobNotRetryableError } from "./database.js";
 import { ExtractionEngine } from "./extraction.js";
 import { SearchService } from "./search.js";
 import { ExtractionWorker } from "./worker.js";
+import { UnknownSourceError } from "./source-ownership.js";
 
 export const REQUEST_BODY_LIMIT_BYTES = 10 * 1024 * 1024;
 
@@ -55,6 +59,7 @@ export type AppDatabase = Pick<
   | "supersedeFailedJob"
   | "getSegment"
   | "sessionSegmentListing"
+  | "listSources"
 >;
 export type AppWorker = Pick<ExtractionWorker, "start" | "stop" | "wake">;
 export type AppSearchService = Pick<SearchService, "search">;
@@ -123,6 +128,12 @@ const JOB_PARAMS_SCHEMA = {
   required: ["job_id"],
   properties: { job_id: { type: "integer" } },
 } as const;
+const SOURCE_ID_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  required: ["source_id"],
+  properties: { source_id: { type: "string", minLength: 1, maxLength: 500 } },
+} as const;
 const SEGMENT_PARAMS_SCHEMA = {
   type: "object",
   additionalProperties: false,
@@ -144,6 +155,8 @@ const KNOWN_ROUTES: ReadonlyArray<{
   { pattern: /^\/openapi\.json$/u, methods: ["GET"] },
   { pattern: /^\/redoc$/u, methods: ["GET"] },
   { pattern: /^\/v1\/queue$/u, methods: ["GET"] },
+  { pattern: /^\/v1\/sources$/u, methods: ["GET"] },
+  { pattern: /^\/v1\/sources\/[^/]+$/u, methods: ["GET"] },
   { pattern: /^\/v1\/segments$/u, methods: ["POST"] },
   { pattern: /^\/v1\/jobs\/[^/]+\/retry$/u, methods: ["POST"] },
   { pattern: /^\/v1\/jobs\/[^/]+\/restart$/u, methods: ["POST"] },
@@ -201,7 +214,7 @@ function parseRequestContract<T>(
   }
 }
 
-function parseSegmentBody(value: unknown): SegmentCreate {
+function parseSegmentBody(value: unknown): SourceSegmentCreate {
   if (typeof value === "object" && value !== null && "messages" in value) {
     const messages = (value as { messages?: unknown }).messages;
     if (Array.isArray(messages)) {
@@ -229,7 +242,7 @@ function parseSegmentBody(value: unknown): SegmentCreate {
       }
     }
   }
-  return parseRequestContract(parseSegmentTransport, value);
+  return parseRequestContract(parseSourceSegmentCreate, value);
 }
 
 function jsonPointerPath(value: string): ValidationLocation[] {
@@ -361,8 +374,8 @@ function registerRoutes(
         {
           schema: {
             headers: API_KEY_HEADER_SCHEMA,
-            body: SegmentCreateTransportSchema,
-            response: { 202: JobResponseSchema },
+            body: SourceSegmentCreateSchema,
+            response: { 202: SourceJobResponseSchema },
           },
           preValidation: async (request) => {
             request.body = parseSegmentBody(request.body);
@@ -370,10 +383,50 @@ function registerRoutes(
         },
         async (request, reply) => {
           const job = await dependencies.database.enqueue(
-            request.body as SegmentCreate,
+            request.body as SourceSegmentCreate,
           );
           dependencies.worker.wake();
           return reply.code(202).send(job);
+        },
+      );
+
+      v1.get(
+        "/sources",
+        {
+          schema: {
+            headers: API_KEY_HEADER_SCHEMA,
+            response: { 200: { type: "array", items: SourceInfoSchema } },
+          },
+        },
+        async () => dependencies.database.listSources(),
+      );
+
+      v1.get(
+        "/sources/:source_id",
+        {
+          schema: {
+            headers: API_KEY_HEADER_SCHEMA,
+            params: {
+              type: "object",
+              additionalProperties: false,
+              required: ["source_id"],
+              properties: {
+                source_id: { type: "string", minLength: 1, maxLength: 500 },
+              },
+            },
+            response: { 200: SourceInfoSchema },
+          },
+        },
+        async (request) => {
+          const { source_id: sourceId } = request.params as {
+            source_id: string;
+          };
+          const source = (await dependencies.database.listSources()).find(
+            (candidate) => candidate.id === sourceId,
+          );
+          if (source === undefined)
+            throw new HttpError(404, "source not found");
+          return source;
         },
       );
 
@@ -383,12 +436,16 @@ function registerRoutes(
           schema: {
             headers: API_KEY_HEADER_SCHEMA,
             params: JOB_PARAMS_SCHEMA,
-            response: { 200: JobResponseSchema },
+            querystring: SOURCE_ID_SCHEMA,
+            response: { 200: SourceJobResponseSchema },
           },
         },
         async (request) => {
           const { job_id: jobId } = request.params as { job_id: number };
-          const job = await dependencies.database.getJob(jobId);
+          const { source_id: sourceId } = request.query as {
+            source_id: string;
+          };
+          const job = await dependencies.database.getJob(sourceId, jobId);
           if (job === null) throw new HttpError(404, "job not found");
           return job;
         },
@@ -400,14 +457,18 @@ function registerRoutes(
           schema: {
             headers: API_KEY_HEADER_SCHEMA,
             params: JOB_PARAMS_SCHEMA,
-            response: { 202: JobResponseSchema },
+            body: SOURCE_ID_SCHEMA,
+            response: { 202: SourceJobResponseSchema },
           },
         },
         async (request, reply) => {
           const { job_id: jobId } = request.params as { job_id: number };
+          const { source_id: sourceId } = request.body as {
+            source_id: string;
+          };
           let job;
           try {
-            job = await dependencies.database.retryFailedJob(jobId);
+            job = await dependencies.database.retryFailedJob(sourceId, jobId);
           } catch (error) {
             if (error instanceof JobNotRetryableError) {
               throw new HttpError(409, error.message);
@@ -426,14 +487,18 @@ function registerRoutes(
           schema: {
             headers: API_KEY_HEADER_SCHEMA,
             params: JOB_PARAMS_SCHEMA,
-            response: { 202: JobResponseSchema },
+            body: SOURCE_ID_SCHEMA,
+            response: { 202: SourceJobResponseSchema },
           },
         },
         async (request, reply) => {
           const { job_id: jobId } = request.params as { job_id: number };
+          const { source_id: sourceId } = request.body as {
+            source_id: string;
+          };
           let job;
           try {
-            job = await dependencies.database.retryFailedJob(jobId, {
+            job = await dependencies.database.retryFailedJob(sourceId, jobId, {
               restartExtraction: true,
             });
           } catch (error) {
@@ -454,14 +519,21 @@ function registerRoutes(
           schema: {
             headers: API_KEY_HEADER_SCHEMA,
             params: JOB_PARAMS_SCHEMA,
-            response: { 200: JobResponseSchema },
+            body: SOURCE_ID_SCHEMA,
+            response: { 200: SourceJobResponseSchema },
           },
         },
         async (request, reply) => {
           const { job_id: jobId } = request.params as { job_id: number };
+          const { source_id: sourceId } = request.body as {
+            source_id: string;
+          };
           let job;
           try {
-            job = await dependencies.database.supersedeFailedJob(jobId);
+            job = await dependencies.database.supersedeFailedJob(
+              sourceId,
+              jobId,
+            );
           } catch (error) {
             if (error instanceof JobNotRetryableError) {
               throw new HttpError(409, error.message);
@@ -479,14 +551,21 @@ function registerRoutes(
           schema: {
             headers: API_KEY_HEADER_SCHEMA,
             params: SEGMENT_PARAMS_SCHEMA,
-            response: { 200: SegmentResponseSchema },
+            querystring: SOURCE_ID_SCHEMA,
+            response: { 200: SourceSegmentResponseSchema },
           },
         },
         async (request) => {
           const { segment_id: segmentId } = request.params as {
             segment_id: string;
           };
-          const segment = await dependencies.database.getSegment(segmentId);
+          const { source_id: sourceId } = request.query as {
+            source_id: string;
+          };
+          const segment = await dependencies.database.getSegment(
+            sourceId,
+            segmentId,
+          );
           if (segment === null) throw new HttpError(404, "segment not found");
           return segment;
         },
@@ -498,16 +577,24 @@ function registerRoutes(
           schema: {
             headers: API_KEY_HEADER_SCHEMA,
             params: SESSION_PARAMS_SCHEMA,
-            response: { 200: SessionSegmentsResponseSchema },
+            querystring: SOURCE_ID_SCHEMA,
+            response: { 200: SourceSessionSegmentsResponseSchema },
           },
         },
         async (request) => {
           const { session_id: sessionId } = request.params as {
             session_id: string;
           };
+          const { source_id: sourceId } = request.query as {
+            source_id: string;
+          };
           const [segments, boundaries, targets] =
-            await dependencies.database.sessionSegmentListing(sessionId);
-          return parseSessionSegmentsResponse({
+            await dependencies.database.sessionSegmentListing(
+              sourceId,
+              sessionId,
+            );
+          return parseSourceSessionSegmentsResponse({
+            source_id: sourceId,
             manifest_version: 2,
             session_id: sessionId,
             segments,
@@ -545,6 +632,9 @@ function registerRoutes(
 
 function registerErrorHandling(app: FastifyInstance): void {
   app.setErrorHandler(async (error: FastifyError, _request, reply) => {
+    if (error instanceof UnknownSourceError) {
+      return reply.code(422).send({ detail: error.message });
+    }
     if (error instanceof HttpError) {
       return reply.code(error.statusCode).send({ detail: error.message });
     }
@@ -607,6 +697,7 @@ function registerErrorHandling(app: FastifyInstance): void {
 export function createApp(options: CreateAppOptions = {}): ReflectionApp {
   const settings = options.settings ?? loadSettings();
   const app = fastify({
+    ajv: { customOptions: { removeAdditional: false } },
     bodyLimit: REQUEST_BODY_LIMIT_BYTES,
     exposeHeadRoutes: false,
     trustProxy: true,
