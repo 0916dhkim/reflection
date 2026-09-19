@@ -435,6 +435,92 @@ describe("segment API", () => {
     expect(crossingTurns.statusCode).toBe(422);
   });
 
+  test("strips transport source IDs before canonical enqueueing", async () => {
+    const enqueue = vi.fn<AppDatabase["enqueue"]>(async () => jobResponse());
+    const { app } = appWith(dependencies({ database: { enqueue } }));
+    const legacy = {
+      session_id: "session",
+      start_user_message_id: "start",
+      end_user_message_id: "end",
+      messages: [{ role: "user", text: "text" }],
+    };
+    const exact = {
+      session_id: "session",
+      start_user_message_id: "turn",
+      end_user_message_id: "turn",
+      source_boundary_version: 2,
+      start_source_message_id: "message-a",
+      end_source_message_id: "message-b",
+      messages: [{ role: "assistant", text: "text" }],
+    };
+
+    const responses = await Promise.all(
+      [
+        legacy,
+        { ...legacy, source_id: "source-legacy" },
+        exact,
+        { ...exact, source_id: "source-exact" },
+      ].map((payload) =>
+        app.inject({
+          method: "POST",
+          url: "/v1/segments",
+          headers: API_HEADERS,
+          payload,
+        }),
+      ),
+    );
+
+    expect(responses.every((response) => response.statusCode === 202)).toBe(
+      true,
+    );
+    const payloads = enqueue.mock.calls.map(([payload]) => payload);
+    for (const [withoutSource, withSource] of [
+      [payloads[0], payloads[1]],
+      [payloads[2], payloads[3]],
+    ]) {
+      expect(withSource).toEqual(withoutSource);
+      expect(withSource).not.toHaveProperty("source_id");
+      if (withoutSource === undefined || withSource === undefined) {
+        throw new Error("missing enqueue payload");
+      }
+      expect(sourceFingerprint(withSource)).toBe(
+        sourceFingerprint(withoutSource),
+      );
+      expect(segmentIdForRequest(withSource)).toBe(
+        segmentIdForRequest(withoutSource),
+      );
+    }
+  });
+
+  test("rejects invalid transport source IDs and unrelated fields", async () => {
+    const { app, injected } = appWith();
+    const base = {
+      session_id: "session",
+      start_user_message_id: "start",
+      end_user_message_id: "end",
+      messages: [{ role: "user", text: "text" }],
+    };
+
+    for (const sourceId of [null, 1, "", "   ", "x".repeat(501)]) {
+      const response = await app.inject({
+        method: "POST",
+        url: "/v1/segments",
+        headers: API_HEADERS,
+        payload: { ...base, source_id: sourceId },
+      });
+      expect(response.statusCode).toBe(422);
+    }
+    const unrelated = await app.inject({
+      method: "POST",
+      url: "/v1/segments",
+      headers: API_HEADERS,
+      payload: { ...base, unrelated: true },
+    });
+
+    expect(unrelated.statusCode).toBe(422);
+    expect(injected.database.enqueue).not.toHaveBeenCalled();
+  });
+
   test("accepts JSON without a content type and validates unsupported media as input", async () => {
     const enqueue = vi.fn<AppDatabase["enqueue"]>(async () => jobResponse());
     const { app } = appWith(dependencies({ database: { enqueue } }));

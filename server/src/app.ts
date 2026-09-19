@@ -10,11 +10,11 @@ import {
   QueueStatusResponseSchema,
   SearchRequestSchema,
   SearchResponseSchema,
-  SegmentCreateSchema,
+  SegmentCreateTransportSchema,
   SegmentResponseSchema,
   SessionSegmentsResponseSchema,
   parseSearchRequest,
-  parseSegmentCreate,
+  parseSegmentTransport,
   parseSessionSegmentsResponse,
   type SearchRequest,
   type SegmentCreate,
@@ -229,7 +229,7 @@ function parseSegmentBody(value: unknown): SegmentCreate {
       }
     }
   }
-  return parseRequestContract(parseSegmentCreate, value);
+  return parseRequestContract(parseSegmentTransport, value);
 }
 
 function jsonPointerPath(value: string): ValidationLocation[] {
@@ -361,7 +361,7 @@ function registerRoutes(
         {
           schema: {
             headers: API_KEY_HEADER_SCHEMA,
-            body: SegmentCreateSchema,
+            body: SegmentCreateTransportSchema,
             response: { 202: JobResponseSchema },
           },
           preValidation: async (request) => {

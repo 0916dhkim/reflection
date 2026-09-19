@@ -11,6 +11,7 @@ import {
   parseResolutionResult,
   parseSearchRequest,
   parseSegmentCreate,
+  parseSegmentTransport,
   parseSegmentResponse,
   parseSessionSegmentsResponse,
   toExtractionResult,
@@ -104,6 +105,64 @@ describe("public contracts", () => {
       expect(() => parseSegmentCreate(malformed)).toThrow(
         ContractValidationError,
       );
+    }
+  });
+
+  it("accepts and strips source IDs only from transport requests", () => {
+    const requests = [
+      {
+        session_id: "session",
+        start_user_message_id: "start",
+        end_user_message_id: "end",
+        messages: [{ role: "user" as const, text: "source" }],
+      },
+      {
+        session_id: "session",
+        start_user_message_id: "turn",
+        end_user_message_id: "turn",
+        source_boundary_version: 2 as const,
+        start_source_message_id: "message-a",
+        end_source_message_id: "message-b",
+        messages: [{ role: "assistant" as const, text: "source" }],
+      },
+    ];
+
+    for (const request of requests) {
+      expect(
+        parseSegmentTransport({ ...request, source_id: " source-id " }),
+      ).toEqual(parseSegmentCreate(request));
+      expect(() =>
+        parseSegmentCreate({ ...request, source_id: "source-id" }),
+      ).toThrow(ContractValidationError);
+    }
+
+    const legacy = requests[0]!;
+    for (const sourceId of [null, 1, "", "   ", "x".repeat(501)]) {
+      expect(() =>
+        parseSegmentTransport({ ...legacy, source_id: sourceId }),
+      ).toThrow(ContractValidationError);
+    }
+    expect(() => parseSegmentTransport({ ...legacy, unrelated: true })).toThrow(
+      ContractValidationError,
+    );
+  });
+
+  it("preserves legacy canonical normalization at the transport boundary", () => {
+    for (const projectionVersion of [true, false, undefined]) {
+      const input = {
+        session_id: " session ",
+        start_user_message_id: " turn ",
+        end_user_message_id: " turn ",
+        projection_version: projectionVersion,
+        messages: [{ role: "user", text: "  keep source text  " }],
+      };
+      expect(parseSegmentTransport(input)).toEqual(parseSegmentCreate(input));
+      expect(parseSegmentTransport({ ...input, source_id: "source" })).toEqual(
+        parseSegmentCreate(input),
+      );
+      expect(() =>
+        parseSegmentTransport({ ...input, source_id: "source", unrelated: 1 }),
+      ).toThrow(ContractValidationError);
     }
   });
 
