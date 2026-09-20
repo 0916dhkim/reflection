@@ -18,6 +18,16 @@ COPY server server
 RUN pnpm --filter @reflection/server build
 RUN pnpm --filter @reflection/server deploy --prod --legacy /deploy
 
+FROM build AS source-operator
+
+ENV MIGRATIONS_DIR=/app/migrations
+COPY --chown=node:node scripts/source-ownership.mjs ./scripts/source-ownership.mjs
+COPY --chown=node:node migrations ./migrations
+
+USER node
+ENTRYPOINT ["node", "scripts/source-ownership.mjs"]
+CMD ["--help"]
+
 FROM node:24.18.0-bookworm-slim AS runtime
 
 ENV NODE_ENV=production \

@@ -15,6 +15,7 @@
     "test": "pnpm --recursive --if-present test",
     "test:integration": "pnpm --filter @reflection/server test:integration",
     "test:opencode-v2": "node plugin/probe-v2/run.mjs",
+    "test:rollout-rehearsal": "node scripts/rehearsal/run.mjs",
     "typecheck": "pnpm --recursive --if-present typecheck",
     "verify:plugin-bundle": "pnpm --filter opencode-reflection-plugin verify:bundle",
     "check": "pnpm format:check && pnpm typecheck && pnpm test && pnpm build && pnpm verify:plugin-bundle"
