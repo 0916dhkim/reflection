@@ -21,6 +21,10 @@ import {
 } from "@reflection/shared/segmentation";
 import { parseJobResponse } from "@reflection/shared/contracts";
 import {
+  nativeSegmentIdForRequest,
+  type NativeSourceMessage,
+} from "@reflection/shared/native";
+import {
   sourceSegmentIdForRequest,
   type SourceInfo,
   type SourceSegmentCreate,
@@ -849,6 +853,223 @@ describe("Reflection plugin hooks", () => {
     expect(result).toContain("REMOTE USER");
     expect(result).not.toContain("remote-secret");
     expect(calls).toHaveLength(3);
+    expect(client.session.messages).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    "exact-range",
+    "assistant-start",
+    "synthetic-only",
+    "metadata-source",
+    "metadata-id",
+    "deterministic-id",
+    "registry-id",
+    "registry-kind",
+    "registry-identity",
+    "unconfigured",
+    "missing-start",
+    "missing-end",
+    "reversed",
+    "incomplete",
+    "unknown-type",
+    "offline",
+  ])("hydrates native remote ranges or fails closed: %s", async (scenario) => {
+    const source: SourceInfo = {
+      id: "remote",
+      kind: "opencode-v2",
+      identity_scheme: "source-v1",
+    };
+    const start =
+      scenario === "assistant-start"
+        ? "msg_assistant"
+        : scenario === "synthetic-only"
+          ? "msg_synthetic"
+          : "msg_user";
+    const nativeMessages: NativeSourceMessage[] = [
+      { id: "msg_user", type: "user", text: "REMOTE USER" },
+      { id: "msg_assistant", type: "assistant", text: "REMOTE ASSISTANT" },
+      { id: "msg_synthetic", type: "synthetic", text: "REMOTE SYNTHETIC" },
+    ];
+    const expected = nativeMessages.slice(
+      scenario === "assistant-start"
+        ? 1
+        : scenario === "synthetic-only"
+          ? 2
+          : 0,
+    );
+    const id = nativeSegmentIdForRequest(
+      {
+        source_id: source.id,
+        session_id: "shared-session",
+        source_boundary_version: 3,
+        start_source_message_id: start,
+        end_source_message_id: "msg_synthetic",
+        projection_version: 3,
+        processing_priority: 0,
+        messages: expected,
+      },
+      source,
+    );
+    const requestedId =
+      scenario === "deterministic-id"
+        ? "11111111-1111-5111-8111-111111111111"
+        : id;
+    writeConfig({
+      sources: {
+        "test-opencode-source": { kind: "opencode-v1", url: "http://local" },
+        ...(scenario === "unconfigured"
+          ? {}
+          : {
+              remote: {
+                kind:
+                  scenario === "registry-kind" ? "opencode-v1" : "opencode-v2",
+                url: "http://remote",
+              },
+            }),
+      },
+    });
+    const client = clientFor(projectionMessages("shared-session"));
+    const history = [
+      {
+        id: "msg_before",
+        type: "user",
+        time: { created: 0 },
+        text: "OUTSIDE BEFORE",
+        files: [],
+      },
+      {
+        id: "msg_user",
+        type: "user",
+        time: { created: 3 },
+        text: "REMOTE USER",
+        files: [],
+      },
+      {
+        id: "msg_assistant",
+        type: scenario === "unknown-type" ? "not-a-native-type" : "assistant",
+        time:
+          scenario === "incomplete"
+            ? { created: 2 }
+            : { created: 2, completed: 4 },
+        agent: "build",
+        model: { providerID: "probe", id: "mock" },
+        content: [{ type: "text", text: "REMOTE ASSISTANT" }],
+      },
+      {
+        id: "msg_synthetic",
+        type: "synthetic",
+        time: { created: 1 },
+        text: "REMOTE SYNTHETIC",
+      },
+      {
+        id: "msg_after",
+        type: "user",
+        time: { created: 5 },
+        text: "OUTSIDE AFTER",
+        files: [],
+      },
+    ];
+    const fetchMock = vi.fn(
+      async (url: string | URL | Request, init?: RequestInit) => {
+        if (
+          String(url) === "https://reflection.example.com/v1/sources/remote"
+        ) {
+          return ok({
+            ...source,
+            id: scenario === "registry-id" ? "wrong" : source.id,
+            kind: scenario === "registry-kind" ? "opencode-v1" : source.kind,
+            identity_scheme:
+              scenario === "registry-identity"
+                ? "legacy"
+                : source.identity_scheme,
+          });
+        }
+        if (
+          String(url).startsWith("https://reflection.example.com/v1/segments/")
+        ) {
+          return ok({
+            id: scenario === "metadata-id" ? "wrong" : requestedId,
+            source_id: scenario === "metadata-source" ? "wrong" : source.id,
+            session_id: "shared-session",
+            source_boundary_version: 3,
+            start_source_message_id:
+              scenario === "missing-start"
+                ? "msg_missing"
+                : scenario === "reversed"
+                  ? "msg_synthetic"
+                  : start,
+            end_source_message_id:
+              scenario === "missing-end"
+                ? "msg_missing"
+                : scenario === "reversed"
+                  ? "msg_user"
+                  : "msg_synthetic",
+            summary: "summary",
+            claims: [],
+            created_at: "now",
+            updated_at: "now",
+          });
+        }
+        expect(new Headers(init?.headers).get("X-Api-Key")).toBeNull();
+        if (scenario === "offline")
+          return new Response("unavailable", { status: 503 });
+        if (
+          String(url) ===
+          "http://remote/api/session/shared-session/message?order=asc&limit=200"
+        ) {
+          return ok({ data: history.slice(0, 3), cursor: { next: "page2" } });
+        }
+        expect(String(url)).toBe(
+          "http://remote/api/session/shared-session/message?limit=200&cursor=page2",
+        );
+        return ok({ data: history.slice(3), cursor: { next: null } });
+      },
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const hooks = await Reflection(pluginInput(client));
+    const output = await hooks.tool!.memory_read_segment!.execute(
+      { source_id: source.id, segment_id: requestedId },
+      {
+        sessionID: "caller-session",
+        messageID: "caller-message",
+        agent: "build",
+        directory: "/tmp",
+        worktree: "/tmp",
+        abort: new AbortController().signal,
+        metadata() {},
+        async ask() {},
+      },
+    );
+    if (typeof output !== "string")
+      throw new Error("expected JSON tool output");
+    const result = JSON.parse(output);
+    if (
+      ["exact-range", "assistant-start", "synthetic-only"].includes(scenario)
+    ) {
+      expect(result).toEqual({
+        source_id: source.id,
+        segment_id: id,
+        session_id: "shared-session",
+        source_boundary_version: 3,
+        start_source_message_id: start,
+        end_source_message_id: "msg_synthetic",
+        messages: expected,
+      });
+      expect(fetchMock).toHaveBeenCalledTimes(4);
+    } else {
+      expect(result.error).toBeTruthy();
+      expect(result.messages).toBeUndefined();
+      if (scenario === "missing-start" || scenario === "missing-end")
+        expect(result.error).toContain("boundary was not found");
+      if (scenario === "reversed")
+        expect(result.error).toContain("boundary is out of order");
+      if (scenario === "incomplete")
+        expect(result.error).toContain("includes an incomplete record");
+      if (scenario === "deterministic-id")
+        expect(result.error).toContain("invalid native segment identity");
+      if (scenario === "registry-kind" || scenario === "registry-identity")
+        expect(result.error).toContain("native hydration requires");
+    }
     expect(client.session.messages).not.toHaveBeenCalled();
   });
 

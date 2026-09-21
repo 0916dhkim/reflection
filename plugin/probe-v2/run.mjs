@@ -37,54 +37,72 @@ try {
   );
   if (build.error || build.status !== 0)
     throw new Error("History reader probe build failed");
+  const { build: bundle } = await import("esbuild");
+  for (const [entry, output] of [
+    ["../../packages/opencode-v2-plugin/src/index.ts", "reflection-v2.js"],
+    ["./native-harness.mjs", "native-harness.mjs"],
+  ]) {
+    await bundle({
+      entryPoints: [fileURLToPath(new URL(entry, import.meta.url))],
+      outfile: `${context}.generated/${output}`,
+      bundle: true,
+      platform: "node",
+      format: "esm",
+      target: "node24",
+      banner: {
+        js: 'import { createRequire as __reflectionCreateRequire } from "node:module"; const require = __reflectionCreateRequire(import.meta.url);',
+      },
+    });
+  }
   docker(
     ["build", "--platform", "linux/arm64", "--tag", image, context],
     300_000,
   );
-  docker(
-    [
-      "run",
-      "--rm",
-      "--name",
-      container,
-      "--platform",
-      "linux/arm64",
-      "--network",
-      "none",
-      "--read-only",
-      "--cap-drop",
-      "ALL",
-      "--security-opt",
-      "no-new-privileges",
-      "--pids-limit",
-      "256",
-      "--memory",
-      "4g",
-      "--tmpfs",
-      "/state:rw,nosuid,nodev,mode=1777",
-      "--tmpfs",
-      "/tmp:rw,nosuid,nodev,mode=1777",
-      image,
-      "/usr/bin/env",
-      "-i",
-      "PATH=/usr/local/bin:/usr/bin:/bin",
-      "HOME=/state/home",
-      "TMPDIR=/tmp",
-      "XDG_CONFIG_HOME=/state/config",
-      "XDG_DATA_HOME=/state/data",
-      "XDG_CACHE_HOME=/state/cache",
-      "XDG_STATE_HOME=/state/state",
-      "OPENCODE_CONFIG_DIR=/state/config/opencode",
-      "OPENCODE_DISABLE_MODELS_FETCH=1",
-      "OPENCODE_DISABLE_FFF=1",
-      "OPENCODE_PASSWORD=cp002-fixture-only",
-      "PROBE_SERVER_URL=http://127.0.0.1:4096",
-      "PROBE_SERVER_PASSWORD=cp002-fixture-only",
-      "node",
-      "/harness/harness.mjs",
-    ],
-    120_000,
-  );
+  for (const harness of ["harness.mjs", "native-harness.mjs"])
+    docker(
+      [
+        "run",
+        "--rm",
+        "--name",
+        container,
+        "--platform",
+        "linux/arm64",
+        "--network",
+        "none",
+        "--read-only",
+        "--cap-drop",
+        "ALL",
+        "--security-opt",
+        "no-new-privileges",
+        "--pids-limit",
+        "256",
+        "--memory",
+        "4g",
+        "--tmpfs",
+        "/state:rw,nosuid,nodev,mode=1777",
+        "--tmpfs",
+        "/tmp:rw,nosuid,nodev,mode=1777",
+        image,
+        "/usr/bin/env",
+        "-i",
+        "PATH=/usr/local/bin:/usr/bin:/bin",
+        "HOME=/state/home",
+        "TMPDIR=/tmp",
+        "XDG_CONFIG_HOME=/state/config",
+        "XDG_DATA_HOME=/state/data",
+        "XDG_CACHE_HOME=/state/cache",
+        "XDG_STATE_HOME=/state/state",
+        "OPENCODE_CONFIG_DIR=/state/config/opencode",
+        "OPENCODE_DISABLE_MODELS_FETCH=1",
+        "OPENCODE_DISABLE_FFF=1",
+        "OPENCODE_PASSWORD=cp002-fixture-only",
+        "PROBE_SERVER_URL=http://127.0.0.1:4096",
+        "PROBE_SERVER_PASSWORD=cp002-fixture-only",
+        "node",
+        `/harness/${harness}`,
+      ],
+      120_000,
+    );
 } finally {
   // A killed Docker client does not necessarily stop the container.
   spawnSync("docker", ["rm", "--force", container], {

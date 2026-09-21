@@ -103,6 +103,8 @@ function job(
 }
 
 function prepared(claimed: ClaimedJob): PreparedSegment {
+  if (claimed.request.source_boundary_version === 3)
+    throw new Error("expected legacy claim");
   return {
     id: claimed.segmentId,
     sessionId: claimed.request.session_id,

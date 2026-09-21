@@ -3,6 +3,10 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 
 import { tool, type Plugin } from "@opencode-ai/plugin";
+import { canonicalizeNativeHistory } from "@reflection/opencode-v2-core/history";
+import { hydrateNativeRange } from "@reflection/opencode-v2-core/segmentation";
+import { parseIngestSegmentResponse } from "@reflection/shared/ingestion";
+import { nativeSegmentIdForRequest } from "@reflection/shared/native";
 import {
   type JobStatus,
   type SegmentCreate,
@@ -12,7 +16,6 @@ import {
   parseSourceInfo,
   parseSourceSegmentCreate,
   parseSourceJobResponse,
-  parseSourceSegmentResponse,
   parseSourceSessionSegmentsResponse,
   sourceSegmentIdForRequest,
   type SourceInfo,
@@ -49,6 +52,7 @@ import { stripStaleToolAttachments } from "./attachments.js";
 import {
   assertReadableBoundary,
   readHistory,
+  readNativeV2History,
   type SourceReaderConfig,
 } from "./history-reader.js";
 
@@ -1778,7 +1782,7 @@ export const Reflection: Plugin = async ({ client, directory }) => {
 
       memory_read_segment: tool({
         description:
-          "Read the original ordered user and assistant text for a Reflection source segment.",
+          "Read ordered source text for a Reflection segment, preserving native message types.",
         args: {
           source_id: tool.schema
             .string()
@@ -1818,7 +1822,7 @@ export const Reflection: Plugin = async ({ client, directory }) => {
               });
             }
 
-            const segment = parseSourceSegmentResponse(
+            const segment = parseIngestSegmentResponse(
               response.data,
               source.id,
             );
@@ -1826,6 +1830,45 @@ export const Reflection: Plugin = async ({ client, directory }) => {
               throw new Error("invalid segment metadata");
             }
             assertReadableBoundary(source, segment);
+            if (segment.source_boundary_version === 3) {
+              const messages = hydrateNativeRange(
+                canonicalizeNativeHistory(
+                  await readNativeV2History(
+                    source,
+                    segment.session_id,
+                    { sources: writerConfig.config?.sources ?? {} },
+                    context.abort,
+                  ),
+                ),
+                segment,
+              );
+              if (
+                nativeSegmentIdForRequest(
+                  {
+                    source_id,
+                    session_id: segment.session_id,
+                    source_boundary_version: 3,
+                    start_source_message_id: segment.start_source_message_id,
+                    end_source_message_id: segment.end_source_message_id,
+                    projection_version: 3,
+                    processing_priority: 0,
+                    messages,
+                  },
+                  source,
+                ) !== segment_id
+              ) {
+                throw new Error("invalid native segment identity");
+              }
+              return formatData({
+                source_id,
+                segment_id,
+                session_id: segment.session_id,
+                source_boundary_version: 3,
+                start_source_message_id: segment.start_source_message_id,
+                end_source_message_id: segment.end_source_message_id,
+                messages,
+              });
+            }
             const boundary: CommittedSegmentBoundary =
               segment.source_boundary_version === 1
                 ? {

@@ -552,6 +552,28 @@ describe("readHistory", () => {
     },
   );
 
+  it("accepts native boundaries only for v2 source-v1 registry entries", () => {
+    const segment = {
+      source_id: "v2",
+      id: "segment",
+      session_id: "session",
+      source_boundary_version: 3 as const,
+      start_source_message_id: "msg_start",
+      end_source_message_id: "msg_end",
+      summary: "summary",
+      claims: [],
+      created_at: "now",
+      updated_at: "now",
+    };
+    expect(() => assertReadableBoundary(v2, segment)).not.toThrow();
+    expect(() => assertReadableBoundary(v1, segment)).toThrow(
+      "native hydration requires",
+    );
+    expect(() =>
+      assertReadableBoundary({ ...v2, identity_scheme: "legacy" }, segment),
+    ).toThrow("native hydration requires");
+  });
+
   it("rejects an unavailable or mismatched source without fallback", async () => {
     await expect(
       readHistory(

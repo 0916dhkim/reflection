@@ -53,13 +53,13 @@ export function codePointLength(value: string): number {
   return length;
 }
 
-const IdentifierSchema = Type.String({ minLength: 1, maxLength: 500 });
+export const IdentifierSchema = Type.String({ minLength: 1, maxLength: 500 });
 const SourceIdentifierSchema = Type.String({
   minLength: 1,
   maxLength: 500,
   pattern: ".*\\S.*",
 });
-const UuidSchema = Type.String({ pattern: UUID_PATTERN });
+export const UuidSchema = Type.String({ pattern: UUID_PATTERN });
 const DateTimeSchema = Type.String();
 const Nullable = <T extends TSchema>(schema: T) =>
   Type.Union([schema, Type.Null()]);
@@ -294,11 +294,9 @@ export const JobStatusSchema = Type.Union([
 ]);
 export type JobStatus = Static<typeof JobStatusSchema>;
 
-const JobResponseProperties = {
+export const JobResponseMetadataProperties = {
   id: Type.Integer(),
   segment_id: UuidSchema,
-  start_user_message_id: IdentifierSchema,
-  end_user_message_id: IdentifierSchema,
   source_fingerprint: Nullable(Type.String()),
   projection_version: Type.Integer(),
   status: JobStatusSchema,
@@ -309,14 +307,19 @@ const JobResponseProperties = {
   finished_at: Nullable(DateTimeSchema),
   next_attempt_at: DateTimeSchema,
 } as const;
+export const JobResponseCommonProperties = {
+  ...JobResponseMetadataProperties,
+  start_user_message_id: IdentifierSchema,
+  end_user_message_id: IdentifierSchema,
+} as const;
 
 export const JobResponseSchema = Type.Union([
   Type.Object(
-    { ...JobResponseProperties, ...SourceBoundaryV1Properties },
+    { ...JobResponseCommonProperties, ...SourceBoundaryV1Properties },
     { additionalProperties: false },
   ),
   Type.Object(
-    { ...JobResponseProperties, ...SourceBoundaryV2Properties },
+    { ...JobResponseCommonProperties, ...SourceBoundaryV2Properties },
     { additionalProperties: false },
   ),
 ]);
@@ -443,24 +446,27 @@ export function validateClaimObject(claim: ClaimData): ClaimData {
   return claim;
 }
 
-const SegmentResponseProperties = {
+export const SegmentResponseMetadataProperties = {
   id: UuidSchema,
   session_id: IdentifierSchema,
-  start_user_message_id: IdentifierSchema,
-  end_user_message_id: IdentifierSchema,
   summary: Type.String(),
   claims: Type.Array(ClaimDataSchema),
   created_at: DateTimeSchema,
   updated_at: DateTimeSchema,
 } as const;
+export const SegmentResponseCommonProperties = {
+  ...SegmentResponseMetadataProperties,
+  start_user_message_id: IdentifierSchema,
+  end_user_message_id: IdentifierSchema,
+} as const;
 
 export const SegmentResponseSchema = Type.Union([
   Type.Object(
-    { ...SegmentResponseProperties, ...SourceBoundaryV1Properties },
+    { ...SegmentResponseCommonProperties, ...SourceBoundaryV1Properties },
     { additionalProperties: false },
   ),
   Type.Object(
-    { ...SegmentResponseProperties, ...SourceBoundaryV2Properties },
+    { ...SegmentResponseCommonProperties, ...SourceBoundaryV2Properties },
     { additionalProperties: false },
   ),
 ]);
@@ -475,63 +481,72 @@ export function parseSegmentResponse(value: unknown): SegmentResponse {
   return result;
 }
 
-const SegmentSummaryProperties = {
+export const SegmentSummaryMetadataProperties = {
   id: UuidSchema,
-  start_user_message_id: IdentifierSchema,
-  end_user_message_id: IdentifierSchema,
   projection_version: Type.Integer(),
   summary: Type.String(),
+} as const;
+export const SegmentSummaryCommonProperties = {
+  ...SegmentSummaryMetadataProperties,
+  start_user_message_id: IdentifierSchema,
+  end_user_message_id: IdentifierSchema,
 } as const;
 
 export const SegmentSummarySchema = Type.Union([
   Type.Object(
-    { ...SegmentSummaryProperties, ...SourceBoundaryV1Properties },
+    { ...SegmentSummaryCommonProperties, ...SourceBoundaryV1Properties },
     { additionalProperties: false },
   ),
   Type.Object(
-    { ...SegmentSummaryProperties, ...SourceBoundaryV2Properties },
+    { ...SegmentSummaryCommonProperties, ...SourceBoundaryV2Properties },
     { additionalProperties: false },
   ),
 ]);
 export type SegmentSummary = Static<typeof SegmentSummarySchema>;
 
-const SegmentBoundaryProperties = {
+export const SegmentBoundaryMetadataProperties = {
   id: UuidSchema,
-  start_user_message_id: IdentifierSchema,
-  end_user_message_id: IdentifierSchema,
   projection_version: Type.Integer(),
   source_eligible: Type.Boolean(),
   source_fingerprint: Nullable(Type.String()),
 } as const;
+export const SegmentBoundaryCommonProperties = {
+  ...SegmentBoundaryMetadataProperties,
+  start_user_message_id: IdentifierSchema,
+  end_user_message_id: IdentifierSchema,
+} as const;
 
 export const SegmentBoundarySchema = Type.Union([
   Type.Object(
-    { ...SegmentBoundaryProperties, ...SourceBoundaryV1Properties },
+    { ...SegmentBoundaryCommonProperties, ...SourceBoundaryV1Properties },
     { additionalProperties: false },
   ),
   Type.Object(
-    { ...SegmentBoundaryProperties, ...SourceBoundaryV2Properties },
+    { ...SegmentBoundaryCommonProperties, ...SourceBoundaryV2Properties },
     { additionalProperties: false },
   ),
 ]);
 export type SegmentBoundary = Static<typeof SegmentBoundarySchema>;
 
-const SegmentTargetBoundaryProperties = {
+export const SegmentTargetBoundaryMetadataProperties = {
   id: UuidSchema,
-  start_user_message_id: IdentifierSchema,
-  end_user_message_id: IdentifierSchema,
   projection_version: Type.Integer(),
   status: JobStatusSchema,
   source_fingerprint: Type.String(),
 } as const;
+export const SegmentTargetBoundaryCommonProperties = {
+  ...SegmentTargetBoundaryMetadataProperties,
+  start_user_message_id: IdentifierSchema,
+  end_user_message_id: IdentifierSchema,
+} as const;
 
 export const SegmentTargetBoundarySchema = Type.Union([
   Type.Object(
-    { ...SegmentTargetBoundaryProperties, ...SourceBoundaryV1Properties },
+    { ...SegmentTargetBoundaryCommonProperties, ...SourceBoundaryV1Properties },
     { additionalProperties: false },
   ),
   Type.Object(
-    { ...SegmentTargetBoundaryProperties, ...SourceBoundaryV2Properties },
+    { ...SegmentTargetBoundaryCommonProperties, ...SourceBoundaryV2Properties },
     { additionalProperties: false },
   ),
 ]);

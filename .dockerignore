@@ -5,6 +5,7 @@
 .venv
 .pnpm-store
 **/node_modules
+**/.verification
 **/dist
 **/*.tsbuildinfo
 coverage
