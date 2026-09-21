@@ -24,12 +24,18 @@ old writers are quiescent.
 expand applies only checksummed transactional migrations (MIGRATIONS_DIR defaults
 to this repository's migrations directory). It starts no server or worker and
 does not register sources or install source-aware boundary indexes.
+Migration 010 leaves replacement boundary checks NOT VALID to avoid table scans
+under expansion's ACCESS EXCLUSIVE locks; new writes are still checked.
+install-indexes first validates all three boundary checks when migration 010 is
+present, then builds indexes. Validation runs in separate autocommit statements
+with SHARE UPDATE EXCLUSIVE locks allowing normal DML. Startup requires all
+three checks validated as well as ready indexes. The 009-only path is unchanged.
 Order: expand; register explicit sources; install-indexes; stop old
 writers; cutover; start source-aware backend; backfill; enforce. cutover drops
 only boundary uniqueness, never global UUID primary keys or claims foreign keys.
 All commands take the app migration advisory lock (MIGRATION_LOCK_ID, default
 7320260818002), with a 5s lock wait and 5s connection timeout. Statements have a
-30 minute timeout, including concurrent index builds. On timeout, retry the
+30 minute timeout, including boundary validation and concurrent index builds. On timeout, retry the
 command: install-indexes validates definitions and rebuilds invalid indexes.
 Backfill uses the repository's canonical TypeScript validation via Node 24.`;
 }
@@ -89,13 +95,15 @@ async function backfill(client) {
     throw new Error("--batch-size must be an integer between 1 and 1000");
   }
   await legacySource(client, owner);
-  // Shared sources are TypeScript with emitted-.js relative imports. Scope the
-  // Node 24 resolver to that package; never rewrite or duplicate its algorithms.
+  // Shared and backend sources use emitted-.js relative imports. Scope the
+  // Node 24 resolver to those directories; never duplicate their algorithms.
   const sharedRoot = new URL("../packages/shared/src/", import.meta.url).href;
+  const serverRoot = new URL("../server/src/", import.meta.url).href;
   const hooks = registerHooks({
     resolve(specifier, context, nextResolve) {
       if (
-        context.parentURL?.startsWith(sharedRoot) &&
+        (context.parentURL?.startsWith(sharedRoot) ||
+          context.parentURL?.startsWith(serverRoot)) &&
         specifier.startsWith("./") &&
         specifier.endsWith(".js")
       ) {
@@ -185,6 +193,18 @@ async function backfill(client) {
 
 export const sourceIndexes = [
   [
+    "segments_source_v3_start_key",
+    "segments",
+    "source_id, session_id, start_source_message_id",
+    "source_boundary_version = 3",
+  ],
+  [
+    "extraction_jobs_source_v3_boundary_key",
+    "extraction_jobs",
+    "source_id, session_id, start_source_message_id, end_source_message_id",
+    "source_boundary_version = 3",
+  ],
+  [
     "segments_source_v1_start_key",
     "segments",
     "source_id, session_id, start_user_message_id",
@@ -216,12 +236,20 @@ export const sourceIndexes = [
   ],
 ];
 
-export async function checkIndexes(
-  client,
-  indexes = sourceIndexes,
-  allowInvalid = false,
-) {
-  for (const [name, table, columns, predicate] of indexes) {
+async function indexesForSchema(client) {
+  const native = await client.query(
+    "SELECT 1 FROM reflection_schema_migrations WHERE name = '010_native_source_spans.sql'",
+  );
+  return native.rowCount
+    ? sourceIndexes
+    : sourceIndexes.filter(
+        ([, , , predicate]) => predicate !== "source_boundary_version = 3",
+      );
+}
+
+export async function checkIndexes(client, indexes, allowInvalid = false) {
+  for (const [name, table, columns, predicate] of indexes ??
+    (await indexesForSchema(client))) {
     const row = (
       await client.query(
         `SELECT i.indisvalid, i.indisunique,
@@ -249,7 +277,19 @@ export async function checkIndexes(
 }
 
 export async function installIndexes(client) {
-  for (const [name, table, columns, predicate] of sourceIndexes) {
+  const indexes = await indexesForSchema(client);
+  if (
+    indexes.some(
+      ([, , , predicate]) => predicate === "source_boundary_version = 3",
+    )
+  ) {
+    for (const table of ["segments", "extraction_jobs", "segment_targets"]) {
+      await client.query(
+        `ALTER TABLE ${table} VALIDATE CONSTRAINT ${table}_source_boundary_check`,
+      );
+    }
+  }
+  for (const [name, table, columns, predicate] of indexes) {
     const row = (
       await client.query(
         "SELECT indisvalid FROM pg_index WHERE indexrelid = to_regclass($1)",
@@ -265,7 +305,7 @@ export async function installIndexes(client) {
         `CREATE UNIQUE INDEX CONCURRENTLY ${name} ON ${table} (${columns})${predicate === null ? "" : ` WHERE ${predicate}`}`,
       );
   }
-  await checkIndexes(client);
+  await checkIndexes(client, indexes);
 }
 
 function requireStoppedWriters() {

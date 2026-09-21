@@ -563,6 +563,11 @@ describe("segment API", () => {
       if (withoutSource === undefined || withSource === undefined) {
         throw new Error("missing enqueue payload");
       }
+      if (
+        withoutSource.source_boundary_version === 3 ||
+        withSource.source_boundary_version === 3
+      )
+        throw new Error("expected legacy requests");
       expect(sourceFingerprint(withSource)).toBe(
         sourceFingerprint(withoutSource),
       );

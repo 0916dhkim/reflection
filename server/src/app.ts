@@ -12,16 +12,16 @@ import {
   parseSearchRequest,
   type SearchRequest,
 } from "@reflection/shared/contracts";
+import { SourceInfoSchema } from "@reflection/shared/sources";
 import {
-  SourceInfoSchema,
-  SourceJobResponseSchema,
-  SourceSegmentCreateSchema,
-  SourceSegmentResponseSchema,
-  SourceSessionSegmentsResponseSchema,
-  parseSourceSegmentCreate,
-  parseSourceSessionSegmentsResponse,
-  type SourceSegmentCreate,
-} from "@reflection/shared/sources";
+  IngestJobResponseSchema as SourceJobResponseSchema,
+  IngestSegmentCreateSchema as SourceSegmentCreateSchema,
+  IngestSegmentResponseSchema as SourceSegmentResponseSchema,
+  IngestSessionSegmentsResponseSchema as SourceSessionSegmentsResponseSchema,
+  parseIngestSegmentCreate as parseSourceSegmentCreate,
+  parseIngestSessionSegmentsResponse as parseSourceSessionSegmentsResponse,
+  type IngestSegmentCreate as SourceSegmentCreate,
+} from "@reflection/shared/ingestion";
 import fastify, {
   type FastifyError,
   type FastifyInstance,

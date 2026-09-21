@@ -25,6 +25,11 @@ import {
 } from "../src/clients.js";
 import type { ClaimedJob, Database } from "../src/database.js";
 import { ExtractionEngine } from "../src/extraction.js";
+import type { ExtractionSource } from "../src/ingestion.js";
+import {
+  parseNativeSegmentCreate,
+  nativeSourceFingerprint,
+} from "@reflection/shared/native";
 
 function request(): SegmentCreate {
   return {
@@ -99,10 +104,10 @@ class FakeDatabase {
 class FakeModels {
   contexts: readonly MentionContext[] = [];
   priors: readonly string[] = [];
-  request: SegmentCreate | null = null;
+  request: ExtractionSource | null = null;
 
   async extract(
-    requestValue: SegmentCreate,
+    requestValue: ExtractionSource,
     priorSummaries: readonly string[],
   ): Promise<{ summary: string; claims: ExtractedClaim[] }> {
     this.request = requestValue;
@@ -129,7 +134,7 @@ class FakeModels {
   }
 
   async resolve(
-    requestValue: SegmentCreate,
+    requestValue: ExtractionSource,
     summary: string,
     claims: readonly ExtractedClaim[],
     contexts: readonly MentionContext[],
@@ -186,7 +191,7 @@ class TriagingModels extends FakeModels {
   }
 
   override async resolve(
-    _requestValue: SegmentCreate,
+    _requestValue: ExtractionSource,
     summary: string,
     claims: readonly ExtractedClaim[],
     contexts: readonly MentionContext[],
@@ -225,6 +230,49 @@ class FakeEmbeddings {
 }
 
 describe("ExtractionEngine", () => {
+  test("prepares native spans without manufacturing user boundary fields", async () => {
+    const request = parseNativeSegmentCreate({
+      source_id: "native",
+      session_id: "native-session",
+      source_boundary_version: 3,
+      start_source_message_id: "shell",
+      end_source_message_id: "shell",
+      projection_version: 3,
+      processing_priority: 0,
+      messages: [{ id: "shell", type: "shell", text: "machine output" }],
+    });
+    const job: ClaimedJob = {
+      id: 1,
+      sourceId: request.source_id,
+      segmentId: randomUUID(),
+      leaseId: randomUUID(),
+      sourceGeneration: 1n,
+      sourceFingerprint: nativeSourceFingerprint(request),
+      attempts: 1,
+      request,
+      extractionResult: null,
+    };
+    const models = new FakeModels();
+    const engine = new ExtractionEngine(
+      new FakeDatabase(),
+      asModels(models),
+      new FakeEmbeddings(),
+    );
+    const extracted = await engine.extract(job);
+    const prepared = await engine.resolve(job, extracted);
+    expect(models.request).toBe(job);
+    expect(prepared).toMatchObject({
+      id: job.segmentId,
+      sourceBoundaryVersion: 3,
+      startSourceMessageId: "shell",
+      endSourceMessageId: "shell",
+      projectionVersion: 3,
+    });
+    expect(prepared).not.toHaveProperty("startUserMessageId");
+    expect(prepared).not.toHaveProperty("endUserMessageId");
+    expect(prepared.claims).toHaveLength(2);
+  });
+
   test("resolves occurrences but not literals and includes full claim context", async () => {
     const database = new FakeDatabase();
     const models = new FakeModels();
@@ -240,7 +288,7 @@ describe("ExtractionEngine", () => {
     const extracted = await engine.extract(job);
     const prepared = await engine.resolve(job, extracted);
 
-    expect(models.request).toBe(source);
+    expect(models.request).toBe(job);
     expect(models.priors).toEqual(["prior one", "prior two"]);
     expect(models.contexts.map((context) => context.mentionId)).toEqual([
       "c0.subject",

@@ -10,34 +10,42 @@ import {
   type JobStatus,
   type JobStatusCounts,
   type QueueStatusResponse,
-  type SegmentBoundary,
-  type SegmentCreate,
-  type SegmentSummary,
-  type SegmentTargetBoundary,
-  type SourceBoundary,
 } from "@reflection/shared/contracts";
 import {
   normalizeName,
-  projectionFingerprintForBoundary,
-  sourceFingerprint,
   unionCandidates,
   type ClaimSupport,
   type EntityCandidate,
-  type PreparedSegment,
   type RecallCandidate,
 } from "@reflection/shared/domain";
 import {
-  decodePersistedSegment,
-  parseSourceJobResponse,
-  parseSourceSegmentCreate,
-  parseSourceSegmentResponse,
-  sourceSegmentIdForRequest,
   type SourceInfo,
-  type SourceJobResponse,
-  type SourceSegmentCreate,
-  type SourceSegmentResponse,
   type SourceSession,
 } from "@reflection/shared/sources";
+import {
+  decodePersistedIngestSegment,
+  ownedIngestRequest,
+  parseIngestJobResponse,
+  parseIngestSegmentCreate,
+  parseIngestSegmentResponse,
+  ingestSegmentIdForRequest,
+  ingestSourceFingerprint,
+  ingestProjectionFingerprintForBoundary,
+  type IngestProjectionFingerprintBoundary,
+  type PersistedIngestRequest,
+  type IngestSegmentCreate,
+  type IngestJobResponse,
+  type IngestSegmentResponse,
+  type IngestSessionSegmentsResponse,
+} from "@reflection/shared/ingestion";
+import {
+  persistedBoundary,
+  persistedRequest,
+  type PreparedSegment,
+} from "./ingestion.js";
+type SegmentSummary = IngestSessionSegmentsResponse["segments"][number];
+type SegmentBoundary = IngestSessionSegmentsResponse["boundaries"][number];
+type SegmentTargetBoundary = IngestSessionSegmentsResponse["targets"][number];
 import {
   Client,
   Pool,
@@ -53,6 +61,7 @@ import {
 } from "./extraction-validation.js";
 import {
   OwnershipValidationError,
+  NativeSourceError,
   effectiveOwnerSql,
   effectiveSource,
   listRegisteredSources,
@@ -95,19 +104,29 @@ const COMMITTED_SEGMENT_ELIGIBILITY_SQL = `
       OR (
           t.source_generation = s.source_generation
           AND t.source_fingerprint = s.source_fingerprint
+          AND t.source_fingerprint = reflection_source_fingerprint(
+              ${effectiveOwnerSql("t")}, t.payload->>'session_id',
+              t.payload->>'start_user_message_id', t.end_user_message_id,
+              t.source_boundary_version, t.start_source_message_id,
+              t.end_source_message_id, t.payload)
           AND t.projection_version = s.projection_version
-          AND t.end_user_message_id = s.end_user_message_id
+          AND t.end_user_message_id IS NOT DISTINCT FROM s.end_user_message_id
           AND t.source_boundary_version = s.source_boundary_version
           AND t.start_source_message_id IS NOT DISTINCT FROM s.start_source_message_id
           AND t.end_source_message_id IS NOT DISTINCT FROM s.end_source_message_id
           AND t.payload->>'session_id' = s.session_id
-          AND t.payload->>'start_user_message_id' = s.start_user_message_id
+           AND t.payload->>'start_user_message_id' IS NOT DISTINCT FROM s.start_user_message_id
       )
   )
 `;
 
 const STAGED_TARGET_ELIGIBILITY_SQL = `
   t.extraction_result IS NOT NULL
+  AND t.source_fingerprint = reflection_source_fingerprint(
+      ${effectiveOwnerSql("t")}, t.payload->>'session_id',
+      t.payload->>'start_user_message_id', t.end_user_message_id,
+      t.source_boundary_version, t.start_source_message_id,
+      t.end_source_message_id, t.payload)
   AND t.extraction_validation_version = ${EXTRACTION_VALIDATION_VERSION}
   AND t.extraction_validation_fingerprint =
       reflection_extraction_validation_fingerprint(
@@ -141,7 +160,7 @@ export interface ClaimedJob {
   sourceFingerprint: string;
   attempts: number;
   sourceId: string;
-  request: SegmentCreate;
+  request: PersistedIngestRequest;
   extractionResult: ValidatedExtractionResult | null;
 }
 
@@ -160,13 +179,13 @@ interface LockedFailedJobRow extends QueryResultRow {
   id: PgBigInt;
   segment_id: string;
   session_id: string;
-  start_user_message_id: string;
+  start_user_message_id: string | null;
   status: string;
   lease_id: string | null;
   source_generation: PgBigInt;
   source_fingerprint: string | null;
   projection_version: number;
-  end_user_message_id: string;
+  end_user_message_id: string | null;
   source_boundary_version: number;
   start_source_message_id: string | null;
   end_source_message_id: string | null;
@@ -180,8 +199,8 @@ interface LockedFailedTargetJobContext {
 interface JobResponseRow extends QueryResultRow {
   id: PgBigInt;
   segment_id: string;
-  start_user_message_id: string;
-  end_user_message_id: string;
+  start_user_message_id: string | null;
+  end_user_message_id: string | null;
   source_boundary_version: number;
   start_source_message_id: string | null;
   end_source_message_id: string | null;
@@ -206,13 +225,13 @@ interface EnqueueJobRow extends QueryResultRow {
   source_boundary_version: number;
   start_source_message_id: string | null;
   end_source_message_id: string | null;
-  end_user_message_id: string;
+  end_user_message_id: string | null;
   processing_priority: number;
 }
 
 interface TargetRow extends QueryResultRow {
   job_id: PgBigInt;
-  end_user_message_id: string;
+  end_user_message_id: string | null;
   source_boundary_version: number;
   start_source_message_id: string | null;
   end_source_message_id: string | null;
@@ -229,8 +248,8 @@ interface TargetRow extends QueryResultRow {
 }
 
 interface CurrentSegmentRow extends QueryResultRow {
-  start_user_message_id: string;
-  end_user_message_id: string;
+  start_user_message_id: string | null;
+  end_user_message_id: string | null;
   source_boundary_version: number;
   start_source_message_id: string | null;
   end_source_message_id: string | null;
@@ -245,8 +264,8 @@ interface ClaimedJobRow extends QueryResultRow {
   id: PgBigInt;
   segment_id: string;
   session_id: string;
-  start_user_message_id: string;
-  end_user_message_id: string;
+  start_user_message_id: string | null;
+  end_user_message_id: string | null;
   source_boundary_version: number;
   start_source_message_id: string | null;
   end_source_message_id: string | null;
@@ -439,17 +458,42 @@ function parsedJson(value: unknown): unknown {
 }
 
 function sourceBoundary(value: {
+  start_user_message_id: string | null;
+  end_user_message_id: string | null;
   source_boundary_version: number;
   start_source_message_id: string | null;
   end_source_message_id: string | null;
-}): SourceBoundary {
+}) {
+  if (
+    value.source_boundary_version === 3 &&
+    value.start_user_message_id === null &&
+    value.end_user_message_id === null &&
+    value.start_source_message_id !== null &&
+    value.end_source_message_id !== null
+  ) {
+    return {
+      source_boundary_version: 3 as const,
+      start_source_message_id: value.start_source_message_id,
+      end_source_message_id: value.end_source_message_id,
+    };
+  }
+  if (
+    value.start_user_message_id === null ||
+    value.end_user_message_id === null
+  )
+    throw new Error("legacy boundary is missing user IDs");
+  const users = {
+    start_user_message_id: value.start_user_message_id,
+    end_user_message_id: value.end_user_message_id,
+  };
   if (
     value.source_boundary_version === 1 &&
     value.start_source_message_id === null &&
     value.end_source_message_id === null
   ) {
     return {
-      source_boundary_version: 1,
+      ...users,
+      source_boundary_version: 1 as const,
       start_source_message_id: null,
       end_source_message_id: null,
     };
@@ -460,7 +504,8 @@ function sourceBoundary(value: {
     value.end_source_message_id !== null
   ) {
     return {
-      source_boundary_version: 2,
+      ...users,
+      source_boundary_version: 2 as const,
       start_source_message_id: value.start_source_message_id,
       end_source_message_id: value.end_source_message_id,
     };
@@ -470,15 +515,16 @@ function sourceBoundary(value: {
 
 function boundaryMatchesRequest(
   value: {
-    end_user_message_id: string;
+    end_user_message_id: string | null;
     source_boundary_version: number;
     start_source_message_id: string | null;
     end_source_message_id: string | null;
   },
-  request: SegmentCreate,
+  request: PersistedIngestRequest,
 ): boolean {
   return (
-    value.end_user_message_id === request.end_user_message_id &&
+    value.end_user_message_id ===
+      persistedBoundary(request).end_user_message_id &&
     value.source_boundary_version === request.source_boundary_version &&
     value.start_source_message_id === request.start_source_message_id &&
     value.end_source_message_id === request.end_source_message_id
@@ -488,21 +534,18 @@ function boundaryMatchesRequest(
 function targetRequest(
   target: TargetRow,
   source: SourceInfo,
-): SourceSegmentCreate {
-  return decodePersistedSegment(parsedJson(target.payload), source.id);
+): IngestSegmentCreate {
+  return decodePersistedIngestSegment(parsedJson(target.payload), source.id);
 }
 
-function legacyPayload(value: unknown, sourceId: string): string {
-  const { source_id: _owner, ...request } = decodePersistedSegment(
-    parsedJson(value),
-    sourceId,
-  );
-  return jsonb(request);
+function persistedPayload(value: unknown, sourceId: string): string {
+  const request = decodePersistedIngestSegment(parsedJson(value), sourceId);
+  return jsonb(persistedRequest(request));
 }
 
 function targetMatchesRequest(
   target: TargetRow | undefined,
-  request: SegmentCreate,
+  request: PersistedIngestRequest,
   segmentId: string,
   fingerprint: string,
   source: SourceInfo,
@@ -519,14 +562,16 @@ function targetMatchesRequest(
     const persisted = targetRequest(target, source);
     return (
       persisted.session_id === request.session_id &&
-      persisted.start_user_message_id === request.start_user_message_id &&
-      persisted.end_user_message_id === request.end_user_message_id &&
+      persistedBoundary(persisted).start_user_message_id ===
+        persistedBoundary(request).start_user_message_id &&
+      persistedBoundary(persisted).end_user_message_id ===
+        persistedBoundary(request).end_user_message_id &&
       persisted.source_boundary_version === request.source_boundary_version &&
       persisted.start_source_message_id === request.start_source_message_id &&
       persisted.end_source_message_id === request.end_source_message_id &&
       persisted.projection_version === request.projection_version &&
-      sourceSegmentIdForRequest(persisted, source) === segmentId &&
-      sourceFingerprint(persisted) === fingerprint
+      ingestSegmentIdForRequest(persisted, source) === segmentId &&
+      ingestSourceFingerprint(persisted) === fingerprint
     );
   } catch {
     return false;
@@ -547,7 +592,7 @@ export function failedTargetMatchesJob(
   ) {
     return false;
   }
-  let targetSource: SourceSegmentCreate;
+  let targetSource: IngestSegmentCreate;
   try {
     targetSource = targetRequest(target, source);
   } catch {
@@ -558,9 +603,10 @@ export function failedTargetMatchesJob(
     boundaryMatchesRequest(job, targetSource) &&
     targetSource.projection_version === job.projection_version &&
     targetSource.session_id === job.session_id &&
-    targetSource.start_user_message_id === job.start_user_message_id &&
-    sourceSegmentIdForRequest(targetSource, source) === job.segment_id &&
-    sourceFingerprint(targetSource) === job.source_fingerprint
+    persistedBoundary(targetSource).start_user_message_id ===
+      job.start_user_message_id &&
+    ingestSegmentIdForRequest(targetSource, source) === job.segment_id &&
+    ingestSourceFingerprint(targetSource) === job.source_fingerprint
   );
 }
 
@@ -591,8 +637,8 @@ function targetMatchesJob(
 function persistedJobMatchesClaim(
   value: {
     session_id: string;
-    start_user_message_id: string;
-    end_user_message_id: string;
+    start_user_message_id: string | null;
+    end_user_message_id: string | null;
     source_boundary_version: number;
     start_source_message_id: string | null;
     end_source_message_id: string | null;
@@ -604,7 +650,8 @@ function persistedJobMatchesClaim(
 ): boolean {
   return (
     value.session_id === job.request.session_id &&
-    value.start_user_message_id === job.request.start_user_message_id &&
+    value.start_user_message_id ===
+      persistedBoundary(job.request).start_user_message_id &&
     boundaryMatchesRequest(value, job.request) &&
     value.projection_version === job.request.projection_version &&
     sameBigInt(value.source_generation, job.sourceGeneration) &&
@@ -613,20 +660,20 @@ function persistedJobMatchesClaim(
 }
 
 function projectionBoundary(value: {
-  sourceBoundaryVersion: 1 | 2;
-  endUserMessageId: string;
+  sourceBoundaryVersion: 1 | 2 | 3;
+  endUserMessageId?: string | null;
   endSourceMessageId: string | null;
-}):
-  | {
-      sourceBoundaryVersion: 1;
-      endUserMessageId: string;
-      endSourceMessageId: null;
-    }
-  | {
-      sourceBoundaryVersion: 2;
-      endUserMessageId: string;
-      endSourceMessageId: string;
-    } {
+}): IngestProjectionFingerprintBoundary {
+  if (value.sourceBoundaryVersion === 3) {
+    if (value.endSourceMessageId === null || value.endUserMessageId != null)
+      throw new Error("invalid native projection boundary");
+    return {
+      source_boundary_version: 3,
+      end_source_message_id: value.endSourceMessageId,
+    };
+  }
+  if (value.endUserMessageId == null)
+    throw new Error("legacy projection missing user boundary");
   if (value.sourceBoundaryVersion === 1) {
     if (value.endSourceMessageId !== null) {
       throw new Error("V1 projection boundary contains a source cursor");
@@ -718,6 +765,18 @@ export class Database {
     await this.applyMigrations(this.#settings.migrationsDir);
     for (const [name, table, columns, version] of [
       [
+        "segments_source_v3_start_key",
+        "segments",
+        "source_id, session_id, start_source_message_id",
+        3,
+      ],
+      [
+        "extraction_jobs_source_v3_boundary_key",
+        "extraction_jobs",
+        "source_id, session_id, start_source_message_id, end_source_message_id",
+        3,
+      ],
+      [
         "segments_source_v1_start_key",
         "segments",
         "source_id, session_id, start_user_message_id",
@@ -763,6 +822,21 @@ export class Database {
           "source indexes are not ready; run scripts/source-ownership.mjs install-indexes before startup",
         );
       }
+    }
+    const boundaryChecks = await this.pool.query(`
+      SELECT convalidated FROM pg_constraint WHERE contype = 'c'
+      AND (conrelid, conname) IN (
+        ('segments'::regclass, 'segments_source_boundary_check'),
+        ('extraction_jobs'::regclass, 'extraction_jobs_source_boundary_check'),
+        ('segment_targets'::regclass, 'segment_targets_source_boundary_check'))
+    `);
+    if (
+      boundaryChecks.rows.length !== 3 ||
+      boundaryChecks.rows.some((row) => !row.convalidated)
+    ) {
+      throw new Error(
+        "source boundary checks are not validated; run scripts/source-ownership.mjs install-indexes before startup",
+      );
     }
     const oldIndexes = await this.pool
       .query(`SELECT 1 FROM pg_class WHERE oid IN (
@@ -1070,10 +1144,10 @@ export class Database {
     job: ClaimedJob,
   ): Promise<SourceInfo> {
     const source = await registeredSource(connection, job.sourceId);
-    const request = decodePersistedSegment(job.request, source.id);
+    const request = ownedIngestRequest(job.request, source.id);
     if (
-      sourceSegmentIdForRequest(request, source) !== job.segmentId ||
-      sourceFingerprint(request) !== job.sourceFingerprint
+      ingestSegmentIdForRequest(request, source) !== job.segmentId ||
+      ingestSourceFingerprint(request) !== job.sourceFingerprint
     ) {
       throw new Error("claimed source identity mismatch");
     }
@@ -1114,14 +1188,20 @@ export class Database {
     );
   }
 
-  async enqueue(request: SourceSegmentCreate): Promise<SourceJobResponse> {
-    request = parseSourceSegmentCreate(request);
+  async enqueue(request: IngestSegmentCreate): Promise<IngestJobResponse> {
+    request = parseIngestSegmentCreate(request);
     return this.#withTransaction(async (connection) => {
       const source = await registeredSource(connection, request.source_id);
-      const segmentId = sourceSegmentIdForRequest(request, source);
-      const fingerprint = sourceFingerprint(request);
-      const { source_id: _sourceId, ...legacyRequest } = request;
-      const payload = jsonb(legacyRequest);
+      if (
+        request.source_boundary_version === 3 &&
+        (source.kind !== "opencode-v2" ||
+          source.identity_scheme !== "source-v1")
+      )
+        throw new NativeSourceError();
+      const segmentId = ingestSegmentIdForRequest(request, source);
+      const fingerprint = ingestSourceFingerprint(request);
+      const payloadRequest = persistedRequest(request);
+      const payload = jsonb(payloadRequest);
 
       await Database.#lockSegment(connection, segmentId);
       await validateSegmentOwnership(connection, segmentId, source);
@@ -1229,8 +1309,8 @@ export class Database {
                 source.id,
                 segmentId,
                 request.session_id,
-                request.start_user_message_id,
-                request.end_user_message_id,
+                persistedBoundary(request).start_user_message_id,
+                persistedBoundary(request).end_user_message_id,
                 request.source_boundary_version,
                 request.start_source_message_id,
                 request.end_source_message_id,
@@ -1268,7 +1348,7 @@ export class Database {
           request.processing_priority,
         );
         const exactPayload = jsonb({
-          ...legacyRequest,
+          ...payloadRequest,
           processing_priority: priority,
         });
         await connection.query(
@@ -1293,8 +1373,10 @@ export class Database {
         await connection.query(
           `
            UPDATE extraction_jobs
-           SET payload = $1::jsonb,
-               processing_priority = $2,
+           SET payload = CASE WHEN status = 'running'
+                   THEN payload ELSE $1::jsonb END,
+               processing_priority = CASE WHEN status = 'running'
+                   THEN processing_priority ELSE $2 END,
                status = CASE WHEN $3 THEN 'pending' ELSE status END,
                attempts = CASE WHEN $3 THEN 0 ELSE attempts END,
                error = CASE WHEN $3 THEN NULL ELSE error END,
@@ -1317,7 +1399,7 @@ export class Database {
         currentSegment !== undefined &&
         target === undefined &&
         currentSegment.start_user_message_id ===
-          request.start_user_message_id &&
+          persistedBoundary(request).start_user_message_id &&
         boundaryMatchesRequest(currentSegment, request) &&
         currentSegment.source_fingerprint === fingerprint &&
         currentSegment.projection_version === request.projection_version &&
@@ -1348,8 +1430,8 @@ export class Database {
                 source.id,
                 segmentId,
                 request.session_id,
-                request.start_user_message_id,
-                request.end_user_message_id,
+                persistedBoundary(request).start_user_message_id,
+                persistedBoundary(request).end_user_message_id,
                 request.source_boundary_version,
                 request.start_source_message_id,
                 request.end_source_message_id,
@@ -1380,7 +1462,7 @@ export class Database {
             WHERE id = $9 AND status <> 'running'
             `,
             [
-              request.end_user_message_id,
+              persistedBoundary(request).end_user_message_id,
               request.source_boundary_version,
               request.start_source_message_id,
               request.end_source_message_id,
@@ -1422,7 +1504,7 @@ export class Database {
           ON CONFLICT ${
             request.source_boundary_version === 1
               ? "(source_id, session_id, start_user_message_id, end_user_message_id) WHERE source_boundary_version = 1"
-              : "(source_id, session_id, start_source_message_id, end_source_message_id) WHERE source_boundary_version = 2"
+              : `(source_id, session_id, start_source_message_id, end_source_message_id) WHERE source_boundary_version = ${request.source_boundary_version}`
           }
           DO UPDATE SET
               segment_id = EXCLUDED.segment_id,
@@ -1447,8 +1529,8 @@ export class Database {
             source.id,
             segmentId,
             request.session_id,
-            request.start_user_message_id,
-            request.end_user_message_id,
+            persistedBoundary(request).start_user_message_id,
+            persistedBoundary(request).end_user_message_id,
             request.source_boundary_version,
             request.start_source_message_id,
             request.end_source_message_id,
@@ -1498,7 +1580,7 @@ export class Database {
           source.id,
           segmentId,
           jobId,
-          request.end_user_message_id,
+          persistedBoundary(request).end_user_message_id,
           request.source_boundary_version,
           request.start_source_message_id,
           request.end_source_message_id,
@@ -1539,7 +1621,7 @@ export class Database {
   async getJob(
     sourceId: string,
     requestedJobId: number,
-  ): Promise<SourceJobResponse | null> {
+  ): Promise<IngestJobResponse | null> {
     return this.#withConnection(async (connection) => {
       const source = await registeredSource(connection, sourceId);
       const row = await Database.#jobRow(connection, requestedJobId, source);
@@ -1619,7 +1701,7 @@ export class Database {
     sourceId: string,
     jobId: number,
     options: RetryFailedJobOptions = {},
-  ): Promise<SourceJobResponse | null> {
+  ): Promise<IngestJobResponse | null> {
     return this.#withTransaction(async (connection) => {
       const source = await registeredSource(connection, sourceId);
       const context = await Database.#lockCurrentFailedTargetJob(
@@ -1662,7 +1744,7 @@ export class Database {
           target.start_source_message_id,
           target.end_source_message_id,
           target.projection_version,
-          legacyPayload(target.payload, source.id),
+          persistedPayload(target.payload, source.id),
           target.source_generation,
           target.source_fingerprint,
           target.processing_priority,
@@ -1681,7 +1763,7 @@ export class Database {
   async supersedeFailedJob(
     sourceId: string,
     jobId: number,
-  ): Promise<SourceJobResponse | null> {
+  ): Promise<IngestJobResponse | null> {
     return this.#withTransaction(async (connection) => {
       const source = await registeredSource(connection, sourceId);
       const context = await Database.#lockCurrentFailedTargetJob(
@@ -1775,7 +1857,7 @@ export class Database {
                    targets.start_source_message_id AS target_start_source_message_id,
                    targets.end_source_message_id AS target_end_source_message_id,
                    targets.projection_version AS target_projection_version,
-                    targets.payload - 'source_id' AS target_payload,
+                     CASE WHEN targets.source_boundary_version = 3 THEN targets.payload ELSE targets.payload - 'source_id' END AS target_payload,
                    targets.source_generation AS target_generation,
                    targets.source_fingerprint AS target_fingerprint,
                    targets.processing_priority AS target_processing_priority
@@ -1838,7 +1920,7 @@ export class Database {
                      OR classified.target_fingerprint
                         IS DISTINCT FROM jobs.source_fingerprint
                       OR classified.target_projection_version <> jobs.projection_version
-                      OR classified.target_end_user_message_id <> jobs.end_user_message_id
+                      OR classified.target_end_user_message_id IS DISTINCT FROM jobs.end_user_message_id
                       OR classified.target_source_boundary_version
                          <> jobs.source_boundary_version
                       OR classified.target_start_source_message_id
@@ -1900,7 +1982,7 @@ export class Database {
                AND targets.source_generation = jobs.source_generation
                AND targets.source_fingerprint = jobs.source_fingerprint
                AND targets.projection_version = jobs.projection_version
-               AND targets.end_user_message_id = jobs.end_user_message_id
+               AND targets.end_user_message_id IS NOT DISTINCT FROM jobs.end_user_message_id
                AND targets.source_boundary_version = jobs.source_boundary_version
                AND targets.start_source_message_id
                    IS NOT DISTINCT FROM jobs.start_source_message_id
@@ -1937,7 +2019,12 @@ export class Database {
                  jobs.end_source_message_id, jobs.projection_version,
                  jobs.payload, jobs.source_generation, jobs.source_fingerprint,
                  CASE
-                     WHEN targets.extraction_result IS NOT NULL
+                      WHEN targets.extraction_result IS NOT NULL
+                       AND targets.source_fingerprint = reflection_source_fingerprint(
+                           ${effectiveOwnerSql("targets")}, targets.payload->>'session_id',
+                           targets.payload->>'start_user_message_id', targets.end_user_message_id,
+                           targets.source_boundary_version, targets.start_source_message_id,
+                           targets.end_source_message_id, targets.payload)
                       AND ${summaryHasContentSql(
                         "targets.extraction_result->>'summary'",
                       )}
@@ -1970,7 +2057,7 @@ export class Database {
            AND targets.source_generation = jobs.source_generation
            AND targets.source_fingerprint = jobs.source_fingerprint
            AND targets.projection_version = jobs.projection_version
-           AND targets.end_user_message_id = jobs.end_user_message_id
+           AND targets.end_user_message_id IS NOT DISTINCT FROM jobs.end_user_message_id
            AND targets.source_boundary_version = jobs.source_boundary_version
            AND targets.start_source_message_id
                IS NOT DISTINCT FROM jobs.start_source_message_id
@@ -2027,9 +2114,9 @@ export class Database {
       }
       const payload = parsedJson(pending.payload);
 
-      let request: SourceSegmentCreate;
+      let request: IngestSegmentCreate;
       try {
-        request = decodePersistedSegment(payload, source.id);
+        request = decodePersistedIngestSegment(payload, source.id);
       } catch (error) {
         const persistedError = truncateCodePoints(
           `invalid persisted payload: ${errorMessage(error)}`,
@@ -2049,16 +2136,18 @@ export class Database {
       const persistedFingerprint = pending.source_fingerprint;
       if (
         request.session_id !== pending.session_id ||
-        request.start_user_message_id !== pending.start_user_message_id ||
-        request.end_user_message_id !== pending.end_user_message_id ||
+        persistedBoundary(request).start_user_message_id !==
+          pending.start_user_message_id ||
+        persistedBoundary(request).end_user_message_id !==
+          pending.end_user_message_id ||
         request.source_boundary_version !== pending.source_boundary_version ||
         request.start_source_message_id !== pending.start_source_message_id ||
         request.end_source_message_id !== pending.end_source_message_id ||
         request.projection_version !== pending.projection_version ||
         request.processing_priority !== pending.processing_priority ||
-        sourceSegmentIdForRequest(request, source) !== pending.segment_id ||
+        ingestSegmentIdForRequest(request, source) !== pending.segment_id ||
         persistedFingerprint === null ||
-        sourceFingerprint(request) !== persistedFingerprint
+        ingestSourceFingerprint(request) !== persistedFingerprint
       ) {
         await connection.query(
           `
@@ -2111,7 +2200,7 @@ export class Database {
         )
       ).rows[0];
       if (claimed === undefined) throw new Error("claimed job disappeared");
-      const { source_id: _owner, ...legacyRequest } = request;
+      const payloadRequest = persistedRequest(request);
       return {
         id: checkedBigIntToNumber(pending.id, "job id"),
         segmentId: pending.segment_id,
@@ -2123,7 +2212,7 @@ export class Database {
         sourceFingerprint: persistedFingerprint,
         attempts: claimed.attempts,
         sourceId: source.id,
-        request: legacyRequest,
+        request: payloadRequest,
         extractionResult,
       };
     });
@@ -2156,11 +2245,11 @@ export class Database {
             status: string;
             lease_id: string | null;
             session_id: string;
-            start_user_message_id: string;
+            start_user_message_id: string | null;
             source_generation: PgBigInt;
             source_fingerprint: string | null;
             projection_version: number;
-            end_user_message_id: string;
+            end_user_message_id: string | null;
             source_boundary_version: number;
             start_source_message_id: string | null;
             end_source_message_id: string | null;
@@ -2236,7 +2325,7 @@ export class Database {
             AND s.id = t.segment_id
             AND s.source_generation = t.source_generation
             AND s.source_fingerprint = t.source_fingerprint
-            AND s.end_user_message_id = t.end_user_message_id
+            AND s.end_user_message_id IS NOT DISTINCT FROM t.end_user_message_id
             AND s.source_boundary_version = t.source_boundary_version
             AND s.start_source_message_id IS NOT DISTINCT FROM t.start_source_message_id
             AND s.end_source_message_id IS NOT DISTINCT FROM t.end_source_message_id
@@ -2298,7 +2387,7 @@ export class Database {
           target.start_source_message_id,
           target.end_source_message_id,
           target.projection_version,
-          legacyPayload(target.payload, job.sourceId),
+          persistedPayload(target.payload, job.sourceId),
           target.source_generation,
           target.source_fingerprint,
           target.processing_priority,
@@ -2343,7 +2432,7 @@ export class Database {
         target.start_source_message_id,
         target.end_source_message_id,
         target.projection_version,
-        legacyPayload(target.payload, job.sourceId),
+        persistedPayload(target.payload, job.sourceId),
         target.source_generation,
         target.source_fingerprint,
         target.processing_priority,
@@ -2357,11 +2446,11 @@ export class Database {
     result: ValidatedExtractionResult,
   ): Promise<boolean> {
     const extractionResult = extractionResultForPersistence(result);
-    const summaryFingerprint = projectionFingerprintForBoundary(
+    const summaryFingerprint = ingestProjectionFingerprintForBoundary(
       job.segmentId,
       projectionBoundary({
         sourceBoundaryVersion: job.request.source_boundary_version,
-        endUserMessageId: job.request.end_user_message_id,
+        endUserMessageId: persistedBoundary(job.request).end_user_message_id,
         endSourceMessageId: job.request.end_source_message_id,
       }),
       extractionResult.summary,
@@ -2377,11 +2466,11 @@ export class Database {
             status: string;
             lease_id: string | null;
             session_id: string;
-            start_user_message_id: string;
+            start_user_message_id: string | null;
             source_generation: PgBigInt;
             source_fingerprint: string | null;
             projection_version: number;
-            end_user_message_id: string;
+            end_user_message_id: string | null;
             source_boundary_version: number;
             start_source_message_id: string | null;
             end_source_message_id: string | null;
@@ -2446,7 +2535,7 @@ export class Database {
         WHERE segment_id = $3 AND job_id = $4
           AND source_generation = $5 AND source_fingerprint = $6
           AND projection_version = $7
-          AND end_user_message_id = $8
+          AND end_user_message_id IS NOT DISTINCT FROM $8
           AND source_boundary_version = $9
           AND start_source_message_id IS NOT DISTINCT FROM $10
           AND end_source_message_id IS NOT DISTINCT FROM $11
@@ -2459,7 +2548,7 @@ export class Database {
           job.sourceGeneration,
           job.sourceFingerprint,
           job.request.projection_version,
-          job.request.end_user_message_id,
+          persistedBoundary(job.request).end_user_message_id,
           job.request.source_boundary_version,
           job.request.start_source_message_id,
           job.request.end_source_message_id,
@@ -2589,8 +2678,14 @@ export class Database {
     if (
       prepared.id !== job.segmentId ||
       prepared.sessionId !== job.request.session_id ||
-      prepared.startUserMessageId !== job.request.start_user_message_id ||
-      prepared.endUserMessageId !== job.request.end_user_message_id ||
+      (prepared.sourceBoundaryVersion === 3
+        ? null
+        : prepared.startUserMessageId) !==
+        persistedBoundary(job.request).start_user_message_id ||
+      (prepared.sourceBoundaryVersion === 3
+        ? null
+        : prepared.endUserMessageId) !==
+        persistedBoundary(job.request).end_user_message_id ||
       prepared.sourceBoundaryVersion !== job.request.source_boundary_version ||
       prepared.startSourceMessageId !== job.request.start_source_message_id ||
       prepared.endSourceMessageId !== job.request.end_source_message_id ||
@@ -2599,7 +2694,7 @@ export class Database {
     ) {
       throw new Error("prepared resolution does not match its claimed source");
     }
-    const projectionCommitFingerprint = projectionFingerprintForBoundary(
+    const projectionCommitFingerprint = ingestProjectionFingerprintForBoundary(
       prepared.id,
       projectionBoundary(prepared),
       extractionResult.summary,
@@ -2615,11 +2710,11 @@ export class Database {
             status: string;
             lease_id: string | null;
             session_id: string;
-            start_user_message_id: string;
+            start_user_message_id: string | null;
             source_generation: PgBigInt;
             source_fingerprint: string | null;
             projection_version: number;
-            end_user_message_id: string;
+            end_user_message_id: string | null;
             source_boundary_version: number;
             start_source_message_id: string | null;
             end_source_message_id: string | null;
@@ -2711,7 +2806,7 @@ export class Database {
           DELETE FROM segment_targets
           WHERE segment_id = $1 AND job_id = $2 AND source_generation = $3
             AND source_fingerprint = $4 AND projection_version = $5
-            AND end_user_message_id = $6 AND source_boundary_version = $7
+            AND end_user_message_id IS NOT DISTINCT FROM $6 AND source_boundary_version = $7
             AND start_source_message_id IS NOT DISTINCT FROM $8
              AND end_source_message_id IS NOT DISTINCT FROM $9
              AND extraction_result = $10::jsonb
@@ -2730,7 +2825,7 @@ export class Database {
             job.sourceGeneration,
             job.sourceFingerprint,
             job.request.projection_version,
-            job.request.end_user_message_id,
+            persistedBoundary(job.request).end_user_message_id,
             job.request.source_boundary_version,
             job.request.start_source_message_id,
             job.request.end_source_message_id,
@@ -2819,8 +2914,12 @@ export class Database {
         [
           prepared.id,
           prepared.sessionId,
-          prepared.startUserMessageId,
-          prepared.endUserMessageId,
+          prepared.sourceBoundaryVersion === 3
+            ? null
+            : prepared.startUserMessageId,
+          prepared.sourceBoundaryVersion === 3
+            ? null
+            : prepared.endUserMessageId,
           prepared.sourceBoundaryVersion,
           prepared.startSourceMessageId,
           prepared.endSourceMessageId,
@@ -2882,7 +2981,7 @@ export class Database {
             error = NULL, finished_at = now()
         WHERE id = $1 AND status = 'running' AND lease_id = $2
           AND source_generation = $3 AND source_fingerprint = $4
-          AND projection_version = $5 AND end_user_message_id = $6
+          AND projection_version = $5 AND end_user_message_id IS NOT DISTINCT FROM $6
           AND source_boundary_version = $7
           AND start_source_message_id IS NOT DISTINCT FROM $8
           AND end_source_message_id IS NOT DISTINCT FROM $9
@@ -2893,7 +2992,7 @@ export class Database {
           job.sourceGeneration,
           job.sourceFingerprint,
           job.request.projection_version,
-          job.request.end_user_message_id,
+          persistedBoundary(job.request).end_user_message_id,
           job.request.source_boundary_version,
           job.request.start_source_message_id,
           job.request.end_source_message_id,
@@ -2907,7 +3006,7 @@ export class Database {
         DELETE FROM segment_targets
         WHERE segment_id = $1 AND job_id = $2 AND source_generation = $3
           AND source_fingerprint = $4
-          AND projection_version = $5 AND end_user_message_id = $6
+          AND projection_version = $5 AND end_user_message_id IS NOT DISTINCT FROM $6
           AND source_boundary_version = $7
           AND start_source_message_id IS NOT DISTINCT FROM $8
            AND end_source_message_id IS NOT DISTINCT FROM $9
@@ -2927,7 +3026,7 @@ export class Database {
           job.sourceGeneration,
           job.sourceFingerprint,
           job.request.projection_version,
-          job.request.end_user_message_id,
+          persistedBoundary(job.request).end_user_message_id,
           job.request.source_boundary_version,
           job.request.start_source_message_id,
           job.request.end_source_message_id,
@@ -2945,7 +3044,7 @@ export class Database {
   async getSegment(
     sourceId: string,
     segmentId: string,
-  ): Promise<SourceSegmentResponse | null> {
+  ): Promise<IngestSegmentResponse | null> {
     return this.#withConnection(async (connection) => {
       const source = await registeredSource(connection, sourceId);
       const segment = (
@@ -2953,8 +3052,8 @@ export class Database {
           QueryResultRow & {
             id: string;
             session_id: string;
-            start_user_message_id: string;
-            end_user_message_id: string;
+            start_user_message_id: string | null;
+            end_user_message_id: string | null;
             source_boundary_version: number;
             start_source_message_id: string | null;
             end_source_message_id: string | null;
@@ -3002,8 +3101,6 @@ export class Database {
         ...sourceBoundary(segment),
         id: segment.id,
         session_id: segment.session_id,
-        start_user_message_id: segment.start_user_message_id,
-        end_user_message_id: segment.end_user_message_id,
         summary: segment.summary,
         claims: claims.map((claim) =>
           validateClaimObject({
@@ -3019,7 +3116,7 @@ export class Database {
         created_at: timestamp(segment.created_at),
         updated_at: timestamp(segment.updated_at),
       };
-      return parseSourceSegmentResponse(
+      return parseIngestSegmentResponse(
         { ...response, source_id: source.id },
         source.id,
       );
@@ -3049,7 +3146,7 @@ export class Database {
             row_kind: "committed" | "target";
             id: string;
             start_user_message_id: string | null;
-            end_user_message_id: string;
+            end_user_message_id: string | null;
             source_boundary_version: number;
             start_source_message_id: string | null;
             end_source_message_id: string | null;
@@ -3127,15 +3224,16 @@ export class Database {
     const targets: SegmentTargetBoundary[] = [];
     for (const row of rows) {
       if (row.row_kind === "committed") {
-        if (row.start_user_message_id === null) {
+        if (
+          row.source_boundary_version !== 3 &&
+          row.start_user_message_id === null
+        ) {
           throw new Error("committed segment is missing start_user_message_id");
         }
         const boundary = sourceBoundary(row);
         boundaries.push({
           ...boundary,
           id: row.id,
-          start_user_message_id: row.start_user_message_id,
-          end_user_message_id: row.end_user_message_id,
           projection_version: row.projection_version,
           source_eligible: row.source_eligible,
           source_fingerprint: row.source_fingerprint,
@@ -3148,8 +3246,6 @@ export class Database {
             summary: {
               ...boundary,
               id: row.id,
-              start_user_message_id: row.start_user_message_id,
-              end_user_message_id: row.end_user_message_id,
               projection_version: row.projection_version,
               summary: row.summary,
             },
@@ -3158,26 +3254,29 @@ export class Database {
         }
       } else {
         if (
-          row.start_user_message_id === null ||
+          (row.source_boundary_version !== 3 &&
+            row.start_user_message_id === null) ||
           row.status === null ||
           row.source_fingerprint === null
         ) {
           throw new Error("target boundary has invalid persisted data");
         }
-        const request = decodePersistedSegment(
+        const request = decodePersistedIngestSegment(
           parsedJson(row.payload),
           source.id,
         );
         if (
           request.session_id !== sessionId ||
-          request.start_user_message_id !== row.start_user_message_id ||
-          request.end_user_message_id !== row.end_user_message_id ||
+          persistedBoundary(request).start_user_message_id !==
+            row.start_user_message_id ||
+          persistedBoundary(request).end_user_message_id !==
+            row.end_user_message_id ||
           request.source_boundary_version !== row.source_boundary_version ||
           request.start_source_message_id !== row.start_source_message_id ||
           request.end_source_message_id !== row.end_source_message_id ||
           request.projection_version !== row.projection_version ||
-          sourceSegmentIdForRequest(request, source) !== row.id ||
-          sourceFingerprint(request) !== row.source_fingerprint
+          ingestSegmentIdForRequest(request, source) !== row.id ||
+          ingestSourceFingerprint(request) !== row.source_fingerprint
         ) {
           throw new Error("target boundary has mismatched persisted data");
         }
@@ -3185,8 +3284,6 @@ export class Database {
         targets.push({
           ...boundary,
           id: row.id,
-          start_user_message_id: row.start_user_message_id,
-          end_user_message_id: row.end_user_message_id,
           projection_version: row.projection_version,
           status: asJobStatus(row.status),
           source_fingerprint: row.source_fingerprint,
@@ -3200,8 +3297,6 @@ export class Database {
               summary: {
                 ...boundary,
                 id: row.id,
-                start_user_message_id: row.start_user_message_id,
-                end_user_message_id: row.end_user_message_id,
                 projection_version: row.projection_version,
                 summary: extraction.summary,
               },
@@ -3365,13 +3460,11 @@ export class Database {
   static #jobResponse(
     row: JobResponseRow,
     source: SourceInfo,
-  ): SourceJobResponse {
+  ): IngestJobResponse {
     const response = {
       ...sourceBoundary(row),
       id: checkedBigIntToNumber(row.id, "job id"),
       segment_id: row.segment_id,
-      start_user_message_id: row.start_user_message_id,
-      end_user_message_id: row.end_user_message_id,
       source_fingerprint: row.source_fingerprint,
       projection_version: row.projection_version,
       status: asJobStatus(row.status),
@@ -3382,7 +3475,7 @@ export class Database {
       finished_at: nullableTimestamp(row.finished_at),
       next_attempt_at: timestamp(row.next_attempt_at),
     };
-    return parseSourceJobResponse(
+    return parseIngestJobResponse(
       { ...response, source_id: source.id },
       source.id,
     );

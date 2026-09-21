@@ -1,0 +1,18 @@
+{
+  "name": "@reflection/opencode-v2-core",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    "./history": "./src/history.ts",
+    "./segmentation": "./src/segmentation.ts",
+    "./projection": "./src/projection.ts"
+  },
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@reflection/shared": "workspace:*"
+  }
+}

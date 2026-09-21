@@ -12,6 +12,7 @@
     "verify:bundle": "node scripts/verify-bundle.mjs"
   },
   "dependencies": {
+    "@reflection/opencode-v2-core": "workspace:*",
     "@reflection/shared": "workspace:*",
     "@opencode-ai/plugin": "1.18.15"
   },

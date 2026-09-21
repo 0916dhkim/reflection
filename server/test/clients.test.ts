@@ -33,6 +33,7 @@ import {
 } from "../src/clients.js";
 import type { Settings } from "../src/config.js";
 import { EXTRACTION_VALIDATION_VERSION } from "../src/extraction-validation.js";
+import { parseNativeSegmentCreate } from "@reflection/shared/native";
 
 const silentLogger: ClientLogger = {
   info: vi.fn(),
@@ -86,6 +87,55 @@ function segmentRequest(text = "Reflection uses PostgreSQL."): SegmentCreate {
     messages: [{ role: "user", text }],
   };
 }
+
+function extractionSource(request: SegmentCreate) {
+  return { segmentId: segmentIdForRequest(request), request };
+}
+
+test("model prompts use the actual owned segment ID and preserve native event types", async () => {
+  const calls: Record<string, unknown>[] = [];
+  const fetcher: FetchLike = async (_url, init) => {
+    calls.push(requestJson(init));
+    return modelResponse(
+      calls.length === 2
+        ? { claims: [], resolutions: [] }
+        : { summary: "Summary", claims: [] },
+    );
+  };
+  const client = new ModelClient(settings(), fetcher, silentLogger);
+  const request = parseNativeSegmentCreate({
+    source_id: "native",
+    session_id: "session",
+    source_boundary_version: 3,
+    start_source_message_id: "m0",
+    end_source_message_id: "m2",
+    projection_version: 3,
+    processing_priority: 0,
+    messages: [
+      { id: "m0", type: "system", text: "system event" },
+      { id: "m1", type: "synthetic", text: "not a user" },
+      { id: "m2", type: "shell", text: "shell output" },
+    ],
+  });
+  const segmentId = randomUUID();
+  await client.extract({ segmentId, request }, []);
+  await client.resolve({ segmentId, request }, "Summary", [], []);
+  await client.extract({ segmentId, request: segmentRequest() }, []);
+  for (const [index, call] of calls.entries()) {
+    const messages = call.messages as Array<{ role: string; content: string }>;
+    const prompt = JSON.parse(messages[2]!.content);
+    expect(prompt.source_context.segment_id).toBe(segmentId);
+    if (index < 2) {
+      expect(prompt.source_messages).toEqual(request.messages);
+      expect(prompt.source_context).not.toHaveProperty("start_user_message_id");
+      expect(prompt.source_context).not.toHaveProperty("end_user_message_id");
+      expect(messages[0]!.content).toContain("NOT user assertions");
+    } else {
+      expect(prompt.source_messages).toEqual(segmentRequest().messages);
+      expect(prompt.source_context.start_user_message_id).toBe("start");
+    }
+  }
+});
 
 function modelResponse(value: unknown, trailing = ""): Response {
   return Response.json({
@@ -389,9 +439,9 @@ describe("ModelClient", () => {
       silentLogger,
     );
 
-    await expect(client.extract(segmentRequest(), [])).rejects.toThrow(
-      "402 Payment Required",
-    );
+    await expect(
+      client.extract(extractionSource(segmentRequest()), []),
+    ).rejects.toThrow("402 Payment Required");
   });
 
   test("uses strict extraction schema, pinned provider, and all prior summaries", async () => {
@@ -418,7 +468,7 @@ describe("ModelClient", () => {
       settings(),
       fetcher,
       silentLogger,
-    ).extract(segmentRequest(), ["first", "second", "third"]);
+    ).extract(extractionSource(segmentRequest()), ["first", "second", "third"]);
 
     expect(capturedUrl).toBe("https://openrouter.example/v1/chat/completions");
     expect(new Headers(capturedInit?.headers).get("Authorization")).toBe(
@@ -535,7 +585,7 @@ describe("ModelClient", () => {
       settings({ extractionProvider: "azure-eastus" }),
       fetcher,
       silentLogger,
-    ).extract(segmentRequest("source"), []);
+    ).extract(extractionSource(segmentRequest("source")), []);
 
     expect(captured.max_completion_tokens).toBe(16_384);
     expect(captured).not.toHaveProperty("max_tokens");
@@ -566,8 +616,10 @@ describe("ModelClient", () => {
 
     await expect(
       new ModelClient(settings(), fetcher, silentLogger).extract(
-        segmentRequest(
-          "Reflection has HTTPServerURL PostgreSQL and stores literal whitespace.",
+        extractionSource(
+          segmentRequest(
+            "Reflection has HTTPServerURL PostgreSQL and stores literal whitespace.",
+          ),
         ),
         [],
       ),
@@ -652,7 +704,7 @@ describe("ModelClient", () => {
 
     await expect(
       new ModelClient(settings(), fetcher, logger).extract(
-        segmentRequest(),
+        extractionSource(segmentRequest()),
         [],
       ),
     ).resolves.toEqual({
@@ -718,7 +770,7 @@ describe("ModelClient", () => {
 
     await expect(
       new ModelClient(settings(), fetcher, silentLogger).extract(
-        segmentRequest("uses_ModelClient"),
+        extractionSource(segmentRequest("uses_ModelClient")),
         [],
       ),
     ).resolves.toMatchObject({
@@ -743,7 +795,7 @@ describe("ModelClient", () => {
 
     await expect(
       new ModelClient(settings(), fetcher, silentLogger).extract(
-        segmentRequest("is_C++_compatible"),
+        extractionSource(segmentRequest("is_C++_compatible")),
         [],
       ),
     ).resolves.toMatchObject({
@@ -784,7 +836,7 @@ describe("ModelClient", () => {
 
       await expect(
         new ModelClient(settings(), fetcher, silentLogger).extract(
-          segmentRequest(source),
+          extractionSource(segmentRequest(source)),
           [],
         ),
       ).resolves.toMatchObject({
@@ -799,7 +851,7 @@ describe("ModelClient", () => {
 
     await expect(
       new ModelClient(settings(), fetcher, silentLogger).extract(
-        segmentRequest("source"),
+        extractionSource(segmentRequest("source")),
         [],
       ),
     ).rejects.toThrow("invalid structured reflection_extraction schema");
@@ -820,7 +872,7 @@ describe("ModelClient", () => {
       }),
       fetcher,
       silentLogger,
-    ).extract(segmentRequest("source"), []);
+    ).extract(extractionSource(segmentRequest("source")), []);
 
     expect(captured).toMatchObject({
       max_tokens: 16_384,
@@ -863,7 +915,7 @@ describe("ModelClient", () => {
       fetcher,
       silentLogger,
     ).resolve(
-      request,
+      extractionSource(request),
       "Segment summary",
       [claim],
       [
@@ -966,7 +1018,7 @@ describe("ModelClient", () => {
     };
 
     await new ModelClient(settings(), fetcher, silentLogger).resolve(
-      segmentRequest("Feature exists."),
+      extractionSource(segmentRequest("Feature exists.")),
       "Feature exists.",
       [
         {
@@ -1077,7 +1129,7 @@ describe("ModelClient", () => {
     };
 
     await new ModelClient(settings(), fetcher, silentLogger).resolve(
-      segmentRequest("No proposed claim is supported."),
+      extractionSource(segmentRequest("No proposed claim is supported.")),
       "No proposed claim is supported.",
       claims,
       mentions,
@@ -1118,7 +1170,7 @@ describe("ModelClient", () => {
     };
 
     await new ModelClient(settings(), fetcher, silentLogger).resolve(
-      segmentRequest("The alpha entity exists."),
+      extractionSource(segmentRequest("The alpha entity exists.")),
       "The alpha entity exists.",
       [
         {
@@ -1176,7 +1228,7 @@ describe("ModelClient", () => {
 
     await expect(
       new ModelClient(settings(), fetcher, silentLogger).resolve(
-        segmentRequest("Springfield exists."),
+        extractionSource(segmentRequest("Springfield exists.")),
         "Springfield exists.",
         [
           {
@@ -1227,7 +1279,7 @@ describe("ModelClient", () => {
 
     await expect(
       new ModelClient(settings(), fetcher, silentLogger).resolve(
-        segmentRequest("Feature exists."),
+        extractionSource(segmentRequest("Feature exists.")),
         "Feature exists.",
         [claim],
         [
@@ -1248,7 +1300,7 @@ describe("ModelClient", () => {
       settings(),
       async () => Response.json({ choices: [] }),
       silentLogger,
-    ).extract(segmentRequest("source"), []);
+    ).extract(extractionSource(segmentRequest("source")), []);
     await expect(extraction).rejects.toThrow(
       "invalid structured reflection_extraction response",
     );
@@ -1261,7 +1313,7 @@ describe("ModelClient", () => {
           resolutions: "invalid",
         }),
       silentLogger,
-    ).resolve(segmentRequest("source"), "Summary", [], []);
+    ).resolve(extractionSource(segmentRequest("source")), "Summary", [], []);
     await expect(resolution).rejects.toThrow(
       "invalid structured entity_resolution schema",
     );
@@ -1288,7 +1340,7 @@ describe("ModelClient", () => {
 
     await expect(
       new ModelClient(settings(), fetcher, silentLogger).resolve(
-        segmentRequest("Feature exists."),
+        extractionSource(segmentRequest("Feature exists.")),
         "Feature exists.",
         [claim],
         [
@@ -1350,7 +1402,7 @@ describe("ModelClient", () => {
 
     await expect(
       new ModelClient(settings(), fetcher, silentLogger).resolve(
-        segmentRequest("Feature is active and has an owner."),
+        extractionSource(segmentRequest("Feature is active and has an owner.")),
         "Feature has two properties.",
         claims,
         mentions,
@@ -1395,7 +1447,7 @@ describe("ModelClient", () => {
 
     await expect(
       new ModelClient(settings(), fetcher, silentLogger).resolve(
-        segmentRequest("Feature has two properties."),
+        extractionSource(segmentRequest("Feature has two properties.")),
         "Feature has two properties.",
         claims,
         claims.map((claim, index) => ({
@@ -1437,7 +1489,7 @@ describe("ModelClient", () => {
 
     await expect(
       new ModelClient(settings(), fetcher, silentLogger).resolve(
-        segmentRequest("Only Kept exists."),
+        extractionSource(segmentRequest("Only Kept exists.")),
         "Only Kept exists.",
         claims,
         [
@@ -1483,7 +1535,7 @@ describe("ModelClient", () => {
 
     await expect(
       new ModelClient(settings(), fetcher, silentLogger).resolve(
-        segmentRequest("Feature exists."),
+        extractionSource(segmentRequest("Feature exists.")),
         "Feature exists.",
         [claim],
         [
@@ -1532,7 +1584,7 @@ describe("ModelClient", () => {
     };
 
     await new ModelClient(settings(), fetcher, silentLogger).extract(
-      request,
+      extractionSource(request),
       [],
     );
 
@@ -1584,8 +1636,10 @@ describe("ModelClient", () => {
 
     await expect(
       new ModelClient(settings(), fetcher, silentLogger).extract(
-        segmentRequest(
-          "Source discusses ModelClient with C++ and tool_example123.",
+        extractionSource(
+          segmentRequest(
+            "Source discusses ModelClient with C++ and tool_example123.",
+          ),
         ),
         [],
       ),
@@ -1640,7 +1694,7 @@ describe("ModelClient", () => {
 
       await expect(
         new ModelClient(settings(), fetcher, silentLogger).extract(
-          segmentRequest(`Identifier ${source}`),
+          extractionSource(segmentRequest(`Identifier ${source}`)),
           [],
         ),
       ).resolves.toEqual({
@@ -1680,7 +1734,7 @@ describe("ModelClient", () => {
     ].join("\n");
 
     const result = await new ModelClient(settings(), fetcher, logger).extract(
-      segmentRequest(source),
+      extractionSource(segmentRequest(source)),
       [],
     );
 
@@ -1732,7 +1786,7 @@ describe("ModelClient", () => {
 
     await expect(
       new ModelClient(settings(), fetcher, silentLogger).extract(
-        segmentRequest(source),
+        extractionSource(segmentRequest(source)),
         [],
       ),
     ).resolves.toEqual({
@@ -1758,7 +1812,9 @@ describe("ModelClient", () => {
 
     await expect(
       new ModelClient(settings(), fetcher, silentLogger).extract(
-        segmentRequest("Source mentions custom-file.ts without backticks."),
+        extractionSource(
+          segmentRequest("Source mentions custom-file.ts without backticks."),
+        ),
         [],
       ),
     ).resolves.toEqual({
@@ -1776,7 +1832,9 @@ describe("ModelClient", () => {
 
     await expect(
       new ModelClient(settings(), fetcher, silentLogger).extract(
-        segmentRequest("Connect to //example.com/api; file is `api`."),
+        extractionSource(
+          segmentRequest("Connect to //example.com/api; file is `api`."),
+        ),
         [],
       ),
     ).resolves.toEqual({
@@ -1794,7 +1852,9 @@ describe("ModelClient", () => {
 
     await expect(
       new ModelClient(settings(), fetcher, silentLogger).extract(
-        segmentRequest("Inspected /workspace/app.tsx; file is `app.ts`."),
+        extractionSource(
+          segmentRequest("Inspected /workspace/app.tsx; file is `app.ts`."),
+        ),
         [],
       ),
     ).resolves.toEqual({
@@ -1815,10 +1875,10 @@ describe("ModelClient", () => {
 
     await expect(
       new ModelClient(settings(), fetcher, silentLogger).extract(
-        {
+        extractionSource({
           ...segmentRequest(source),
           messages: [{ role: "assistant", text: source }],
-        },
+        }),
         [],
       ),
     ).resolves.toEqual({
@@ -1838,10 +1898,10 @@ describe("ModelClient", () => {
 
     await expect(
       new ModelClient(settings(), fetcher, silentLogger).extract(
-        {
+        extractionSource({
           ...segmentRequest(unclosed),
           messages: [{ role: "assistant", text: unclosed }],
-        },
+        }),
         [],
       ),
     ).resolves.toEqual({
@@ -1865,10 +1925,10 @@ describe("ModelClient", () => {
 
     await expect(
       new ModelClient(settings(), fetcher, silentLogger).extract(
-        {
+        extractionSource({
           ...segmentRequest(source),
           messages: [{ role: "assistant", text: source }],
-        },
+        }),
         [],
       ),
     ).resolves.toEqual({
@@ -1894,7 +1954,7 @@ describe("ModelClient", () => {
 
     await expect(
       new ModelClient(settings(), fetcher, silentLogger).extract(
-        segmentRequest("source"),
+        extractionSource(segmentRequest("source")),
         [],
       ),
     ).rejects.toBeInstanceOf(UpstreamValidationError);
@@ -1920,7 +1980,7 @@ describe("ModelClient", () => {
         settings({ modelCallTimeoutSeconds: 0.01 }),
         fetcher,
         silentLogger,
-      ).extract(segmentRequest("source"), []),
+      ).extract(extractionSource(segmentRequest("source")), []),
     ).rejects.toBeInstanceOf(UpstreamTimeoutError);
   });
 
@@ -1933,7 +1993,7 @@ describe("ModelClient", () => {
 
     await expect(
       new ModelClient(settings(), fetcher, silentLogger).extract(
-        segmentRequest("source"),
+        extractionSource(segmentRequest("source")),
         [],
       ),
     ).resolves.toEqual({ summary: "Summary", claims: [] });
@@ -1947,7 +2007,7 @@ describe("ModelClient", () => {
       settings(),
       fetcher,
       silentLogger,
-    ).extract(segmentRequest("source"), []);
+    ).extract(extractionSource(segmentRequest("source")), []);
     await expect(operation).rejects.toEqual(
       expect.objectContaining<Partial<UpstreamRequestError>>({
         message: "upstream request failed: 503 Service Unavailable",

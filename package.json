@@ -18,7 +18,8 @@
     "test:rollout-rehearsal": "node scripts/rehearsal/run.mjs",
     "typecheck": "pnpm --recursive --if-present typecheck",
     "verify:plugin-bundle": "pnpm --filter opencode-reflection-plugin verify:bundle",
-    "check": "pnpm format:check && pnpm typecheck && pnpm test && pnpm build && pnpm verify:plugin-bundle"
+    "verify:v2-plugin-bundle": "pnpm --filter @reflection/opencode-v2-plugin verify:bundle",
+    "check": "pnpm format:check && pnpm typecheck && pnpm test && pnpm build && pnpm verify:plugin-bundle && pnpm verify:v2-plugin-bundle"
   },
   "devDependencies": {
     "@types/node": "24.12.2",

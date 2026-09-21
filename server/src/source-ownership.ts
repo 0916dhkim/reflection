@@ -1,18 +1,26 @@
 import type { PoolClient } from "pg";
-import { sourceFingerprint } from "@reflection/shared/domain";
+import {
+  ingestSourceFingerprint as sourceFingerprint,
+  decodePersistedIngestSegment as decodePersistedSegment,
+  ingestSegmentIdForRequest as sourceSegmentIdForRequest,
+} from "@reflection/shared/ingestion";
+import { persistedBoundary } from "./ingestion.js";
 import { ContractValidationError } from "@reflection/shared/contracts";
 
-import {
-  decodePersistedSegment,
-  sourceSegmentIdForRequest,
-  parseSourceInfo,
-  type SourceInfo,
-} from "@reflection/shared/sources";
+import { parseSourceInfo, type SourceInfo } from "@reflection/shared/sources";
 
 export class UnknownSourceError extends Error {
   constructor(sourceId: string) {
     super(`unknown source: ${sourceId}`);
     this.name = "UnknownSourceError";
+  }
+}
+
+export class NativeSourceError extends Error {
+  readonly statusCode = 422;
+  constructor() {
+    super("native ingestion requires an opencode-v2 source-v1 registry entry");
+    this.name = "NativeSourceError";
   }
 }
 
@@ -105,6 +113,15 @@ export async function validateSegmentOwnership(
       if (source !== null && source.id !== owner.id)
         throw new OwnershipValidationError("contradictory segment ownership");
       source = owner;
+      if (
+        row.payload == null &&
+        row.source_boundary_version === 3 &&
+        (owner.kind !== "opencode-v2" || owner.identity_scheme !== "source-v1")
+      ) {
+        throw new OwnershipValidationError(
+          "native row has incompatible source registry entry",
+        );
+      }
       if (row.payload != null) {
         let request: ReturnType<typeof decodePersistedSegment>;
         try {
@@ -113,6 +130,20 @@ export async function validateSegmentOwnership(
           if (!(error instanceof ContractValidationError)) throw error;
           throw new OwnershipValidationError(
             "invalid persisted segment payload",
+          );
+        }
+        if (request.source_boundary_version !== row.source_boundary_version) {
+          throw new OwnershipValidationError(
+            "persisted payload has mismatched source boundary version",
+          );
+        }
+        if (
+          request.source_boundary_version === 3 &&
+          (owner.kind !== "opencode-v2" ||
+            owner.identity_scheme !== "source-v1")
+        ) {
+          throw new OwnershipValidationError(
+            "native payload has incompatible source registry entry",
           );
         }
         if (sourceSegmentIdForRequest(request, owner) !== segmentId) {
@@ -124,12 +155,15 @@ export async function validateSegmentOwnership(
           "session_id",
           "start_user_message_id",
           "end_user_message_id",
-          "source_boundary_version",
           "start_source_message_id",
           "end_source_message_id",
           "projection_version",
         ] as const) {
-          if (field in row && row[field] !== request[field])
+          const value =
+            field === "start_user_message_id" || field === "end_user_message_id"
+              ? persistedBoundary(request)[field]
+              : request[field];
+          if (field in row && row[field] !== value)
             throw new OwnershipValidationError(
               "persisted payload has mismatched request identity",
             );

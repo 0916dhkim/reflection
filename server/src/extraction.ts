@@ -7,7 +7,6 @@ import {
   type MentionContext,
   type PreparedClaim,
   type PreparedEntity,
-  type PreparedSegment,
   type ValidatedResolutionPlan,
 } from "@reflection/shared/domain";
 
@@ -17,6 +16,7 @@ import {
   ModelClient,
 } from "./clients.js";
 import type { ClaimedJob, Database } from "./database.js";
+import type { PreparedSegment } from "./ingestion.js";
 import type { ValidatedExtractionResult } from "./extraction-validation.js";
 
 const MAX_ENTITY_DESCRIPTION_CODE_POINTS = 2_000;
@@ -72,7 +72,7 @@ export class ExtractionEngine {
       job.request.session_id,
       job.segmentId,
     );
-    return this.#models.extract(job.request, priorSummaries);
+    return this.#models.extract(job, priorSummaries);
   }
 
   async resolve(
@@ -133,7 +133,7 @@ export class ExtractionEngine {
     let plan: ValidatedResolutionPlan = { keptClaims: [], mentions: [] };
     if (contexts.length > 0) {
       plan = await this.#models.resolve(
-        job.request,
+        job,
         extracted.summary,
         extracted.claims,
         contexts,
@@ -293,11 +293,19 @@ export class ExtractionEngine {
     return {
       id: job.segmentId,
       sessionId: job.request.session_id,
-      startUserMessageId: job.request.start_user_message_id,
-      endUserMessageId: job.request.end_user_message_id,
-      sourceBoundaryVersion: job.request.source_boundary_version,
-      startSourceMessageId: job.request.start_source_message_id,
-      endSourceMessageId: job.request.end_source_message_id,
+      ...(job.request.source_boundary_version === 3
+        ? {
+            sourceBoundaryVersion: 3 as const,
+            startSourceMessageId: job.request.start_source_message_id,
+            endSourceMessageId: job.request.end_source_message_id,
+          }
+        : {
+            startUserMessageId: job.request.start_user_message_id,
+            endUserMessageId: job.request.end_user_message_id,
+            sourceBoundaryVersion: job.request.source_boundary_version,
+            startSourceMessageId: job.request.start_source_message_id,
+            endSourceMessageId: job.request.end_source_message_id,
+          }),
       summary: extracted.summary,
       entities,
       claims,
