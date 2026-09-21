@@ -47,7 +47,7 @@ function fixture(
   const manifest: NativeSessionSegmentsResponse = {
     source_id: sourceInfo.id,
     session_id: "s",
-    manifest_version: 2,
+    manifest_version: 3,
     targets: [],
     boundaries: segments.map((segment) => ({
       id: segment.id,

@@ -159,7 +159,7 @@ function manifest(id) {
     {
       source_id: source.id,
       session_id: id,
-      manifest_version: 2,
+      manifest_version: 3,
       segments: entries
         .filter((item) => !item.pending)
         .map((item) => ({
@@ -757,7 +757,7 @@ async function main() {
     manifest: {
       source_id: source.id,
       session_id: pressure,
-      manifest_version: 2,
+      manifest_version: 3,
       segments: [],
       boundaries: [],
       targets: [],

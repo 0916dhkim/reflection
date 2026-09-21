@@ -593,9 +593,30 @@ function registerRoutes(
               sourceId,
               sessionId,
             );
+          const entries = [...segments, ...boundaries, ...targets];
+          const native = entries.some(
+            (entry) => entry.source_boundary_version === 3,
+          );
+          const legacy = entries.some(
+            (entry) => entry.source_boundary_version !== 3,
+          );
+          if (native && legacy) {
+            throw new HttpError(
+              409,
+              "source manifest mixes legacy and native boundaries",
+            );
+          }
+          let manifestVersion = native ? 3 : 2;
+          if (entries.length === 0) {
+            const source = (await dependencies.database.listSources()).find(
+              (source) => source.id === sourceId,
+            );
+            if (source === undefined) throw new UnknownSourceError(sourceId);
+            manifestVersion = source.kind === "opencode-v2" ? 3 : 2;
+          }
           return parseSourceSessionSegmentsResponse({
             source_id: sourceId,
-            manifest_version: 2,
+            manifest_version: manifestVersion,
             session_id: sessionId,
             segments,
             boundaries,

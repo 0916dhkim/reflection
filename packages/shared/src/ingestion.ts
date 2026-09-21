@@ -1,19 +1,11 @@
-import { Type, type Static, type TSchema } from "@sinclair/typebox";
-import { Value } from "@sinclair/typebox/value";
+import { Type } from "@sinclair/typebox";
 
 import {
   ContractValidationError,
   type JobResponse,
-  type SegmentBoundary,
   type SegmentCreate,
   type SegmentResponse,
-  type SegmentSummary,
-  type SegmentTargetBoundary,
   type SessionSegmentsResponse,
-  SegmentBoundarySchema,
-  SegmentSummarySchema,
-  SegmentTargetBoundarySchema,
-  parseSessionSegmentsResponse,
 } from "./contracts.js";
 import {
   type ProjectionFingerprintBoundary,
@@ -22,26 +14,20 @@ import {
 } from "./domain.js";
 import {
   type NativeJobResponse,
-  type NativeSegmentBoundary,
   type NativeSegmentCreate,
   type NativeSegmentResponse,
-  type NativeSegmentSummary,
-  type NativeSegmentTargetBoundary,
+  type NativeSessionSegmentsResponse,
   NativeJobResponseSchema,
   NativeSegmentCreateSchema,
   NativeSegmentResponseSchema,
-  NativeSegmentBoundarySchema,
-  NativeSegmentSummarySchema,
-  NativeSegmentTargetBoundarySchema,
+  NativeSessionSegmentsResponseSchema,
   nativeProjectionFingerprint,
   nativeSegmentIdForRequest,
   nativeSourceFingerprint,
   parseNativeJobResponse,
-  parseNativeSegmentBoundary,
   parseNativeSegmentCreate,
   parseNativeSegmentResponse,
-  parseNativeSegmentSummary,
-  parseNativeSegmentTargetBoundary,
+  parseNativeSessionSegmentsResponse,
 } from "./native.js";
 import {
   type SourceInfo,
@@ -49,7 +35,7 @@ import {
   type SourceSegmentCreate,
   type SourceSegmentResponse,
   type SourceSessionSegmentsResponse,
-  SourceIdSchema,
+  SourceSessionSegmentsResponseSchema,
   SourceJobResponseSchema,
   SourceSegmentCreateSchema,
   SourceSegmentResponseSchema,
@@ -58,6 +44,7 @@ import {
   parseSourceJobResponse,
   parseSourceSegmentCreate,
   parseSourceSegmentResponse,
+  parseSourceSessionSegmentsResponse,
   sourceSegmentIdForRequest,
 } from "./sources.js";
 
@@ -81,14 +68,9 @@ export const IngestSegmentResponseSchema = Type.Union([
   NativeSegmentResponseSchema,
 ]);
 
-export interface IngestSessionSegmentsResponse {
-  source_id: string;
-  manifest_version: 2;
-  session_id: string;
-  segments: Array<SegmentSummary | NativeSegmentSummary>;
-  boundaries: Array<SegmentBoundary | NativeSegmentBoundary>;
-  targets: Array<SegmentTargetBoundary | NativeSegmentTargetBoundary>;
-}
+export type IngestSessionSegmentsResponse =
+  | SourceSessionSegmentsResponse
+  | NativeSessionSegmentsResponse;
 
 export type IngestProjectionFingerprintBoundary =
   | ProjectionFingerprintBoundary
@@ -105,17 +87,6 @@ function record(value: unknown): Record<string, unknown> | null {
 
 function hasNativeBoundary(value: unknown): boolean {
   return record(value)?.source_boundary_version === 3;
-}
-
-function parse<T extends TSchema>(
-  name: string,
-  schema: T,
-  value: unknown,
-): Static<T> {
-  if (!Value.Check(schema, value)) {
-    throw new ContractValidationError(name, schema, value);
-  }
-  return value as Static<T>;
 }
 
 export function parseIngestSegmentCreate(value: unknown): IngestSegmentCreate {
@@ -217,103 +188,18 @@ export function parseIngestSegmentResponse(
     : parseSourceSegmentResponse(value, expectedSourceId);
 }
 
-export const IngestSessionSegmentsResponseSchema = Type.Object(
-  {
-    source_id: SourceIdSchema,
-    manifest_version: Type.Literal(2),
-    session_id: Type.String(),
-    segments: Type.Array(
-      Type.Union([SegmentSummarySchema, NativeSegmentSummarySchema]),
-    ),
-    boundaries: Type.Array(
-      Type.Union([SegmentBoundarySchema, NativeSegmentBoundarySchema]),
-    ),
-    targets: Type.Array(
-      Type.Union([
-        SegmentTargetBoundarySchema,
-        NativeSegmentTargetBoundarySchema,
-      ]),
-    ),
-  },
-  { additionalProperties: false },
-);
-
-function parseLegacySummary(value: unknown): SegmentSummary {
-  return parseSessionSegmentsResponse({
-    manifest_version: 2,
-    session_id: "legacy-manifest-entry",
-    segments: [value],
-    boundaries: [],
-    targets: [],
-  }).segments[0]!;
-}
-
-function parseLegacyBoundary(value: unknown): SegmentBoundary {
-  return parseSessionSegmentsResponse({
-    manifest_version: 2,
-    session_id: "legacy-manifest-entry",
-    segments: [],
-    boundaries: [value],
-    targets: [],
-  }).boundaries[0]!;
-}
-
-function parseLegacyTarget(value: unknown): SegmentTargetBoundary {
-  return parseSessionSegmentsResponse({
-    manifest_version: 2,
-    session_id: "legacy-manifest-entry",
-    segments: [],
-    boundaries: [],
-    targets: [value],
-  }).targets[0]!;
-}
+export const IngestSessionSegmentsResponseSchema = Type.Union([
+  SourceSessionSegmentsResponseSchema,
+  NativeSessionSegmentsResponseSchema,
+]);
 
 export function parseIngestSessionSegmentsResponse(
   value: unknown,
   expectedSourceId?: string,
 ): IngestSessionSegmentsResponse {
-  const object = record(value);
-  const normalized = object
-    ? {
-        ...object,
-        source_id: parseSourceId(object.source_id, "ingest manifest"),
-      }
-    : value;
-  const manifest = parse(
-    "ingest session segments response",
-    IngestSessionSegmentsResponseSchema,
-    normalized,
-  );
-  if (
-    expectedSourceId !== undefined &&
-    manifest.source_id !== parseSourceId(expectedSourceId, "ingest manifest")
-  ) {
-    throw new ContractValidationError(
-      "ingest session segments response",
-      Type.Object({ source_id: Type.Literal(expectedSourceId) }),
-      manifest,
-    );
-  }
-  return {
-    source_id: manifest.source_id,
-    manifest_version: manifest.manifest_version,
-    session_id: manifest.session_id,
-    segments: manifest.segments.map((entry) =>
-      hasNativeBoundary(entry)
-        ? parseNativeSegmentSummary(entry)
-        : parseLegacySummary(entry),
-    ),
-    boundaries: manifest.boundaries.map((entry) =>
-      hasNativeBoundary(entry)
-        ? parseNativeSegmentBoundary(entry)
-        : parseLegacyBoundary(entry),
-    ),
-    targets: manifest.targets.map((entry) =>
-      hasNativeBoundary(entry)
-        ? parseNativeSegmentTargetBoundary(entry)
-        : parseLegacyTarget(entry),
-    ),
-  };
+  return record(value)?.manifest_version === 3
+    ? parseNativeSessionSegmentsResponse(value, expectedSourceId)
+    : parseSourceSessionSegmentsResponse(value, expectedSourceId);
 }
 
 export type {

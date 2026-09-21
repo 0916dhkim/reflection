@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { Value } from "@sinclair/typebox/value";
 
 import { sourceFingerprint } from "../src/domain.js";
 import {
@@ -9,6 +10,7 @@ import {
   ownedIngestRequest,
   parseIngestSegmentCreate,
   parseIngestSessionSegmentsResponse,
+  IngestSessionSegmentsResponseSchema,
 } from "../src/ingestion.js";
 import {
   nativeProjectionFingerprint,
@@ -99,10 +101,10 @@ describe("ingestion compatibility dispatch", () => {
     expect(() => ownedIngestRequest(native, "source-b")).toThrow();
   });
 
-  it("accepts per-entry native manifest boundaries with strict outer ownership", () => {
+  it("separates native manifest 3 from legacy manifest 2 with strict ownership", () => {
     const manifest = {
       source_id: "source-a",
-      manifest_version: 2 as const,
+      manifest_version: 3 as const,
       session_id: "session",
       segments: [
         {
@@ -126,5 +128,86 @@ describe("ingestion compatibility dispatch", () => {
         "source-a",
       ),
     ).toThrow();
+    const legacyEntry = {
+      id: manifest.segments[0]!.id,
+      source_boundary_version: 2,
+      start_user_message_id: "u1",
+      end_user_message_id: "u1",
+      start_source_message_id: "u1",
+      end_source_message_id: "a1",
+      projection_version: 1,
+      summary: "legacy",
+    };
+    const legacyManifest = {
+      ...manifest,
+      manifest_version: 2,
+      segments: [
+        legacyEntry,
+        {
+          ...legacyEntry,
+          source_boundary_version: 1,
+          start_source_message_id: null,
+          end_source_message_id: null,
+        },
+      ],
+    };
+    for (const valid of [manifest, legacyManifest]) {
+      expect(Value.Check(IngestSessionSegmentsResponseSchema, valid)).toBe(
+        true,
+      );
+      expect(parseIngestSessionSegmentsResponse(valid, " source-a ")).toEqual(
+        valid,
+      );
+      expect(
+        parseIngestSessionSegmentsResponse({ ...valid, segments: [] }),
+      ).toEqual({ ...valid, segments: [] });
+      const { source_id: _sourceId, ...unowned } = valid;
+      expect(() => parseIngestSessionSegmentsResponse(unowned)).toThrow();
+    }
+    for (const invalid of [
+      { ...manifest, manifest_version: 2 },
+      { ...manifest, manifest_version: 4 },
+      { ...legacyManifest, manifest_version: 3 },
+      { ...manifest, segments: [...manifest.segments, legacyEntry] },
+      {
+        ...legacyManifest,
+        segments: [...legacyManifest.segments, ...manifest.segments],
+      },
+    ]) {
+      expect(Value.Check(IngestSessionSegmentsResponseSchema, invalid)).toBe(
+        false,
+      );
+      expect(() => parseIngestSessionSegmentsResponse(invalid)).toThrow();
+    }
+    const { summary: _legacySummary, ...legacyRange } = legacyEntry;
+    const { summary: _nativeSummary, ...nativeRange } = manifest.segments[0]!;
+    for (const [key, metadata] of [
+      ["boundaries", { source_eligible: true, source_fingerprint: "hash" }],
+      ["targets", { status: "pending", source_fingerprint: "hash" }],
+    ] as const) {
+      for (const [base, range, otherRange] of [
+        [manifest, nativeRange, legacyRange],
+        [legacyManifest, legacyRange, nativeRange],
+      ] as const) {
+        const valid = { ...base, [key]: [{ ...range, ...metadata }] };
+        expect(Value.Check(IngestSessionSegmentsResponseSchema, valid)).toBe(
+          true,
+        );
+        expect(parseIngestSessionSegmentsResponse(valid)).toEqual(valid);
+        for (const entries of [
+          [{ ...otherRange, ...metadata }],
+          [
+            { ...range, ...metadata },
+            { ...otherRange, ...metadata },
+          ],
+        ]) {
+          const invalid = { ...base, [key]: entries };
+          expect(
+            Value.Check(IngestSessionSegmentsResponseSchema, invalid),
+          ).toBe(false);
+          expect(() => parseIngestSessionSegmentsResponse(invalid)).toThrow();
+        }
+      }
+    }
   });
 });

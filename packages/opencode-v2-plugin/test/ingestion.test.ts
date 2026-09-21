@@ -23,7 +23,7 @@ const config: Config = {
 };
 const manifest = {
   source_id: "native",
-  manifest_version: 2 as const,
+  manifest_version: 3 as const,
   session_id: "s",
   segments: [],
   boundaries: [],

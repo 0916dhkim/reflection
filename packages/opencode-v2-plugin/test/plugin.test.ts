@@ -228,7 +228,7 @@ function recoveryFetch(registry: (init: RequestInit) => Promise<Response>) {
     if (path === "/v1/sessions/s/segments")
       return Response.json({
         source_id: "native",
-        manifest_version: 2,
+        manifest_version: 3,
         session_id: "s",
         segments: [],
         boundaries: [],
@@ -521,7 +521,7 @@ it.each([
     })[0]!;
     const manifest = {
       source_id: "native",
-      manifest_version: 2,
+      manifest_version: 3,
       session_id: "s",
       segments: [],
       boundaries: [],
@@ -668,7 +668,7 @@ it.each(["/work", "/work/\uD55C\uAE00 project"])(
         }
         return Response.json({
           source_id: "native",
-          manifest_version: 2,
+          manifest_version: 3,
           session_id: "s",
           segments: [],
           boundaries: [],

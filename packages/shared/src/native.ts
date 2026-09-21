@@ -172,6 +172,7 @@ export function nativeSourceFingerprint(request: NativeSegmentCreate): string {
     utf8Frame(request.source_id) +
     utf8Frame(request.session_id) +
     utf8Frame("3") +
+    utf8Frame(String(request.projection_version)) +
     utf8Frame(request.start_source_message_id) +
     utf8Frame(request.end_source_message_id) +
     `${request.messages.length}:` +
@@ -272,7 +273,7 @@ export type NativeSegmentTargetBoundary = Static<
 export const NativeSessionSegmentsResponseSchema = Type.Object(
   {
     source_id: SourceIdSchema,
-    manifest_version: Type.Literal(2),
+    manifest_version: Type.Literal(3),
     session_id: Type.String(),
     segments: Type.Array(NativeSegmentSummarySchema),
     boundaries: Type.Array(NativeSegmentBoundarySchema),
