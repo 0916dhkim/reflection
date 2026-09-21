@@ -1,0 +1,106 @@
+# Use fresh, uniquely named volumes for each rehearsal. No host mounts or production services.
+# Build separately: docker compose -f scripts/cp008/compose.yml build backup
+# Then: run --rm --no-deps -T backup; run --rm -T verify; run --rm --no-deps -T report-check
+# Stop/remove the disposable services with Compose controls without deleting evidence volumes.
+# The inherited helper PGDATA anonymous volume is unused and removed by run --rm.
+x-operator: &operator
+  profiles: [cp008]
+  image: ${CP008_OPERATOR_IMAGE:?}
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+  tmpfs:
+    - /tmp:rw,nosuid,nodev,mode=1777
+  mem_limit: 2g
+  cpus: 2
+  restart: "no"
+  stop_grace_period: 5s
+
+x-proof-environment: &proof-environment
+  BACKUP_RUN_ID: ${BACKUP_RUN_ID:?}
+  EXPECTED_ARTIFACT_SHA256: ${EXPECTED_ARTIFACT_SHA256:?}
+  JOB_TIMEOUT_SECONDS: ${JOB_TIMEOUT_SECONDS:-1800}
+
+services:
+  backup:
+    <<: *operator
+    build:
+      context: ../..
+      dockerfile: scripts/cp008/Dockerfile
+    command: [backup]
+    environment:
+      <<: *proof-environment
+      SOURCE_DATABASE_URL: ${SOURCE_DATABASE_URL:?}
+      EXPECTED_SOURCE_HOST: ${EXPECTED_SOURCE_HOST:-db}
+      EXPECTED_SOURCE_DATABASE: ${EXPECTED_SOURCE_DATABASE:-reflection}
+      EXPECTED_SOURCE_USER: ${EXPECTED_SOURCE_USER:-reflection}
+    networks: [source]
+    volumes:
+      - backup:/backup
+
+  verify:
+    <<: *operator
+    command: [verify]
+    environment:
+      <<: *proof-environment
+      # Use a URL-safe password (e.g. random hex) for this disposable database.
+      TARGET_DATABASE_URL: postgresql://reflection_restore_test:${CP008_RESTORE_PASSWORD:?}@restore-db:5432/reflection_restore_test
+    depends_on:
+      restore-db:
+        condition: service_healthy
+    networks: [restore]
+    volumes:
+      - backup:/backup:ro
+      - reports:/reports
+
+  report-check:
+    <<: *operator
+    command: [report-check]
+    environment: *proof-environment
+    network_mode: none
+    volumes:
+      - backup:/backup:ro
+      - reports:/reports:ro
+
+  restore-db:
+    profiles: [cp008]
+    image: pgvector/pgvector@sha256:cf134a767f474095eeba57e0117be8e568e011a63f33fbf252f14c9b760f8e6f
+    environment:
+      POSTGRES_USER: reflection_restore_test
+      POSTGRES_DB: reflection_restore_test
+      POSTGRES_PASSWORD: ${CP008_RESTORE_PASSWORD:?}
+    read_only: true
+    # Keep normal entrypoint capabilities for root-owned volume initialization.
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,mode=1777
+      - /var/run/postgresql:rw,nosuid,nodev,mode=3775
+    mem_limit: 2g
+    cpus: 2
+    restart: "no"
+    healthcheck:
+      test:
+        [
+          CMD-SHELL,
+          "pg_isready -U reflection_restore_test -d reflection_restore_test",
+        ]
+      interval: 1s
+      timeout: 5s
+      retries: 30
+    networks: [restore]
+    volumes:
+      - restore-data:/var/lib/postgresql/data
+
+networks:
+  source:
+    external: true
+    name: ${CP008_SOURCE_NETWORK:?}
+  restore:
+    internal: true
+
+volumes:
+  backup:
+    name: ${CP008_BACKUP_VOLUME:?}
+  reports:
+    name: ${CP008_REPORT_VOLUME:?}
+  restore-data:
+    name: ${CP008_RESTORE_VOLUME:?}
