@@ -9,8 +9,8 @@
   "scripts": {
     "build": "esbuild src/main.ts --bundle --platform=node --format=esm --target=node24 --outfile=dist/main.js --external:fastify --external:@fastify/swagger --external:@fastify/swagger-ui --external:pg",
     "start": "node dist/main.js",
-    "test": "vitest run --exclude test/database.integration.test.ts",
-    "test:integration": "node -e \"if (!process.env.REFLECTION_TEST_DATABASE_URL) { console.error('REFLECTION_TEST_DATABASE_URL is required and must identify a disposable database'); process.exit(1); }\" && vitest run test/database.integration.test.ts",
+    "test": "vitest run --exclude 'test/*.integration.test.ts'",
+    "test:integration": "node test/dual-plugin-fixture/database-guard.mjs && pnpm --filter opencode-reflection-plugin build && pnpm --filter @reflection/opencode-v2-plugin build && vitest run test/database.integration.test.ts test/dual-plugin.integration.test.ts --no-file-parallelism --config=./test/dual-plugin-fixture/sequencer.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

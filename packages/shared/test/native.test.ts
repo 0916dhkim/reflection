@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { describe, expect, it } from "vitest";
 
 import { ContractValidationError } from "../src/contracts.js";
@@ -49,7 +50,7 @@ describe("native v3 segment contracts", () => {
       }),
     ).toEqual(request);
     expect(nativeSourceFingerprint(request)).toBe(
-      "7cd171e87030a53b1b684be491e786718c009daf8abc65d0f151cfd00498ff52",
+      "eaab4957c25565e7a89822598f22b86ea6ae45e2cf82af91b6a57354e1194b4b",
     );
     expect(
       nativeProjectionFingerprint(SEGMENT_ID, "m2", "summary😀\n", 3),
@@ -69,6 +70,28 @@ describe("native v3 segment contracts", () => {
     expect(
       nativeSourceFingerprint({ ...request, processing_priority: 100 }),
     ).toBe(nativeSourceFingerprint(request));
+  });
+
+  it("frames rendering policy separately while excluding processing priority", () => {
+    // Explicit UTF-8 byte frames, independent of the production framing helper.
+    const prefix = "reflection-source-v3:8:source-a11:session\u{1f600}1:3";
+    const suffix =
+      "7:m\u{1f600}-12:m22:7:m\u{1f600}-14:user10:  hi \u{1f600}\n2:m29:synthetic0:";
+    const digest = (payload: string) =>
+      createHash("sha256").update(payload, "utf8").digest("hex");
+    const golden =
+      "eaab4957c25565e7a89822598f22b86ea6ae45e2cf82af91b6a57354e1194b4b";
+    expect(digest(prefix + "1:3" + suffix)).toBe(golden);
+    expect(
+      nativeSourceFingerprint({ ...request, processing_priority: 100 }),
+    ).toBe(golden);
+    expect(digest(prefix + suffix)).toBe(
+      "7cd171e87030a53b1b684be491e786718c009daf8abc65d0f151cfd00498ff52",
+    );
+    expect(digest(prefix + "1:4" + suffix)).not.toBe(golden);
+    expect(() =>
+      parseNativeSegmentCreate({ ...request, projection_version: 4 }),
+    ).toThrow();
   });
 
   it("requires canonical native records and exact endpoints", () => {
@@ -175,7 +198,7 @@ describe("native v3 segment contracts", () => {
     } as const;
     const manifest = {
       source_id: "source-a",
-      manifest_version: 2,
+      manifest_version: 3,
       session_id: "session",
       segments: [],
       boundaries: [],
@@ -199,5 +222,13 @@ describe("native v3 segment contracts", () => {
     expect(() =>
       parseNativeSessionSegmentsResponse({ ...manifest, extra: true }),
     ).toThrow(ContractValidationError);
+    expect(() =>
+      parseNativeSessionSegmentsResponse({ ...manifest, manifest_version: 2 }),
+    ).toThrow(ContractValidationError);
+    const { source_id: _sourceId, ...unowned } = manifest;
+    expect(() => parseNativeSessionSegmentsResponse(unowned)).toThrow();
+    expect(() =>
+      parseNativeSessionSegmentsResponse(manifest, "source-b"),
+    ).toThrow();
   });
 });

@@ -614,7 +614,7 @@ describe("native segment planning", () => {
     })[0]!;
     const manifest: NativeSessionSegmentsResponse = {
       source_id: source.id,
-      manifest_version: 2,
+      manifest_version: 3,
       session_id: "session",
       segments: [],
       boundaries: [
@@ -683,7 +683,7 @@ describe("native segment planning", () => {
     })[0]!;
     const manifest: NativeSessionSegmentsResponse = {
       source_id: source.id,
-      manifest_version: 2,
+      manifest_version: 3,
       session_id: "session",
       segments: [],
       boundaries: [
@@ -739,7 +739,7 @@ describe("native segment planning", () => {
       const segment = before[0]!;
       const manifest: NativeSessionSegmentsResponse = {
         source_id: source.id,
-        manifest_version: 2,
+        manifest_version: 3,
         session_id: "session",
         segments: [],
         targets: [],
@@ -785,7 +785,7 @@ describe("native segment planning", () => {
     })[0]!;
     const manifest: NativeSessionSegmentsResponse = {
       source_id: source.id,
-      manifest_version: 2,
+      manifest_version: 3,
       session_id: "session",
       segments: [],
       boundaries: [],
@@ -831,7 +831,7 @@ describe("native segment planning", () => {
     })[0]!;
     const manifest: NativeSessionSegmentsResponse = {
       source_id: source.id,
-      manifest_version: 2,
+      manifest_version: 3,
       session_id: "session",
       segments: [],
       boundaries: [],
@@ -890,7 +890,7 @@ describe("native segment planning", () => {
   it("rejects anchors whose present endpoint range has the wrong deterministic ID", () => {
     const manifest: NativeSessionSegmentsResponse = {
       source_id: source.id,
-      manifest_version: 2,
+      manifest_version: 3,
       session_id: "session",
       segments: [],
       boundaries: [
@@ -932,7 +932,7 @@ describe("native segment planning", () => {
         records: snapshot,
         manifest: {
           source_id: "source-b",
-          manifest_version: 2,
+          manifest_version: 3,
           session_id: "session",
           segments: [],
           boundaries: [],

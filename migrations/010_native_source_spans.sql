@@ -108,6 +108,7 @@ BEGIN
       INTO frames FROM jsonb_array_elements(payload->'messages') WITH ORDINALITY AS messages(m,n);
     input := 'reflection-source-v3:' || octet_length(source_id)::text || ':' || source_id ||
         octet_length(session_id)::text || ':' || session_id || '1:3' ||
+        '1:3' || -- The validated native rendering policy is projection_version 3.
         octet_length(start_source_message_id)::text || ':' || start_source_message_id ||
         octet_length(end_source_message_id)::text || ':' || end_source_message_id ||
         jsonb_array_length(payload->'messages')::text || ':' || frames;

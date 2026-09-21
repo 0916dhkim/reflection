@@ -124,7 +124,7 @@ async function fixture(
         return Response.json({
           source_id: "native",
           session_id: "s",
-          manifest_version: 2,
+          manifest_version: 3,
           boundaries: [],
           targets: ranges.map((range, i) => ({
             ...range,
@@ -167,7 +167,7 @@ async function fixture(
         return Response.json({
           source_id: "native",
           session_id: "s",
-          manifest_version: 2,
+          manifest_version: 3,
           segments: [],
           boundaries: [],
           targets: [],
@@ -222,7 +222,7 @@ async function fixture(
         : {
             source_id: "other",
             session_id: "s",
-            manifest_version: 2,
+            manifest_version: 3,
             segments: [],
             boundaries: [],
             targets: [],
@@ -329,7 +329,7 @@ function anchoredManifest(
   return {
     source_id: "native",
     session_id: "s",
-    manifest_version: 2,
+    manifest_version: 3,
     targets: [],
     boundaries: ranges.map((range, i) => ({
       ...range,
@@ -666,7 +666,7 @@ it.each([
     const empty = {
       source_id: "native",
       session_id: "s",
-      manifest_version: 2,
+      manifest_version: 3,
       segments: [],
       boundaries: [],
       targets: [],

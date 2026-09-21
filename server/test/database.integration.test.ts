@@ -638,9 +638,26 @@ describe.sequential("Database PostgreSQL integration", () => {
   test("native fingerprints match SQL UTF-8 framing, types, order, sources, and projections", async () => {
     const database = await openNativeDatabase();
     try {
+      const golden = parseNativeSegmentCreate({
+        source_id: "source-a",
+        session_id: "session😀",
+        source_boundary_version: 3,
+        start_source_message_id: "m😀-1",
+        end_source_message_id: "m2",
+        projection_version: 3,
+        processing_priority: 0,
+        messages: [
+          { id: "m😀-1", type: "user", text: "  hi 😀\n" },
+          { id: "m2", type: "synthetic", text: "" },
+        ],
+      });
+      expect(nativeSourceFingerprint(golden)).toBe(
+        "eaab4957c25565e7a89822598f22b86ea6ae45e2cf82af91b6a57354e1194b4b",
+      );
       const base = nativeRequest();
       const variants = [
         base,
+        golden,
         { ...base, source_id: "another-source" },
         { ...base, session_id: "other:session" },
         {
@@ -685,9 +702,9 @@ describe.sequential("Database PostgreSQL integration", () => {
       expect(fingerprints.size).toBe(variants.length);
       const id = nativeSegmentIdForRequest(base, NATIVE_SOURCE);
       expect(
-        nativeSegmentIdForRequest(variants[1]!, {
+        nativeSegmentIdForRequest(variants[2]!, {
           ...NATIVE_SOURCE,
-          id: variants[1]!.source_id,
+          id: variants[2]!.source_id,
         }),
       ).not.toBe(id);
       for (const summary of [
@@ -736,6 +753,39 @@ describe.sequential("Database PostgreSQL integration", () => {
     const headers = { "x-api-key": "test-key" };
     try {
       const source = nativeRequest();
+      const manifestUrl = `/v1/sessions/${source.session_id}/segments?source_id=${source.source_id}`;
+      const emptyNative = await app.inject({ url: manifestUrl, headers });
+      expect(emptyNative.statusCode).toBe(200);
+      expect(
+        parseIngestSessionSegmentsResponse(
+          emptyNative.json(),
+          source.source_id,
+        ),
+      ).toEqual({
+        source_id: source.source_id,
+        session_id: source.session_id,
+        manifest_version: 3,
+        segments: [],
+        boundaries: [],
+        targets: [],
+      });
+      const emptyLegacy = await app.inject({
+        url: `/v1/sessions/${source.session_id}/segments?source_id=${SOURCE_ID}`,
+        headers,
+      });
+      expect(emptyLegacy.statusCode).toBe(200);
+      expect(
+        parseIngestSessionSegmentsResponse(emptyLegacy.json(), SOURCE_ID)
+          .manifest_version,
+      ).toBe(2);
+      expect(
+        (
+          await app.inject({
+            url: `/v1/sessions/${source.session_id}/segments?source_id=unknown`,
+            headers,
+          })
+        ).statusCode,
+      ).toBe(422);
       for (const extra of [
         { start_user_message_id: null },
         { end_user_message_id: null },
@@ -783,11 +833,11 @@ describe.sequential("Database PostgreSQL integration", () => {
         claims: [],
       });
       expect(await database.publishExtraction(claim, extraction)).toBe(true);
-      const manifestUrl = `/v1/sessions/${source.session_id}/segments?source_id=${source.source_id}`;
       const staged = parseIngestSessionSegmentsResponse(
         (await app.inject({ url: manifestUrl, headers })).json(),
         source.source_id,
       );
+      expect(staged.manifest_version).toBe(3);
       expect(staged.segments).toHaveLength(1);
       expect(staged.targets).toHaveLength(1);
       expect(staged.segments[0]).not.toHaveProperty("start_user_message_id");
@@ -827,6 +877,7 @@ describe.sequential("Database PostgreSQL integration", () => {
       const manifest = parseIngestSessionSegmentsResponse(
         (await app.inject({ url: manifestUrl, headers })).json(),
       );
+      expect(manifest.manifest_version).toBe(3);
       expect(manifest.targets).toEqual([]);
       expect(manifest.boundaries[0]).toMatchObject({
         source_boundary_version: 3,
@@ -855,6 +906,37 @@ describe.sequential("Database PostgreSQL integration", () => {
         claim.sourceGeneration,
       );
       expect(await database.publishExtraction(claim, extraction)).toBe(false);
+      const legacy = {
+        ...request({
+          session_id: "legacy-under-v2-registry",
+          start_user_message_id: "turn",
+          end_user_message_id: "turn",
+          source_boundary_version: 2,
+          start_source_message_id: "legacy-start",
+          end_source_message_id: "legacy-end",
+          projection_version: 2,
+          messages: [{ role: "user", text: "legacy source" }],
+        }),
+        source_id: source.source_id,
+      };
+      await database.enqueue(legacy);
+      const legacyResponse = await app.inject({
+        url: `/v1/sessions/${legacy.session_id}/segments?source_id=${source.source_id}`,
+        headers,
+      });
+      expect(legacyResponse.statusCode).toBe(200);
+      const legacyManifest = parseIngestSessionSegmentsResponse(
+        legacyResponse.json(),
+        source.source_id,
+      );
+      expect(legacyManifest.manifest_version).toBe(2);
+      expect(legacyManifest.targets[0]?.source_boundary_version).toBe(2);
+      await database.enqueue({ ...legacy, session_id: source.session_id });
+      const mixed = await app.inject({ url: manifestUrl, headers });
+      expect(mixed.statusCode).toBe(409);
+      expect(mixed.json()).toEqual({
+        detail: "source manifest mixes legacy and native boundaries",
+      });
     } finally {
       await app.close();
     }

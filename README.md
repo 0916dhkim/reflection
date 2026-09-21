@@ -178,17 +178,17 @@ The integration suite requires an explicitly disposable pgvector database. It de
 docker run --rm -d --name reflection-test-postgres \
   -e POSTGRES_USER=reflection \
   -e POSTGRES_PASSWORD=reflection \
-  -e POSTGRES_DB=reflection \
-  -p 55432:5432 \
+  -e POSTGRES_DB=reflection_test \
+  -p 127.0.0.1:55432:5432 \
   pgvector/pgvector:pg17
 
-REFLECTION_TEST_DATABASE_URL=postgresql://reflection:reflection@127.0.0.1:55432/reflection \
+REFLECTION_TEST_DATABASE_URL=postgresql://reflection:reflection@127.0.0.1:55432/reflection_test \
   pnpm test:integration
 
 docker rm -f reflection-test-postgres
 ```
 
-`pnpm test:integration` exits with an error before Vitest starts unless `REFLECTION_TEST_DATABASE_URL` is set.
+`pnpm test:integration` requires a loopback `REFLECTION_TEST_DATABASE_URL` whose database name contains `test` or `disposable`, with no query overrides. It builds both plugins and runs the database suite followed by the dual-plugin integration test sequentially. That test activates the actual bundles in isolated HOME directories against one real PostgreSQL backend; only the OpenCode hosts, extraction engine, and embeddings are fixtures.
 
 ## Docker and Compose
 
@@ -305,6 +305,8 @@ The synthetic HTTP outage budget is five seconds, including a two-second stop gr
 Recovery after cutover should prefer completing the source-aware rollout. The tested cutover-boundary backup preserves all work accepted before that snapshot, including active/staged/pending jobs, but does not preserve later writes. Do not automatically downgrade or restore an older backup after new writes: CP008 must preserve/replay those writes or use a sufficiently current recovery point. The initial older baseline restore is only a point-in-time rollback demonstration.
 
 ### Native OpenCode v2 implementation (CP009–011)
+
+Native manifests use **version 3**; legacy manifests remain version 2. A manifest cannot mix native and legacy boundary entries. Native source fingerprints explicitly frame the rendering-policy version separately from the boundary version; neither priority nor JSON property order participates in content identity.
 
 The separate plugin builds to `packages/opencode-v2-plugin/dist/reflection-v2.js`. It targets OpenCode **2.0.8**, not the v1 plugin API. Do not replace the running v1 bundle or install both artifacts in the same discovery directory. Production activation remains gated on CP008 and final dual-instance readiness.
 

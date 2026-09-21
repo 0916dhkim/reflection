@@ -312,7 +312,7 @@ export async function setup(ctx: Plugin.Context) {
         manifest = {
           source_id: source.id,
           session_id: event.sessionID,
-          manifest_version: 2,
+          manifest_version: 3,
           segments: [],
           boundaries: [],
           targets: [],
