@@ -1,0 +1,20 @@
+{
+  "url": "https://reflection.example.invalid",
+  "apiKey": "REPLACE_WITH_EXISTING_REFLECTION_API_KEY",
+  "sourceId": "danny-opencode-v2",
+  "sources": {
+    "danny-opencode-v1": {
+      "kind": "opencode-v1",
+      "url": "http://127.0.0.1:4096"
+    },
+    "danny-opencode-v2": {
+      "kind": "opencode-v2",
+      "url": "http://127.0.0.1:4097",
+      "username": "opencode",
+      "password": "REPLACE_WITH_OPENCODE_PASSWORD"
+    }
+  },
+  "contextProjection": {
+    "enabled": true
+  }
+}
