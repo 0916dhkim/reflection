@@ -42,6 +42,7 @@ function request(): SegmentCreate {
 
 function jobFor(value: SegmentCreate = request()): ClaimedJob {
   return {
+    sourceId: "test-source",
     id: 1,
     segmentId: segmentIdForRequest(value),
     leaseId: randomUUID(),
@@ -79,6 +80,7 @@ class FakeDatabase {
   readonly candidateMentions: string[] = [];
 
   async priorSummaries(
+    _sourceId: string,
     _sessionId: string,
     _segmentId: string,
   ): Promise<string[]> {

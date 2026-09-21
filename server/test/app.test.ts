@@ -1,13 +1,15 @@
 import { randomUUID } from "node:crypto";
 
 import {
-  parseSegmentCreate,
-  parseSegmentResponse,
-  type JobResponse,
   type QueueStatusResponse,
-  type SegmentResponse,
   type SegmentSummary,
 } from "@reflection/shared/contracts";
+import {
+  parseSourceSegmentCreate as parseSegmentCreate,
+  parseSourceSegmentResponse as parseSegmentResponse,
+  type SourceJobResponse as JobResponse,
+  type SourceSegmentResponse as SegmentResponse,
+} from "@reflection/shared/sources";
 import {
   segmentIdForRequest,
   sourceFingerprint,
@@ -26,12 +28,14 @@ import {
 } from "../src/app.js";
 import { UpstreamRequestError, UpstreamResponseError } from "../src/clients.js";
 import { loadSettings, type Settings } from "../src/config.js";
+import { UnknownSourceError } from "../src/source-ownership.js";
 import {
   JobNotRetryableError,
   failedTargetMatchesJob,
 } from "../src/database.js";
 
 const API_HEADERS = { "x-api-key": "test-key" };
+const SOURCE_ID = "test-source";
 const openApps = new Set<ReflectionApp>();
 
 function settings(): Settings {
@@ -47,6 +51,7 @@ function jobResponse(status: JobResponse["status"] = "pending"): JobResponse {
   const now = "2026-08-22T12:00:00Z";
   return {
     id: 1,
+    source_id: SOURCE_ID,
     segment_id: randomUUID(),
     start_user_message_id: "start",
     end_user_message_id: "end",
@@ -127,6 +132,9 @@ function dependencies(
     close: vi.fn(async () => undefined),
     healthcheck: vi.fn(async () => undefined),
     queueStatus: vi.fn(async () => queueStatusResponse()),
+    listSources: vi.fn(async () => [
+      { id: SOURCE_ID, kind: "opencode-v1", identity_scheme: "legacy" },
+    ]),
     enqueue: vi.fn(async () => jobResponse()),
     getJob: vi.fn(async () => null),
     retryFailedJob: vi.fn(async () => null),
@@ -196,7 +204,7 @@ describe("API key authentication", () => {
     const missing = await app.inject({ method: "GET", url: "/v1/jobs/1" });
     const wrong = await app.inject({
       method: "GET",
-      url: "/v1/jobs/1",
+      url: "/v1/jobs/1?source_id=test-source",
       headers: { "x-api-key": "wrong" },
     });
     const malformedWithoutKey = await app.inject({
@@ -312,6 +320,68 @@ describe("queue diagnostics", () => {
 });
 
 describe("segment API", () => {
+  test("requires explicit registered sources and authenticates registry discovery", async () => {
+    const getJob = vi.fn<AppDatabase["getJob"]>(async (sourceId) => {
+      throw new UnknownSourceError(sourceId);
+    });
+    const enqueue = vi.fn<AppDatabase["enqueue"]>(async (request) => {
+      throw new UnknownSourceError(request.source_id);
+    });
+    const { app } = appWith(dependencies({ database: { getJob, enqueue } }));
+    const missing = await app.inject({
+      method: "GET",
+      url: "/v1/jobs/1",
+      headers: API_HEADERS,
+    });
+    expect(missing.statusCode).toBe(422);
+    expect(getJob).not.toHaveBeenCalled();
+    expect(
+      (
+        await app.inject({
+          method: "GET",
+          url: "/v1/jobs/1?source_id=unknown",
+          headers: API_HEADERS,
+        })
+      ).statusCode,
+    ).toBe(422);
+    const payload = {
+      session_id: "session",
+      start_user_message_id: "start",
+      end_user_message_id: "end",
+      messages: [{ role: "user", text: "source" }],
+    };
+    expect(
+      (
+        await app.inject({
+          method: "POST",
+          url: "/v1/segments",
+          headers: API_HEADERS,
+          payload,
+        })
+      ).statusCode,
+    ).toBe(422);
+    expect(enqueue).not.toHaveBeenCalled();
+    expect(
+      (
+        await app.inject({
+          method: "POST",
+          url: "/v1/segments",
+          headers: API_HEADERS,
+          payload: { ...payload, source_id: "unknown" },
+        })
+      ).statusCode,
+    ).toBe(422);
+    for (const url of ["/v1/sources", `/v1/sources/${SOURCE_ID}`]) {
+      expect((await app.inject({ method: "GET", url })).statusCode).toBe(401);
+      const response = await app.inject({
+        method: "GET",
+        url,
+        headers: API_HEADERS,
+      });
+      expect(response.statusCode).toBe(200);
+      expect(response.body).not.toContain("test-key");
+    }
+  });
   test("accepts empty text and a one-million-character turn without truncation", async () => {
     const enqueue = vi.fn<AppDatabase["enqueue"]>(async () => jobResponse());
     const injected = dependencies({ database: { enqueue } });
@@ -322,6 +392,7 @@ describe("segment API", () => {
       url: "/v1/segments",
       headers: API_HEADERS,
       payload: {
+        source_id: SOURCE_ID,
         session_id: " session ",
         start_user_message_id: "start",
         end_user_message_id: "end",
@@ -334,6 +405,7 @@ describe("segment API", () => {
       url: "/v1/segments",
       headers: API_HEADERS,
       payload: {
+        source_id: SOURCE_ID,
         session_id: "session",
         start_user_message_id: "large",
         end_user_message_id: "large-end",
@@ -346,6 +418,7 @@ describe("segment API", () => {
     const first = enqueue.mock.calls[0]?.[0];
     const second = enqueue.mock.calls[1]?.[0];
     expect(first).toMatchObject({
+      source_id: SOURCE_ID,
       session_id: "session",
       projection_version: 0,
       processing_priority: 0,
@@ -362,6 +435,7 @@ describe("segment API", () => {
   test("returns 422 for aggregate limits and strict nested validation", async () => {
     const { app, injected } = appWith();
     const base = {
+      source_id: SOURCE_ID,
       session_id: "session",
       start_user_message_id: "start",
       end_user_message_id: "end",
@@ -400,6 +474,7 @@ describe("segment API", () => {
     const enqueue = vi.fn<AppDatabase["enqueue"]>(async () => jobResponse());
     const { app } = appWith(dependencies({ database: { enqueue } }));
     const base = {
+      source_id: SOURCE_ID,
       session_id: "session",
       start_user_message_id: "turn",
       end_user_message_id: "turn",
@@ -435,16 +510,18 @@ describe("segment API", () => {
     expect(crossingTurns.statusCode).toBe(422);
   });
 
-  test("strips transport source IDs before canonical enqueueing", async () => {
+  test("preserves explicit source IDs through canonical enqueueing", async () => {
     const enqueue = vi.fn<AppDatabase["enqueue"]>(async () => jobResponse());
     const { app } = appWith(dependencies({ database: { enqueue } }));
     const legacy = {
+      source_id: SOURCE_ID,
       session_id: "session",
       start_user_message_id: "start",
       end_user_message_id: "end",
       messages: [{ role: "user", text: "text" }],
     };
     const exact = {
+      source_id: SOURCE_ID,
       session_id: "session",
       start_user_message_id: "turn",
       end_user_message_id: "turn",
@@ -478,8 +555,11 @@ describe("segment API", () => {
       [payloads[0], payloads[1]],
       [payloads[2], payloads[3]],
     ]) {
-      expect(withSource).toEqual(withoutSource);
-      expect(withSource).not.toHaveProperty("source_id");
+      expect(withSource).toEqual({
+        ...withoutSource,
+        source_id: withSource?.source_id,
+      });
+      expect(withSource).toHaveProperty("source_id");
       if (withoutSource === undefined || withSource === undefined) {
         throw new Error("missing enqueue payload");
       }
@@ -495,6 +575,7 @@ describe("segment API", () => {
   test("rejects invalid transport source IDs and unrelated fields", async () => {
     const { app, injected } = appWith();
     const base = {
+      source_id: SOURCE_ID,
       session_id: "session",
       start_user_message_id: "start",
       end_user_message_id: "end",
@@ -525,6 +606,7 @@ describe("segment API", () => {
     const enqueue = vi.fn<AppDatabase["enqueue"]>(async () => jobResponse());
     const { app } = appWith(dependencies({ database: { enqueue } }));
     const body = JSON.stringify({
+      source_id: SOURCE_ID,
       session_id: "session",
       start_user_message_id: "start",
       end_user_message_id: "end",
@@ -564,6 +646,29 @@ describe("segment API", () => {
 });
 
 describe("jobs and committed segments", () => {
+  test.each(["retry", "restart", "supersede"])(
+    "requires a strict source body for %s, never a query-only source",
+    async (action) => {
+      const { app, injected } = appWith();
+      for (const options of [
+        {},
+        { query: { source_id: SOURCE_ID } },
+        { payload: {} },
+        { payload: { source_id: SOURCE_ID, extra: true } },
+      ]) {
+        const response = await app.inject({
+          method: "POST",
+          url: `/v1/jobs/1/${action}`,
+          headers: API_HEADERS,
+          ...options,
+        });
+        expect(response.statusCode).toBe(422);
+      }
+      expect(injected.database.retryFailedJob).not.toHaveBeenCalled();
+      expect(injected.database.supersedeFailedJob).not.toHaveBeenCalled();
+      expect(injected.worker.wake).not.toHaveBeenCalled();
+    },
+  );
   test("returns jobs, missing resources, validation errors, and retry conflicts", async () => {
     const existing = jobResponse("failed");
     const getJob = vi
@@ -583,32 +688,35 @@ describe("jobs and committed segments", () => {
 
     const found = await app.inject({
       method: "GET",
-      url: "/v1/jobs/1",
+      url: "/v1/jobs/1?source_id=test-source",
       headers: API_HEADERS,
     });
     const missing = await app.inject({
       method: "GET",
-      url: "/v1/jobs/2",
+      url: "/v1/jobs/2?source_id=test-source",
       headers: API_HEADERS,
     });
     const invalid = await app.inject({
       method: "GET",
-      url: "/v1/jobs/not-an-int",
+      url: "/v1/jobs/not-an-int?source_id=test-source",
       headers: API_HEADERS,
     });
     const retried = await app.inject({
       method: "POST",
       url: "/v1/jobs/1/retry",
+      payload: { source_id: SOURCE_ID },
       headers: API_HEADERS,
     });
     const conflict = await app.inject({
       method: "POST",
       url: "/v1/jobs/1/retry",
+      payload: { source_id: SOURCE_ID },
       headers: API_HEADERS,
     });
     const retryMissing = await app.inject({
       method: "POST",
       url: "/v1/jobs/2/retry",
+      payload: { source_id: SOURCE_ID },
       headers: API_HEADERS,
     });
 
@@ -656,11 +764,12 @@ describe("jobs and committed segments", () => {
     const restartOk = await app.inject({
       method: "POST",
       url: "/v1/jobs/1/restart",
+      payload: { source_id: SOURCE_ID },
       headers: API_HEADERS,
     });
     expect(restartOk.statusCode).toBe(202);
     expect(restartOk.json()).toEqual(existing);
-    expect(retryFailedJob).toHaveBeenLastCalledWith(1, {
+    expect(retryFailedJob).toHaveBeenLastCalledWith(SOURCE_ID, 1, {
       restartExtraction: true,
     });
     expect(injected.worker.wake).toHaveBeenCalledTimes(1);
@@ -668,6 +777,7 @@ describe("jobs and committed segments", () => {
     const restartConflict = await app.inject({
       method: "POST",
       url: "/v1/jobs/1/restart",
+      payload: { source_id: SOURCE_ID },
       headers: API_HEADERS,
     });
     expect(restartConflict.statusCode).toBe(409);
@@ -679,6 +789,7 @@ describe("jobs and committed segments", () => {
     const restartMissing = await app.inject({
       method: "POST",
       url: "/v1/jobs/2/restart",
+      payload: { source_id: SOURCE_ID },
       headers: API_HEADERS,
     });
     expect(restartMissing.statusCode).toBe(404);
@@ -687,6 +798,7 @@ describe("jobs and committed segments", () => {
     const restartInvalid = await app.inject({
       method: "POST",
       url: "/v1/jobs/not-an-int/restart",
+      payload: { source_id: SOURCE_ID },
       headers: API_HEADERS,
     });
     expect(restartInvalid.statusCode).toBe(422);
@@ -694,22 +806,25 @@ describe("jobs and committed segments", () => {
     const restartUnauthorized = await app.inject({
       method: "POST",
       url: "/v1/jobs/1/restart",
+      payload: { source_id: SOURCE_ID },
     });
     expect(restartUnauthorized.statusCode).toBe(401);
 
     const supersedeOk = await app.inject({
       method: "POST",
       url: "/v1/jobs/1/supersede",
+      payload: { source_id: SOURCE_ID },
       headers: API_HEADERS,
     });
     expect(supersedeOk.statusCode).toBe(200);
     expect(supersedeOk.json()).toEqual(superseded);
-    expect(supersedeFailedJob).toHaveBeenLastCalledWith(1);
+    expect(supersedeFailedJob).toHaveBeenLastCalledWith(SOURCE_ID, 1);
     expect(injected.worker.wake).toHaveBeenCalledTimes(1);
 
     const supersedeConflict = await app.inject({
       method: "POST",
       url: "/v1/jobs/1/supersede",
+      payload: { source_id: SOURCE_ID },
       headers: API_HEADERS,
     });
     expect(supersedeConflict.statusCode).toBe(409);
@@ -720,6 +835,7 @@ describe("jobs and committed segments", () => {
     const supersedeMissing = await app.inject({
       method: "POST",
       url: "/v1/jobs/2/supersede",
+      payload: { source_id: SOURCE_ID },
       headers: API_HEADERS,
     });
     expect(supersedeMissing.statusCode).toBe(404);
@@ -728,6 +844,7 @@ describe("jobs and committed segments", () => {
     const supersedeInvalid = await app.inject({
       method: "POST",
       url: "/v1/jobs/not-an-int/supersede",
+      payload: { source_id: SOURCE_ID },
       headers: API_HEADERS,
     });
     expect(supersedeInvalid.statusCode).toBe(422);
@@ -735,12 +852,14 @@ describe("jobs and committed segments", () => {
     const supersedeUnauthorized = await app.inject({
       method: "POST",
       url: "/v1/jobs/1/supersede",
+      payload: { source_id: SOURCE_ID },
     });
     expect(supersedeUnauthorized.statusCode).toBe(401);
   });
 
   test("validates failed target matching pure logic", () => {
     const payload = parseSegmentCreate({
+      source_id: SOURCE_ID,
       session_id: "ses_1",
       start_user_message_id: "msg_user_1",
       end_user_message_id: "msg_user_1",
@@ -756,6 +875,7 @@ describe("jobs and committed segments", () => {
     const validJob = {
       id: 1,
       segment_id: segmentId,
+      source_id: SOURCE_ID,
       session_id: "ses_1",
       start_user_message_id: "msg_user_1",
       status: "failed",
@@ -785,42 +905,67 @@ describe("jobs and committed segments", () => {
       processing_priority: 0,
     };
 
-    expect(failedTargetMatchesJob(undefined, validJob)).toBe(false);
-    expect(failedTargetMatchesJob(validTarget, validJob)).toBe(true);
     expect(
-      failedTargetMatchesJob({ ...validTarget, job_id: 2 }, validJob),
+      failedTargetMatchesJob(undefined, validJob, {
+        id: SOURCE_ID,
+        kind: "opencode-v1",
+        identity_scheme: "legacy",
+      }),
+    ).toBe(false);
+    expect(
+      failedTargetMatchesJob(validTarget, validJob, {
+        id: SOURCE_ID,
+        kind: "opencode-v1",
+        identity_scheme: "legacy",
+      }),
+    ).toBe(true);
+    expect(
+      failedTargetMatchesJob({ ...validTarget, job_id: 2 }, validJob, {
+        id: SOURCE_ID,
+        kind: "opencode-v1",
+        identity_scheme: "legacy",
+      }),
     ).toBe(false);
     expect(
       failedTargetMatchesJob(
         { ...validTarget, source_generation: 2n },
         validJob,
+        { id: SOURCE_ID, kind: "opencode-v1", identity_scheme: "legacy" },
       ),
     ).toBe(false);
     expect(
       failedTargetMatchesJob(
         { ...validTarget, source_fingerprint: "other" },
         validJob,
+        { id: SOURCE_ID, kind: "opencode-v1", identity_scheme: "legacy" },
       ),
     ).toBe(false);
     expect(
       failedTargetMatchesJob(
         { ...validTarget, projection_version: 2 },
         validJob,
+        { id: SOURCE_ID, kind: "opencode-v1", identity_scheme: "legacy" },
       ),
     ).toBe(false);
     expect(
       failedTargetMatchesJob(
         { ...validTarget, payload: "invalid-json" },
         validJob,
+        { id: SOURCE_ID, kind: "opencode-v1", identity_scheme: "legacy" },
       ),
     ).toBe(false);
     expect(
       failedTargetMatchesJob(
         {
           ...validTarget,
-          payload: { ...payload, session_id: "other_ses" },
+          payload: {
+            ...payload,
+            source_id: SOURCE_ID,
+            session_id: "other_ses",
+          },
         },
         validJob,
+        { id: SOURCE_ID, kind: "opencode-v1", identity_scheme: "legacy" },
       ),
     ).toBe(false);
   });
@@ -829,6 +974,7 @@ describe("jobs and committed segments", () => {
     const segmentId = randomUUID();
     const segment: SegmentResponse = {
       id: segmentId,
+      source_id: SOURCE_ID,
       session_id: "session",
       start_user_message_id: "start",
       end_user_message_id: "end",
@@ -848,17 +994,17 @@ describe("jobs and committed segments", () => {
 
     const found = await app.inject({
       method: "GET",
-      url: `/v1/segments/${segmentId}`,
+      url: `/v1/segments/${segmentId}?source_id=test-source`,
       headers: API_HEADERS,
     });
     const missing = await app.inject({
       method: "GET",
-      url: `/v1/segments/${randomUUID()}`,
+      url: `/v1/segments/${randomUUID()}?source_id=test-source`,
       headers: API_HEADERS,
     });
     const invalid = await app.inject({
       method: "GET",
-      url: "/v1/segments/not-a-uuid",
+      url: "/v1/segments/not-a-uuid?source_id=test-source",
       headers: API_HEADERS,
     });
 
@@ -876,7 +1022,7 @@ describe("jobs and committed segments", () => {
 
     const response = await app.inject({
       method: "GET",
-      url: `/v1/segments/${segmentId}`,
+      url: `/v1/segments/${segmentId}?source_id=test-source`,
       headers: API_HEADERS,
     });
 
@@ -921,12 +1067,13 @@ describe("jobs and committed segments", () => {
 
     const response = await app.inject({
       method: "GET",
-      url: "/v1/sessions/session/segments",
+      url: "/v1/sessions/session/segments?source_id=test-source",
       headers: API_HEADERS,
     });
 
     expect(response.json()).toEqual({
       manifest_version: 2,
+      source_id: SOURCE_ID,
       session_id: "session",
       segments: [summary],
       boundaries: [
@@ -1001,7 +1148,7 @@ describe("search and framework compatibility", () => {
     });
     const wrongMethod = await app.inject({
       method: "POST",
-      url: "/v1/jobs/1",
+      url: "/v1/jobs/1?source_id=test-source",
     });
     const docs = await app.inject({ method: "GET", url: "/docs" });
     const redoc = await app.inject({ method: "GET", url: "/redoc" });

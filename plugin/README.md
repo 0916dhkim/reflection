@@ -29,6 +29,13 @@ Create `~/.config/opencode/reflection.json`:
   "url": "https://your-reflection-service.example.com",
   "apiKey": "your-api-key",
   "sourceId": "your-stable-opencode-source",
+  "sources": {
+    "your-stable-opencode-source": {
+      "kind": "opencode-v1",
+      "url": "http://127.0.0.1:4096",
+      "directory": "/your/workspace"
+    }
+  },
   "contextProjection": {
     "enabled": false
   }
@@ -41,14 +48,16 @@ Protect the file as a secret and never commit it:
 chmod 600 ~/.config/opencode/reflection.json
 ```
 
-Every request sends `apiKey` as `X-Api-Key`. `sourceId` is required, is trimmed, and must be a nonblank string of at most 500 characters. Choose a stable identifier for this OpenCode writer; Reflection never supplies a v1 default. All ingestion mutations, including retries, send it as `source_id`. The plugin pins its writer configuration at startup, so changing `sourceId` requires an OpenCode restart. Context projection is experimental and defaults to disabled.
+Every Reflection request sends `apiKey` as `X-Api-Key`. `sourceId` is required, is trimmed, and must be a nonblank string of at most 500 characters. `sources` must configure that source and can optionally configure remote sources with an OpenCode kind, endpoint, and HTTP basic-reader credentials. Credentials are never returned by tools or logged. The service registry must agree with each configured kind. Choose a stable identifier for this OpenCode writer; Reflection never supplies a default. All ingestion mutations, including retries, send it as `source_id`. The plugin pins its writer configuration at startup, so changing it requires an OpenCode restart. Context projection is experimental and defaults to disabled.
 
 ## Memory tools
 
-- `memory_search(query)` calls `POST /v1/search` and returns structured claims with their supporting segment IDs.
-- `memory_read_segment(segment_id)` calls `GET /v1/segments/{id}`, reloads that OpenCode session locally, and returns ordered user/assistant text for the committed source boundary.
+- `memory_search(query)` calls `POST /v1/search` and returns structured claims whose supporting references are `{source_id, segment_id}` pairs.
+- `memory_read_segment(source_id, segment_id)` calls `GET /v1/segments/{id}?source_id=...`, validates the returned ownership pair, reloads that exact configured source, and returns ordered user/assistant text for the committed source boundary.
 
-Hydration is local and fails closed if the session history no longer exists. A v1 segment hydrates complete turns between its inclusive user boundaries. A v2 segment resolves its inclusive `start_source_message_id` and `end_source_message_id` within one user turn and returns exactly that intra-turn span. Missing, duplicate, reordered, or cross-turn v2 cursors are errors rather than a reason to widen the read to a whole turn.
+Hydration fails closed if the source is unavailable or history no longer exists. A boundary-v1 segment hydrates complete turns between its inclusive user boundaries; boundary-v2 resolves an exact span within a v1 user turn. Remote v1 reads follow `X-Next-Cursor` with `before`. The separate native-v2 reader preserves typed source records and follows cursor pagination, but native-v2 range hydration remains CP009 work. Both legacy boundary versions are rejected for native-v2 sources, rather than fabricating parent links. Reads use one bounded deadline for the complete page sequence and reject duplicate messages or repeated cursors.
+
+Native v2 records use the flat OpenCode 2.0.8 `SessionMessage.Info` transport (`id`, `type`, `time`, and type-specific `text` or `content`), not v1's `info`/`parts` envelope. The reader validates minimum bodies for all pinned message types, including synthetic completions, idle markers, and agent/model/location switches, while preserving additional fields unchanged. It never converts synthetic records into user-authored input or fabricates parent links.
 
 Tool calls normally do not appear in hydrated/extracted text, but their complete model-visible representation contributes to segmentation weight. When every ordinary source message in a segment is blank, extraction receives up to 20,000 characters of sanitized tool names and state instead. Sanitized tool JSON sorts object keys recursively before truncation so transport key order cannot change source fingerprints. Objects with redacted keys use an entry-array representation so literal placeholder-shaped keys cannot collide with renderer placeholders. The server also recognizes the bounded legacy flat-key representation; deploy the compatible server before a plugin that emits the entry-array representation. This fallback omits reasoning, inline `data:` values, and compacted tool output. File parts become bounded filename and MIME markers. Empty model-visible messages remain in the submitted source with an empty `text` value.
 
@@ -77,6 +86,8 @@ When enabled, the plugin sets OpenCode `compaction.auto` to `false`. It starts c
 The request estimate covers the message payload visible to the transform plus a conservative reserve. The hook runs before OpenCode assembles final instruction files, MCP content, tool schemas, later plugin transforms, and provider-specific rewrites, so the estimate is not an absolute bound on the final provider request. A hard bound requires an OpenCode seam that exposes the assembled request before dispatch.
 
 Projection replaces only the archived prefix with a synthetic compaction user/assistant pair. The retained raw tail is immutable. Its first message ID and generated summary are persisted as a mode-`0600` checkpoint under `~/.local/state/reflection/projection/` and reused across ordinary loops for provider-cache stability. A checkpoint is discarded only when its referenced local messages no longer match or a later safe reset replaces more of the prefix.
+
+Checkpoints are isolated in hashed source directories. The registered legacy source uses lazy read-only legacy adoption on next state write: `get()` can read an existing unscoped checkpoint but never moves, writes, or deletes it. After reading legacy state, it rechecks namespaced state and the migration marker so a concurrent `set()` or `delete()` wins. The next normal `set()` persists the namespaced envelope; both `set()` and `delete()` create a durable marker that permanently detaches the source from unscoped fallback. New sources never read legacy checkpoints.
 
 On an actual reset, the transform performs this bounded sequence:
 

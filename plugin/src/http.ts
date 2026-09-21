@@ -67,7 +67,7 @@ export function safeErrorDetail(
   apiKey: string,
   maxChars = MAX_ERROR_DETAIL_CHARS,
 ): string {
-  const redacted = value.split(apiKey).join("[REDACTED]");
+  const redacted = apiKey ? value.split(apiKey).join("[REDACTED]") : value;
   return redacted
     .replace(/[\u0000-\u001f\u007f-\u009f]/gu, " ")
     .replace(/\s+/g, " ")

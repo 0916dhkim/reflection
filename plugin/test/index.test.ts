@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
@@ -19,6 +20,11 @@ import {
   type ReflectionSegment,
 } from "@reflection/shared/segmentation";
 import { parseJobResponse } from "@reflection/shared/contracts";
+import {
+  sourceSegmentIdForRequest,
+  type SourceInfo,
+  type SourceSegmentCreate,
+} from "@reflection/shared/sources";
 import {
   segmentIdForRequest,
   sourceFingerprint,
@@ -120,6 +126,13 @@ function writeConfig(overrides: Record<string, unknown> = {}): void {
       url: "https://reflection.example.com",
       apiKey: "test",
       sourceId: "test-opencode-source",
+      sources: {
+        "test-opencode-source": {
+          kind: "opencode-v1",
+          url: "http://127.0.0.1:4096",
+          directory: "/tmp",
+        },
+      },
       contextProjection: { enabled: true },
       ...overrides,
     }),
@@ -298,6 +311,9 @@ function v2Manifest(data: unknown): unknown {
     return data;
   }
   const value = data as Record<string, unknown>;
+  if ("segment_id" in value || ("claims" in value && "session_id" in value)) {
+    return { source_id: "test-opencode-source", ...value };
+  }
   if (
     typeof value.session_id !== "string" ||
     !Array.isArray(value.segments) ||
@@ -338,6 +354,7 @@ function v2Manifest(data: unknown): unknown {
     return normalized;
   };
   return {
+    source_id: "test-opencode-source",
     ...value,
     manifest_version: value.manifest_version ?? 2,
     segments: value.segments.map(boundary),
@@ -351,6 +368,32 @@ function ok(data: unknown = {}): Response {
     status: 200,
     headers: { "Content-Type": "application/json" },
   });
+}
+
+// These legacy-writer scenarios use one explicit registry entry. Unknown source
+// URLs still reach the scenario mock; responses are never inferred from requests.
+function stubLegacyFetch(
+  name: "fetch",
+  handler: (...args: Parameters<typeof fetch>) => unknown,
+): void {
+  vi.stubGlobal(
+    name,
+    (url: Parameters<typeof fetch>[0], init?: RequestInit) => {
+      if (
+        String(url) ===
+        "https://reflection.example.com/v1/sources/test-opencode-source"
+      ) {
+        return Promise.resolve(
+          ok({
+            id: "test-opencode-source",
+            kind: "opencode-v1",
+            identity_scheme: "legacy",
+          }),
+        );
+      }
+      return handler(url, init);
+    },
+  );
 }
 
 function acceptedSegment(
@@ -402,6 +445,413 @@ function emptyListing(
 }
 
 describe("Reflection plugin hooks", () => {
+  it("bounds source-owned metadata reads and does not hydrate on timeout", async () => {
+    vi.useFakeTimers();
+    const client = clientFor([]);
+    let metadataSignal: AbortSignal | undefined;
+    stubLegacyFetch(
+      "fetch",
+      async (_url, init) =>
+        new Promise<Response>((_resolve, reject) => {
+          metadataSignal = init?.signal ?? undefined;
+          metadataSignal?.addEventListener(
+            "abort",
+            () => reject(metadataSignal?.reason),
+            { once: true },
+          );
+        }),
+    );
+    const hooks = await Reflection(pluginInput(client));
+    const pending = hooks.tool!.memory_read_segment!.execute(
+      { source_id: "test-opencode-source", segment_id: "segment" },
+      { abort: new AbortController().signal } as never,
+    );
+    await vi.advanceTimersByTimeAsync(0);
+    expect(metadataSignal).toBeDefined();
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(await pending).toContain("timed out after 5000ms");
+    expect(metadataSignal?.aborted).toBe(true);
+    expect(client.session.messages).not.toHaveBeenCalled();
+  });
+
+  it.each(["registry", "metadata"])(
+    "redacts local endpoint and credentials from backend %s errors",
+    async (operation) => {
+      const secrets = [
+        "reflection-api-secret",
+        "http://private-reader.internal:4096",
+        "reader-name",
+        "reader-password",
+        Buffer.from("reader-name:reader-password").toString("base64"),
+      ];
+      writeConfig({
+        apiKey: secrets[0],
+        sources: {
+          "test-opencode-source": {
+            kind: "opencode-v1",
+            url: secrets[1],
+            username: secrets[2],
+            password: secrets[3],
+          },
+        },
+      });
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (url: string | URL | Request) => {
+          if (operation === "metadata" && String(url).includes("/v1/sources/"))
+            return ok({
+              id: "test-opencode-source",
+              kind: "opencode-v1",
+              identity_scheme: "legacy",
+            });
+          return new Response(secrets.join(" "), { status: 502 });
+        }),
+      );
+      const client = clientFor([]);
+      const hooks = await Reflection(pluginInput(client));
+      const result = await hooks.tool!.memory_read_segment!.execute(
+        { source_id: "test-opencode-source", segment_id: "segment" },
+        { abort: new AbortController().signal } as never,
+      );
+      expect(result).toContain("502");
+      expect(result).toContain("[REDACTED]");
+      for (const secret of secrets) expect(result).not.toContain(secret);
+      expect(client.session.messages).not.toHaveBeenCalled();
+      expect(client.app.log).not.toHaveBeenCalled();
+    },
+  );
+
+  it("returns search support as explicit source/segment pairs", async () => {
+    const claims = [
+      {
+        subject: "shared",
+        segments: [
+          { source_id: "first", segment_id: "segment-a" },
+          { source_id: "second", segment_id: "segment-b" },
+        ],
+      },
+    ];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+        expect(String(url)).toBe("https://reflection.example.com/v1/search");
+        expect(init?.method).toBe("POST");
+        return ok({ claims });
+      }),
+    );
+    const hooks = await Reflection(pluginInput(clientFor([])));
+    const result = await hooks.tool!.memory_search!.execute(
+      { query: "shared" },
+      { abort: new AbortController().signal } as never,
+    );
+    if (typeof result !== "string")
+      throw new Error("expected JSON tool output");
+    expect(JSON.parse(result)).toEqual({ claims });
+  });
+
+  it("reuses source-v1 projection identities during canonical checkpoint validation", async () => {
+    const sessionId = "source-v1-checkpoint";
+    const messages = projectionMessages(sessionId);
+    const client = clientFor(messages);
+    const source: SourceInfo = {
+      id: "test-opencode-source",
+      kind: "opencode-v1",
+      identity_scheme: "source-v1",
+    };
+    let gets = 0;
+    let summary: ReturnType<typeof segmentSummary> | undefined;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+        if (String(url).endsWith(`/sources/${source.id}`)) return ok(source);
+        if (init?.method === "POST") {
+          const body = JSON.parse(String(init.body)) as SourceSegmentCreate;
+          const id = sourceSegmentIdForRequest(body, source);
+          summary = {
+            ...segmentSummary(
+              sessionId,
+              segmentMessages(messages)[0]!,
+              "SOURCE OWNED SUMMARY",
+            ),
+            id,
+          };
+          return ok({
+            ...segmentJob(body),
+            source_id: source.id,
+            segment_id: id,
+          });
+        }
+        gets += 1;
+        return ok({
+          source_id: source.id,
+          session_id: sessionId,
+          segments: summary ? [summary] : [],
+          boundaries: [],
+          targets: [],
+        });
+      }),
+    );
+    const hooks = await Reflection(pluginInput(client));
+    const first = { messages: structuredClone(messages) };
+    await hooks["experimental.chat.messages.transform"]?.({}, first as never);
+    expect(first.messages[0]?.parts[0]?.text).toContain("SOURCE OWNED SUMMARY");
+    const firstGets = gets;
+    messages.push({
+      ...structuredClone(messages[2]!),
+      info: { ...messages[2]!.info, id: "next-user" },
+    });
+    await hooks["experimental.chat.messages.transform"]?.({}, {
+      messages: structuredClone(messages),
+    } as never);
+    expect(gets).toBe(firstGets + 1);
+  });
+
+  it.each(["legacy", "source-v1"] as const)(
+    "uses the registered %s identity for writer jobs",
+    async (identity_scheme) => {
+      const source: SourceInfo = {
+        id: "test-opencode-source",
+        kind: "opencode-v1",
+        identity_scheme,
+      };
+      const posted: SourceSegmentCreate[] = [];
+      const client = clientFor(
+        projectionMessages(`identity-${identity_scheme}`),
+      );
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+          const path = new URL(String(url));
+          if (path.pathname === `/v1/sources/${source.id}`) return ok(source);
+          if (init?.method === "POST") {
+            const body = JSON.parse(String(init.body)) as SourceSegmentCreate;
+            posted.push(body);
+            return ok({
+              ...segmentJob(body),
+              source_id: source.id,
+              segment_id: sourceSegmentIdForRequest(body, source),
+            });
+          }
+          expect(path.searchParams.get("source_id")).toBe(source.id);
+          return ok({
+            source_id: source.id,
+            session_id: `identity-${identity_scheme}`,
+            segments: [],
+            boundaries: [],
+            targets: [],
+          });
+        }),
+      );
+      const hooks = await Reflection(pluginInput(client));
+      await hooks.event?.({
+        event: {
+          type: "session.idle",
+          properties: { sessionID: `identity-${identity_scheme}` },
+        },
+      } as never);
+      expect(posted).toHaveLength(1);
+      expect(posted[0]?.source_id).toBe(source.id);
+      expect(
+        sourceSegmentIdForRequest(posted[0]!, source) ===
+          segmentIdForRequest(posted[0]!),
+      ).toBe(identity_scheme === "legacy");
+      expect(
+        client.app.log.mock.calls
+          .flatMap(([input]) => input.body.message)
+          .join(" "),
+      ).not.toContain("invalid job");
+    },
+  );
+
+  it.each([
+    null,
+    { bad: null },
+    { bad: { kind: "opencode-v1", url: "not a URL" } },
+    { bad: { kind: "opencode-v1", url: "http://host", username: "reader" } },
+  ])("rejects malformed sources without dropping entries: %j", async (bad) => {
+    writeConfig({
+      sources:
+        bad === null
+          ? null
+          : {
+              "test-opencode-source": {
+                kind: "opencode-v1",
+                url: "http://localhost",
+              },
+              ...bad,
+            },
+    });
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    const hooks = await Reflection(pluginInput(clientFor([])));
+    await expect(
+      hooks["experimental.chat.messages.transform"]?.({}, {
+        messages: projectionMessages("bad-source"),
+      } as never),
+    ).rejects.toThrow("sources config");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    "registry-id",
+    "registry-kind",
+    "metadata-source",
+    "missing-source",
+    "unknown-source",
+    "offline",
+  ])("fails closed for %s without own-history fallback", async (failure) => {
+    const client = clientFor(projectionMessages("owned-read"));
+    const segment = segmentMessages(projectionMessages("owned-read"))[0]!;
+    const id = segmentId("owned-read", segment);
+    const fetchMock = vi.fn(async (url: string | URL | Request) => {
+      if (String(url).includes("/v1/sources/")) {
+        if (failure === "offline")
+          return new Response("unavailable", { status: 503 });
+        if (failure === "unknown-source")
+          return new Response("unknown", { status: 404 });
+        return ok({
+          id: failure === "registry-id" ? "wrong" : "test-opencode-source",
+          kind: failure === "registry-kind" ? "opencode-v2" : "opencode-v1",
+          identity_scheme: "legacy",
+        });
+      }
+      return ok({
+        id,
+        source_id: "wrong",
+        session_id: "owned-read",
+        start_user_message_id: segment.startUserMessageId,
+        end_user_message_id: segment.endUserMessageId,
+        ...segmentWireBoundary(segment),
+        summary: "summary",
+        claims: [],
+        created_at: "now",
+        updated_at: "now",
+      });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const hooks = await Reflection(pluginInput(client));
+    const reader = hooks.tool!.memory_read_segment!;
+    const response = await reader.execute(
+      {
+        source_id:
+          failure === "missing-source"
+            ? undefined
+            : failure === "unknown-source"
+              ? "unknown"
+              : "test-opencode-source",
+        segment_id: id,
+      } as never,
+      { abort: new AbortController().signal } as never,
+    );
+    if (typeof response !== "string")
+      throw new Error("expected JSON tool output");
+    const result = JSON.parse(response);
+    expect(result.error).toBeTruthy();
+    expect(client.session.messages).not.toHaveBeenCalled();
+    if (failure === "missing-source") expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("does not poison registry lookup after a cancelled read", async () => {
+    const client = clientFor([]);
+    let attempts = 0;
+    let registrySignal: AbortSignal | undefined;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+        attempts += 1;
+        if (attempts === 1)
+          return new Promise<Response>((_resolve, reject) => {
+            registrySignal = init?.signal ?? undefined;
+            registrySignal?.addEventListener(
+              "abort",
+              () => reject(registrySignal?.reason),
+              { once: true },
+            );
+          });
+        return new Response("unavailable", { status: 503 });
+      }),
+    );
+    const hooks = await Reflection(pluginInput(client));
+    const abort = new AbortController();
+    const pending = hooks.tool!.memory_read_segment!.execute(
+      { source_id: "test-opencode-source", segment_id: "segment" },
+      { abort: abort.signal } as never,
+    );
+    const rejected = expect(pending).rejects.toThrow("cancelled");
+    await vi.waitFor(() => expect(registrySignal).toBeDefined());
+    abort.abort(new Error("cancelled"));
+    await rejected;
+    const result = await hooks.tool!.memory_read_segment!.execute(
+      { source_id: "test-opencode-source", segment_id: "segment" },
+      { abort: new AbortController().signal } as never,
+    );
+    expect(result).toContain("503");
+    expect(attempts).toBe(2);
+  });
+
+  it("hydrates a configured remote v1 source with coincident session and message IDs", async () => {
+    const messages = projectionMessages("shared-session");
+    const remoteMessages = structuredClone(messages);
+    remoteMessages[0]!.parts = [{ type: "text", text: "REMOTE USER" }];
+    const segment = segmentMessages(messages)[0]!;
+    const id = segmentId("shared-session", segment);
+    writeConfig({
+      sources: {
+        "test-opencode-source": { kind: "opencode-v1", url: "http://local" },
+        remote: {
+          kind: "opencode-v1",
+          url: "http://remote",
+          username: "reader",
+          password: "remote-secret",
+        },
+      },
+    });
+    const client = clientFor(messages);
+    const calls: string[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+        calls.push(String(url));
+        if (String(url) === "https://reflection.example.com/v1/sources/remote")
+          return ok({
+            id: "remote",
+            kind: "opencode-v1",
+            identity_scheme: "source-v1",
+          });
+        if (
+          String(url) ===
+          `https://reflection.example.com/v1/segments/${id}?source_id=remote`
+        )
+          return ok({
+            id,
+            source_id: "remote",
+            session_id: "shared-session",
+            start_user_message_id: segment.startUserMessageId,
+            end_user_message_id: segment.endUserMessageId,
+            ...segmentWireBoundary(segment),
+            summary: "summary",
+            claims: [],
+            created_at: "now",
+            updated_at: "now",
+          });
+        expect(String(url)).toBe(
+          "http://remote/session/shared-session/message",
+        );
+        expect(new Headers(init?.headers).get("X-Api-Key")).toBeNull();
+        return new Response(JSON.stringify(remoteMessages));
+      }),
+    );
+    const hooks = await Reflection(pluginInput(client));
+    const result = await hooks.tool!.memory_read_segment!.execute(
+      { source_id: "remote", segment_id: id },
+      { abort: new AbortController().signal } as never,
+    );
+    expect(result).toContain("REMOTE USER");
+    expect(result).not.toContain("remote-secret");
+    expect(calls).toHaveLength(3);
+    expect(client.session.messages).not.toHaveBeenCalled();
+  });
+
   it.each([
     [undefined, "missing required sourceId"],
     [null, "invalid sourceId"],
@@ -481,7 +931,7 @@ describe("Reflection plugin hooks", () => {
     const messages = projectionMessages(sessionId);
     const client = clientFor(messages);
     const requests: Array<{ url: string; init: RequestInit | undefined }> = [];
-    vi.stubGlobal(
+    stubLegacyFetch(
       "fetch",
       vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
         requests.push({ url: String(url), init });
@@ -508,7 +958,7 @@ describe("Reflection plugin hooks", () => {
 
     expect(requests).toHaveLength(2);
     expect(requests[0]?.url).toBe(
-      `https://reflection.example.com/v1/sessions/${sessionId}/segments`,
+      `https://reflection.example.com/v1/sessions/${sessionId}/segments?source_id=test-opencode-source`,
     );
     expect(new Headers(requests[0]?.init?.headers).get("X-Api-Key")).toBe(
       "test",
@@ -561,13 +1011,14 @@ describe("Reflection plugin hooks", () => {
     const sessionId = "strict-manifest-session";
     const messages = projectionMessages(sessionId);
     const client = clientFor(messages);
-    vi.stubGlobal(
+    stubLegacyFetch(
       "fetch",
       vi.fn(
         async () =>
           new Response(
             JSON.stringify({
               manifest_version: 1,
+              source_id: "test-opencode-source",
               session_id: sessionId,
               segments: [],
               boundaries: [],
@@ -590,13 +1041,14 @@ describe("Reflection plugin hooks", () => {
     const sessionId = "strict-boundary-session";
     const messages = projectionMessages(sessionId);
     const client = clientFor(messages);
-    vi.stubGlobal(
+    stubLegacyFetch(
       "fetch",
       vi.fn(
         async () =>
           new Response(
             JSON.stringify({
               manifest_version: 2,
+              source_id: "test-opencode-source",
               session_id: sessionId,
               segments: [
                 {
@@ -639,7 +1091,7 @@ describe("Reflection plugin hooks", () => {
     }
     const id = segmentId(sessionId, segment);
     const client = clientFor(messages);
-    vi.stubGlobal(
+    stubLegacyFetch(
       "fetch",
       vi.fn(async () =>
         ok({
@@ -658,14 +1110,14 @@ describe("Reflection plugin hooks", () => {
     const hooks = await Reflection(pluginInput(client));
     const reader = hooks.tool?.memory_read_segment as unknown as {
       execute(
-        args: { segment_id: string },
+        args: { source_id: string; segment_id: string },
         context: { abort: AbortSignal },
       ): Promise<string>;
     };
 
     const result = JSON.parse(
       await reader.execute(
-        { segment_id: id },
+        { source_id: "test-opencode-source", segment_id: id },
         { abort: new AbortController().signal },
       ),
     );
@@ -697,7 +1149,7 @@ describe("Reflection plugin hooks", () => {
         );
       });
     });
-    vi.stubGlobal(
+    stubLegacyFetch(
       "fetch",
       vi.fn(async () =>
         ok({
@@ -716,13 +1168,13 @@ describe("Reflection plugin hooks", () => {
     const hooks = await Reflection(pluginInput(client));
     const reader = hooks.tool?.memory_read_segment as unknown as {
       execute(
-        args: { segment_id: string },
+        args: { source_id: string; segment_id: string },
         context: { abort: AbortSignal },
       ): Promise<string>;
     };
     const cancellation = new AbortController();
     const pending = reader.execute(
-      { segment_id: id },
+      { source_id: "test-opencode-source", segment_id: id },
       { abort: cancellation.signal },
     );
     await vi.waitFor(() => expect(hydrationSignal).toBeDefined());
@@ -744,7 +1196,7 @@ describe("Reflection plugin hooks", () => {
     let maxActivePosts = 0;
     let postCount = 0;
     let summaryGets = 0;
-    vi.stubGlobal(
+    stubLegacyFetch(
       "fetch",
       vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
         if (init?.method === "POST") {
@@ -820,7 +1272,7 @@ describe("Reflection plugin hooks", () => {
     const client = clientFor(messages);
     const submittedBodies: Array<Record<string, unknown>> = [];
     let targetPosts = 0;
-    vi.stubGlobal(
+    stubLegacyFetch(
       "fetch",
       vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
         if (init?.method === "POST") {
@@ -917,7 +1369,7 @@ describe("Reflection plugin hooks", () => {
     ];
     const client = clientFor(messages);
     const submittedBodies: Array<Record<string, unknown>> = [];
-    vi.stubGlobal(
+    stubLegacyFetch(
       "fetch",
       vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
         if (init?.method === "POST") {
@@ -952,7 +1404,7 @@ describe("Reflection plugin hooks", () => {
     messages[0]!.parts = [{ type: "text", text: "x".repeat(1_000_001) }];
     const client = clientFor(messages);
     let targetPosts = 0;
-    vi.stubGlobal(
+    stubLegacyFetch(
       "fetch",
       vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
         if (init?.method === "POST") targetPosts += 1;
@@ -989,7 +1441,7 @@ describe("Reflection plugin hooks", () => {
     const client = clientFor(messages);
     let boundaries: unknown[] = [];
     const posted: Array<Record<string, unknown>> = [];
-    vi.stubGlobal(
+    stubLegacyFetch(
       "fetch",
       vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
         if (init?.method === "POST") {
@@ -1048,7 +1500,7 @@ describe("Reflection plugin hooks", () => {
     const messages = projectionMessages(sessionId);
     const client = clientFor(messages);
     const submittedBodies: Array<Record<string, unknown>> = [];
-    vi.stubGlobal(
+    stubLegacyFetch(
       "fetch",
       vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
         if (init?.method === "POST") {
@@ -1112,7 +1564,7 @@ describe("Reflection plugin hooks", () => {
       segments: [] as unknown[],
       boundaries: [] as unknown[],
     };
-    vi.stubGlobal(
+    stubLegacyFetch(
       "fetch",
       vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
         if (init?.method === "POST") {
@@ -1185,7 +1637,7 @@ describe("Reflection plugin hooks", () => {
     };
     const client = clientFor(raw);
     const posted: Array<Record<string, unknown>> = [];
-    vi.stubGlobal(
+    stubLegacyFetch(
       "fetch",
       vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
         if (init?.method === "POST") {
@@ -1243,7 +1695,7 @@ describe("Reflection plugin hooks", () => {
           : activeMessages,
     }));
     const submittedBodies: Array<Record<string, unknown>> = [];
-    vi.stubGlobal(
+    stubLegacyFetch(
       "fetch",
       vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
         if (init?.method === "POST") {
@@ -1320,7 +1772,7 @@ describe("Reflection plugin hooks", () => {
           : activeMessages,
     }));
     const submittedBodies: Array<Record<string, unknown>> = [];
-    vi.stubGlobal(
+    stubLegacyFetch(
       "fetch",
       vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
         if (init?.method === "POST") {
@@ -1382,7 +1834,7 @@ describe("Reflection plugin hooks", () => {
       data: { time: { updated: currentUpdated } },
     }));
     const submittedBodies: Array<Record<string, unknown>> = [];
-    vi.stubGlobal(
+    stubLegacyFetch(
       "fetch",
       vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
         if (init?.method === "POST") {
@@ -1448,7 +1900,7 @@ describe("Reflection plugin hooks", () => {
     }));
     let summaryGets = 0;
     let openAttempts = 0;
-    vi.stubGlobal(
+    stubLegacyFetch(
       "fetch",
       vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
         if (init?.method === "POST") {
@@ -1545,7 +1997,7 @@ describe("Reflection plugin hooks", () => {
       );
     let summaryGets = 0;
     const submittedBodies: Array<Record<string, unknown>> = [];
-    vi.stubGlobal(
+    stubLegacyFetch(
       "fetch",
       vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
         if (init?.method === "POST") {
@@ -1600,7 +2052,7 @@ describe("Reflection plugin hooks", () => {
     const postResolvers: Array<() => void> = [];
     const submittedBodies: Array<Record<string, unknown>> = [];
     let summaryGets = 0;
-    vi.stubGlobal(
+    stubLegacyFetch(
       "fetch",
       vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
         if (init?.method === "POST") {
@@ -1676,7 +2128,7 @@ describe("Reflection plugin hooks", () => {
     const client = clientFor(messages);
     let releaseFirstGet: (() => void) | undefined;
     let summaryGets = 0;
-    vi.stubGlobal(
+    stubLegacyFetch(
       "fetch",
       vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
         if (init?.method === "POST") return acceptedSegment(init);
@@ -1730,7 +2182,7 @@ describe("Reflection plugin hooks", () => {
     let releaseFirstPost: (() => void) | undefined;
     let summaryGets = 0;
     let targetPosts = 0;
-    vi.stubGlobal(
+    stubLegacyFetch(
       "fetch",
       vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
         if (init?.method === "POST") {
@@ -1814,7 +2266,7 @@ describe("Reflection plugin hooks", () => {
       .mockResolvedValueOnce({ data: firstSnapshot });
     const postResolvers: Array<() => void> = [];
     const submittedBodies: Array<Record<string, unknown>> = [];
-    vi.stubGlobal(
+    stubLegacyFetch(
       "fetch",
       vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
         if (init?.method !== "POST") return emptyListing(url);
@@ -1867,7 +2319,7 @@ describe("Reflection plugin hooks", () => {
     const sessionId = "deleted-session";
     const client = clientFor(projectionMessages(sessionId));
     let postSignal: AbortSignal | undefined;
-    vi.stubGlobal(
+    stubLegacyFetch(
       "fetch",
       vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
         if (init?.method !== "POST") return emptyListing(url);
@@ -1901,6 +2353,7 @@ describe("Reflection plugin hooks", () => {
   });
 
   it("aborts in-flight projection SDK reads when a session is deleted", async () => {
+    stubLegacyFetch("fetch", emptyListing);
     const sessionId = "deleted-projection-session";
     const messages = projectionMessages(sessionId);
     const client = clientFor(messages);
@@ -1954,7 +2407,7 @@ describe("Reflection plugin hooks", () => {
         ),
     );
     const submittedSessions: string[] = [];
-    vi.stubGlobal(
+    stubLegacyFetch(
       "fetch",
       vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
         if (init?.method === "POST") {
@@ -1996,7 +2449,7 @@ describe("Reflection plugin hooks", () => {
       return { data: projectionMessages(id) };
     });
     const postedPriorities = new Map<string, number>();
-    vi.stubGlobal(
+    stubLegacyFetch(
       "fetch",
       vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
         if (init?.method === "POST") {
@@ -2055,7 +2508,7 @@ describe("Reflection plugin hooks", () => {
         );
       });
     });
-    vi.stubGlobal(
+    stubLegacyFetch(
       "fetch",
       vi.fn(async (url: string | URL | Request, init?: RequestInit) =>
         emptyListing(url, init),
@@ -2101,7 +2554,7 @@ describe("Reflection plugin hooks", () => {
         );
       });
     });
-    vi.stubGlobal(
+    stubLegacyFetch(
       "fetch",
       vi.fn(async (url: string | URL | Request, init?: RequestInit) =>
         emptyListing(url, init),
@@ -2147,7 +2600,7 @@ describe("Reflection plugin hooks", () => {
         },
       };
     });
-    vi.stubGlobal(
+    stubLegacyFetch(
       "fetch",
       vi.fn(async (url: string | URL | Request, init?: RequestInit) =>
         emptyListing(url, init),
@@ -2216,7 +2669,7 @@ describe("Reflection plugin hooks", () => {
     let summaryGets = 0;
     let synced = false;
     let releaseRestartSync: (() => void) | undefined;
-    vi.stubGlobal(
+    stubLegacyFetch(
       "fetch",
       vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
         if (init?.method === "POST") {
@@ -2302,6 +2755,7 @@ describe("Reflection plugin hooks", () => {
         "state",
         "reflection",
         "projection",
+        `source-${createHash("sha256").update("test-opencode-source").digest("hex")}`,
         `${encodeURIComponent(sessionId)}.json`,
       ),
       { force: true },
@@ -2321,7 +2775,7 @@ describe("Reflection plugin hooks", () => {
     let sourceChanged = false;
     let currentTargetPresent = false;
     let targetPosts = 0;
-    vi.stubGlobal(
+    stubLegacyFetch(
       "fetch",
       vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
         if (init?.method === "POST") {
@@ -2373,7 +2827,7 @@ describe("Reflection plugin hooks", () => {
     const client = clientFor(messages);
     const submittedBodies: Array<Record<string, unknown>> = [];
     let summaryGets = 0;
-    vi.stubGlobal(
+    stubLegacyFetch(
       "fetch",
       vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
         if (init?.method === "POST") {
@@ -2417,7 +2871,7 @@ describe("Reflection plugin hooks", () => {
     const client = clientFor(messages);
     const submittedBodies: Array<Record<string, unknown>> = [];
     let summaryGets = 0;
-    vi.stubGlobal(
+    stubLegacyFetch(
       "fetch",
       vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
         if (init?.method === "POST") {
@@ -2468,7 +2922,7 @@ describe("Reflection plugin hooks", () => {
     const client = clientFor(messages);
     let summaryGets = 0;
     let targetPosts = 0;
-    vi.stubGlobal(
+    stubLegacyFetch(
       "fetch",
       vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
         if (init?.method === "POST") {
@@ -2517,7 +2971,7 @@ describe("Reflection plugin hooks", () => {
     );
     let targetPosts = 0;
     let summaryGets = 0;
-    vi.stubGlobal(
+    stubLegacyFetch(
       "fetch",
       vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
         if (init?.method === "POST") {
@@ -2593,7 +3047,7 @@ describe("Reflection plugin hooks", () => {
     });
     const submittedBodies: Array<Record<string, unknown>> = [];
     let summaryGets = 0;
-    vi.stubGlobal(
+    stubLegacyFetch(
       "fetch",
       vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
         if (init?.method === "POST") {
@@ -2648,7 +3102,7 @@ describe("Reflection plugin hooks", () => {
     const client = clientFor(messages);
     const submittedBodies: Array<Record<string, unknown>> = [];
     let summaryGets = 0;
-    vi.stubGlobal(
+    stubLegacyFetch(
       "fetch",
       vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
         if (init?.method === "POST") {
@@ -2693,7 +3147,7 @@ describe("Reflection plugin hooks", () => {
     let retryBody: unknown;
     let segmentPosts = 0;
     let retryPosts = 0;
-    vi.stubGlobal(
+    stubLegacyFetch(
       "fetch",
       vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
         if (String(url).endsWith("/retry")) {
@@ -2747,7 +3201,7 @@ describe("Reflection plugin hooks", () => {
     }));
     let targetPosts = 0;
     let summaryGets = 0;
-    vi.stubGlobal(
+    stubLegacyFetch(
       "fetch",
       vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
         if (init?.method === "POST") {
@@ -2812,7 +3266,7 @@ describe("Reflection plugin hooks", () => {
     }));
     let targetPosts = 0;
     let summaryGets = 0;
-    vi.stubGlobal(
+    stubLegacyFetch(
       "fetch",
       vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
         if (init?.method === "POST") {
@@ -2873,7 +3327,7 @@ describe("Reflection plugin hooks", () => {
     const sessionId = "detached-finish-failure-session";
     const client = clientFor(projectionMessages(sessionId));
     client.session.list.mockRejectedValue(new Error("list failed"));
-    vi.stubGlobal(
+    stubLegacyFetch(
       "fetch",
       vi.fn(async (url: string | URL | Request, init?: RequestInit) =>
         emptyListing(url, init),
@@ -2924,7 +3378,7 @@ describe("Reflection plugin hooks", () => {
     const client = clientFor(raw);
     let gets = 0;
     const posted: Array<Record<string, unknown>> = [];
-    vi.stubGlobal(
+    stubLegacyFetch(
       "fetch",
       vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
         if (init?.method === "POST") {
@@ -2975,7 +3429,7 @@ describe("Reflection plugin hooks", () => {
     const required = segmentMessages(messages)[0]!;
     const client = clientFor(messages);
     let summaryGets = 0;
-    vi.stubGlobal(
+    stubLegacyFetch(
       "fetch",
       vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
         if (init?.method === "POST") return acceptedSegment(init);
@@ -3007,7 +3461,7 @@ describe("Reflection plugin hooks", () => {
     const required = segmentMessages(messages)[0]!;
     const client = clientFor(messages);
     let gets = 0;
-    vi.stubGlobal(
+    stubLegacyFetch(
       "fetch",
       vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
         if (init?.method === "POST") return acceptedSegment(init);
@@ -3036,7 +3490,7 @@ describe("Reflection plugin hooks", () => {
     const messages = projectionMessages(sessionId);
     const client = clientFor(messages);
     let gets = 0;
-    vi.stubGlobal(
+    stubLegacyFetch(
       "fetch",
       vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
         if (init?.method === "POST") return acceptedSegment(init);
@@ -3067,7 +3521,7 @@ describe("Reflection plugin hooks", () => {
     const messages = projectionMessages(sessionId);
     const client = clientFor(messages);
     let posts = 0;
-    vi.stubGlobal(
+    stubLegacyFetch(
       "fetch",
       vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
         if (init?.method === "POST") {
@@ -3094,7 +3548,7 @@ describe("Reflection plugin hooks", () => {
     const sessionId = "initial-manifest-timeout";
     const messages = projectionMessages(sessionId);
     const client = clientFor(messages);
-    vi.stubGlobal(
+    stubLegacyFetch(
       "fetch",
       vi.fn(
         async (_url: string | URL | Request, init?: RequestInit) =>
@@ -3128,7 +3582,7 @@ describe("Reflection plugin hooks", () => {
     const messages = projectionMessages(sessionId);
     const client = clientFor(messages);
     let summaryGets = 0;
-    vi.stubGlobal(
+    stubLegacyFetch(
       "fetch",
       vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
         if (init?.method === "POST") {
@@ -3173,7 +3627,7 @@ describe("Reflection plugin hooks", () => {
     const sessionId = "warning-session";
     const messages = projectionMessages(sessionId);
     const client = clientFor(messages);
-    vi.stubGlobal(
+    stubLegacyFetch(
       "fetch",
       vi.fn(async (_url: string | URL | Request, init?: RequestInit) =>
         init?.method === "POST"
@@ -3213,7 +3667,7 @@ describe("Reflection plugin hooks", () => {
     const messages = projectionMessages(sessionId);
     const client = clientFor(messages);
     client.tui.showToast.mockRejectedValue(new Error("TUI disconnected"));
-    vi.stubGlobal(
+    stubLegacyFetch(
       "fetch",
       vi.fn(async (_url: string | URL | Request, init?: RequestInit) =>
         init?.method === "POST"
@@ -3244,7 +3698,7 @@ describe("Reflection plugin hooks", () => {
       const closed = segmentMessages(messages)[0]!;
       const client = clientFor(messages);
       let targetPosts = 0;
-      vi.stubGlobal(
+      stubLegacyFetch(
         "fetch",
         vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
           if (init?.method === "POST") {
@@ -3331,7 +3785,7 @@ describe("Reflection plugin hooks", () => {
     const closed = segmentMessages(messages)[0]!;
     const client = clientFor(messages);
     let summaryGets = 0;
-    vi.stubGlobal(
+    stubLegacyFetch(
       "fetch",
       vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
         if (init?.method === "POST") return acceptedSegment(init);
@@ -3448,7 +3902,7 @@ describe("Reflection plugin hooks", () => {
     const client = clientFor(messages);
     let summaryPresent = false;
     let targetPosts = 0;
-    vi.stubGlobal(
+    stubLegacyFetch(
       "fetch",
       vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
         if (init?.method === "POST") {
@@ -3541,7 +3995,7 @@ describe("Reflection plugin hooks", () => {
     let firstSummaryText = "Initial summary 1";
     let secondSummaryPresent = false;
     let targetPosts = 0;
-    vi.stubGlobal(
+    stubLegacyFetch(
       "fetch",
       vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
         if (init?.method === "POST") {
@@ -3649,7 +4103,7 @@ describe("Reflection plugin hooks", () => {
       cache: { read: 0, write: 0 },
     };
     const client = clientFor(raw);
-    vi.stubGlobal(
+    stubLegacyFetch(
       "fetch",
       vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
         if (init?.method === "POST") {
@@ -3698,7 +4152,7 @@ describe("Reflection plugin hooks", () => {
     const client = clientFor(messages);
     let targetPosts = 0;
     let manifestHasBoundaries = true;
-    vi.stubGlobal(
+    stubLegacyFetch(
       "fetch",
       vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
         if (init?.method === "POST") {
@@ -3755,7 +4209,7 @@ describe("Reflection plugin hooks", () => {
     const closed = segmentMessages(messages)[0]!;
     const client = clientFor(messages);
     let summaryGets = 0;
-    vi.stubGlobal(
+    stubLegacyFetch(
       "fetch",
       vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
         if (init?.method === "POST") return acceptedSegment(init);
@@ -3809,7 +4263,7 @@ describe("Reflection plugin hooks", () => {
     const client = clientFor(messages);
     let postCount = 0;
     let summaryGets = 0;
-    vi.stubGlobal(
+    stubLegacyFetch(
       "fetch",
       vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
         if (init?.method === "POST") {
@@ -3871,7 +4325,7 @@ describe("Reflection plugin hooks", () => {
     const closed = segmentMessages(messages)[0]!;
     const client = clientFor(messages);
     let gets = 0;
-    vi.stubGlobal(
+    stubLegacyFetch(
       "fetch",
       vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
         if (init?.method === "POST") {
@@ -3913,7 +4367,7 @@ describe("Reflection plugin hooks", () => {
     const postStartedPromise = new Promise<void>((resolve) => {
       postStarted = resolve;
     });
-    vi.stubGlobal(
+    stubLegacyFetch(
       "fetch",
       vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
         if (init?.method === "POST") {
@@ -3961,7 +4415,7 @@ describe("Reflection plugin hooks", () => {
     const directGetPromise = new Promise<void>((resolve) => {
       directGetStarted = resolve;
     });
-    vi.stubGlobal(
+    stubLegacyFetch(
       "fetch",
       vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
         if (init?.method === "POST") {

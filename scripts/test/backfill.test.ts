@@ -17,6 +17,10 @@ import {
   sourceFingerprint,
 } from "@reflection/shared/domain";
 import {
+  sourceSegmentIdForRequest,
+  type SourceInfo,
+} from "@reflection/shared/sources";
+import {
   segmentMessages,
   type CommittedSegmentBoundary,
   type OpenCodeMessage,
@@ -52,6 +56,7 @@ import {
   resolveBackfillOptions,
   runBackfill,
   segmentSubmission,
+  segmentPlan,
   serializeState,
   serializeSegmentTransport,
   sessionRemainsStable,
@@ -63,12 +68,216 @@ import {
   type PlannedSegment,
   type ProcessingContext,
   type ReflectionJob,
-  type ReflectionService,
+  type ReflectionService as RegisteredReflectionService,
   type SegmentManifest,
   type SessionStore,
 } from "../src/backfill.js";
 
 const SESSION_ID = "session-1";
+const LEGACY_SOURCE: SourceInfo = {
+  id: "test-opencode-source",
+  kind: "opencode-v1",
+  identity_scheme: "legacy",
+};
+type ReflectionService = Omit<RegisteredReflectionService, "getSource">;
+
+function ownedManifest(manifest: SegmentManifest = emptyManifest()) {
+  return { ...manifest, source_id: LEGACY_SOURCE.id };
+}
+
+function ownedJob(
+  submission: SegmentCreate,
+  overrides: Partial<ReflectionJob> = {},
+) {
+  return { ...jobFor(submission, overrides), source_id: LEGACY_SOURCE.id };
+}
+
+describe("source-owned backfill contracts", () => {
+  it("rejects missing runtime sources before any manifest request or history loading", async () => {
+    const request = vi.fn();
+    const store: SessionStore = {
+      sessions: [],
+      sessionUpdatedAt: vi.fn(),
+      sessionMessages: vi.fn(),
+    };
+    const missing = undefined as unknown as SourceInfo;
+    await expect(
+      segmentPlan(SESSION_ID, [], { request }, missing),
+    ).rejects.toThrow();
+    await expect(
+      createDryRunSummary([], store, { request }, missing),
+    ).rejects.toThrow();
+    expect(request).not.toHaveBeenCalled();
+    expect(store.sessionMessages).not.toHaveBeenCalled();
+  });
+
+  it.each([undefined, "wrong"])(
+    "rejects unowned processSession job responses: %s",
+    async (source_id) => {
+      const messages = [user("u1", "request")];
+      const service: ReflectionService = {
+        request: vi.fn(async (path, init) => {
+          if (path.includes("/sessions/")) {
+            expect(path).toContain(`?source_id=${LEGACY_SOURCE.id}`);
+            return ownedManifest();
+          }
+          const submission = JSON.parse(String(init?.body));
+          expect(submission.source_id).toBe(LEGACY_SOURCE.id);
+          return {
+            ...jobFor(submission),
+            ...(source_id === undefined ? {} : { source_id }),
+          };
+        }),
+        getJob: vi.fn(),
+        retryJob: vi.fn(),
+        waitForJob: vi.fn(),
+      };
+      const context = processingContext(service);
+      await expect(
+        processSession(
+          context,
+          { id: SESSION_ID, title: "test", timeUpdated: 100 },
+          messages,
+          100,
+        ),
+      ).rejects.toThrow();
+      expect(service.request).toHaveBeenCalledTimes(2);
+      expect(service.retryJob).not.toHaveBeenCalled();
+    },
+  );
+
+  it("puts retry ownership only in its JSON body", async () => {
+    const fetchImpl = vi.fn(
+      async () =>
+        new Response(
+          JSON.stringify({
+            ...jobFor(v1Submission(), { status: "pending", error: null }),
+            source_id: LEGACY_SOURCE.id,
+          }),
+        ),
+    );
+    const service = createReflectionService({
+      url: "https://reflection.example",
+      sourceId: LEGACY_SOURCE.id,
+      headers: {},
+      jobPollMs: 1,
+      fetchImpl,
+    });
+    await service.retryJob(12);
+    expect(fetchImpl).toHaveBeenCalledWith(
+      "https://reflection.example/v1/jobs/12/retry",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ source_id: LEGACY_SOURCE.id }),
+      }),
+    );
+  });
+
+  it.each([undefined, "wrong", "owned"])(
+    "requires the exact source on job responses: %s",
+    async (source_id) => {
+      const body = {
+        ...jobFor(v1Submission()),
+        ...(source_id === undefined ? {} : { source_id }),
+      };
+      const service = createReflectionService({
+        url: "https://reflection.example",
+        sourceId: "owned",
+        headers: {},
+        jobPollMs: 1,
+        fetchImpl: vi.fn(async () => new Response(JSON.stringify(body))),
+      });
+      if (source_id === "owned")
+        await expect(service.getJob(12)).resolves.toEqual(
+          jobFor(v1Submission()),
+        );
+      else await expect(service.getJob(12)).rejects.toThrow();
+    },
+  );
+
+  it.each(["legacy", "source-v1"] as const)(
+    "checks %s manifest identity without loading history",
+    (identity_scheme) => {
+      const source: SourceInfo = {
+        id: "owned",
+        kind: "opencode-v1",
+        identity_scheme,
+      };
+      const segment = segmentMessages([
+        user("u", "text"),
+        assistant("a", "u", "reply"),
+        user("next", "next"),
+      ])[0]!;
+      const submission = segmentSubmission(SESSION_ID, segment);
+      const boundary = boundaryFor(SESSION_ID, segment, {
+        id: sourceSegmentIdForRequest(
+          { ...submission, source_id: source.id },
+          source,
+        ),
+      });
+      const manifest = {
+        ...emptyManifest(),
+        source_id: source.id,
+        boundaries: [boundary],
+      };
+      expect(
+        validateSegmentManifest(manifest, SESSION_ID, source).boundaries,
+      ).toEqual([boundary]);
+      expect(() =>
+        validateSegmentManifest(
+          {
+            ...manifest,
+            boundaries: [
+              { ...boundary, id: "11111111-1111-5111-8111-111111111111" },
+            ],
+          },
+          SESSION_ID,
+          source,
+        ),
+      ).toThrow("non-deterministic identity");
+      expect(() =>
+        validateSegmentManifest(
+          { ...manifest, source_id: "wrong" },
+          SESSION_ID,
+          source,
+        ),
+      ).toThrow();
+      expect(() =>
+        validateSegmentManifest(emptyManifest(), SESSION_ID, source),
+      ).toThrow();
+    },
+  );
+
+  it("validates registry identity and job ownership on scoped HTTP requests", async () => {
+    const urls: string[] = [];
+    const fetchImpl = vi.fn(
+      async (url: string | URL | Request, init?: RequestInit) => {
+        urls.push(String(url));
+        expect(init?.redirect).toBe("error");
+        return new Response(
+          JSON.stringify({
+            id: "wrong",
+            kind: "opencode-v1",
+            identity_scheme: "source-v1",
+          }),
+        );
+      },
+    );
+    const service = createReflectionService({
+      url: "https://reflection.example",
+      sourceId: "owned",
+      headers: {},
+      jobPollMs: 1,
+      fetchImpl,
+    });
+    await expect(service.getSource()).rejects.toThrow("mismatched source");
+    await expect(service.getJob(12)).rejects.toThrow();
+    expect(urls).toEqual([
+      "https://reflection.example/v1/sources/owned",
+      "https://reflection.example/v1/jobs/12?source_id=owned",
+    ]);
+  });
+});
 
 function user(id: string, text: string): OpenCodeMessage {
   return {
@@ -243,7 +452,7 @@ function processingContext(
     },
     providerPollMs: 5_000,
     jobPollMs: 10,
-    sourceId: "test-opencode-source",
+    source: LEGACY_SOURCE,
     priorityJobIds: options.priorityJobIds ?? [],
     completedSnapshots: new Set(),
     attemptedSnapshots: new Set(),
@@ -383,12 +592,13 @@ describe("stable session revisions", () => {
       sessionUpdatedAt: vi.fn(() => updates.shift() ?? 101),
       sessionMessages: () => [user("u1", "request")],
     };
-    const request = vi.fn(async () => emptyManifest());
+    const request = vi.fn(async () => ownedManifest());
 
     const summary = await createDryRunSummary(
       [session],
       store,
       { request },
+      LEGACY_SOURCE,
       { nowMs: () => 1_000_000 },
     );
 
@@ -412,7 +622,8 @@ describe("stable session revisions", () => {
     const summary = await createDryRunSummary(
       [session],
       store,
-      { request: vi.fn(async () => emptyManifest()) },
+      { request: vi.fn(async () => ownedManifest()) },
+      LEGACY_SOURCE,
       { nowMs: () => 1_000_000 },
     );
 
@@ -428,7 +639,8 @@ describe("stable session revisions", () => {
     const expired = await createDryRunSummary(
       [session],
       store,
-      { request: vi.fn(async () => emptyManifest()) },
+      { request: vi.fn(async () => ownedManifest()) },
+      LEGACY_SOURCE,
       { nowMs: () => 1_000_000 },
       100,
     );
@@ -452,10 +664,11 @@ describe("stable session revisions", () => {
       store,
       {
         request: vi.fn(async () => ({
-          ...emptyManifest(),
+          ...ownedManifest(),
           manifest_version: 1,
         })),
       },
+      LEGACY_SOURCE,
       { nowMs: () => 1_000_000 },
     );
 
@@ -481,8 +694,8 @@ describe("stable session revisions", () => {
     const service: ReflectionService = {
       request: vi.fn(async (path) =>
         path.includes(invalid.id)
-          ? { ...emptyManifest(invalid.id), manifest_version: 1 }
-          : emptyManifest(valid.id),
+          ? { ...ownedManifest(emptyManifest(invalid.id)), manifest_version: 1 }
+          : ownedManifest(emptyManifest(valid.id)),
       ),
       getJob: vi.fn(),
       retryJob: vi.fn(),
@@ -515,7 +728,7 @@ describe("stable session revisions", () => {
       sessionMessages: () => messages,
     };
     const service: ReflectionService = {
-      request: vi.fn(async () => emptyManifest()),
+      request: vi.fn(async () => ownedManifest()),
       getJob: vi.fn(),
       retryJob: vi.fn(),
       waitForJob: vi.fn(),
@@ -542,7 +755,7 @@ describe("stable session revisions", () => {
     const session = { id: SESSION_ID, title: "test", timeUpdated: 100 };
     const messages = [user("u1", "x".repeat(25_000))];
     const service: ReflectionService = {
-      request: vi.fn(async () => emptyManifest()),
+      request: vi.fn(async () => ownedManifest()),
       getJob: vi.fn(),
       retryJob: vi.fn(),
       waitForJob: vi.fn(),
@@ -584,7 +797,7 @@ describe("stable session revisions", () => {
       sessionMessages: () => messages,
     };
     const service: ReflectionService = {
-      request: vi.fn(async () => emptyManifest()),
+      request: vi.fn(async () => ownedManifest()),
       getJob: vi.fn(),
       retryJob: vi.fn(),
       waitForJob: vi.fn(),
@@ -597,7 +810,9 @@ describe("stable session revisions", () => {
     expect(context.state.segmentsFailed).toBe(0);
 
     await expect(
-      createDryRunSummary([session], store, service, { nowMs: () => now }),
+      createDryRunSummary([session], store, service, LEGACY_SOURCE, {
+        nowMs: () => now,
+      }),
     ).resolves.toMatchObject({
       deferredSessions: 1,
       expiredDeferredSessions: 0,
@@ -970,17 +1185,19 @@ describe("strict jobs and exact submissions", () => {
       request: vi.fn(async (path, init) => {
         if (path.includes("/sessions/")) {
           manifestCalls += 1;
-          if (manifestCalls === 1) return emptyManifest();
-          return manifestWith([
-            boundaryFor(SESSION_ID, local, {
-              projection_version: manifestCalls === 2 ? 0 : 1,
-            }),
-          ]);
+          if (manifestCalls === 1) return ownedManifest();
+          return ownedManifest(
+            manifestWith([
+              boundaryFor(SESSION_ID, local, {
+                projection_version: manifestCalls === 2 ? 0 : 1,
+              }),
+            ]),
+          );
         }
         submittedBodies.push(String(init?.body));
         const submission = JSON.parse(String(init?.body)) as SegmentCreate;
         postCalls += 1;
-        return jobFor(submission, {
+        return ownedJob(submission, {
           status: "succeeded",
           error: null,
           projection_version: postCalls === 1 ? 0 : 1,
@@ -1122,7 +1339,11 @@ describe("request retries and timeouts", () => {
           status: 409,
         }),
       )
-      .mockResolvedValueOnce(new Response(JSON.stringify(failed)));
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({ ...failed, source_id: "test-backfill-source" }),
+        ),
+      );
     const service = createReflectionService({
       url: "https://reflection.example",
       headers: {},
@@ -1153,7 +1374,11 @@ describe("request retries and timeouts", () => {
           status: 409,
         }),
       )
-      .mockResolvedValueOnce(new Response(JSON.stringify(pending)));
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({ ...pending, source_id: "test-backfill-source" }),
+        ),
+      );
     const service = createReflectionService({
       url: "https://reflection.example",
       headers: {},
@@ -1177,7 +1402,10 @@ describe("request retries and timeouts", () => {
     });
     const fetchMock = vi.fn(
       async (_url: string | URL | Request, _init?: RequestInit) =>
-        new Response(JSON.stringify(pending), { status: 202 }),
+        new Response(
+          JSON.stringify({ ...pending, source_id: "test-backfill-source" }),
+          { status: 202 },
+        ),
     );
     const service = createReflectionService({
       url: "https://reflection.example",
@@ -1380,9 +1608,9 @@ describe("job completion fencing", () => {
     let postCount = 0;
     const service: ReflectionService = {
       request: vi.fn(async (path, init) => {
-        if (path.includes("/sessions/")) return manifest;
+        if (path.includes("/sessions/")) return ownedManifest(manifest);
         postCount += 1;
-        return jobFor(JSON.parse(String(init?.body)) as SegmentCreate);
+        return ownedJob(JSON.parse(String(init?.body)) as SegmentCreate);
       }),
       getJob: vi.fn(),
       retryJob: vi.fn(async (jobId) => {
@@ -1424,12 +1652,12 @@ describe("job completion fencing", () => {
       request: vi.fn(async (path, init) => {
         if (path.includes("/sessions/")) {
           return committed
-            ? manifestWith([boundaryFor(SESSION_ID, local[0]!)])
-            : emptyManifest();
+            ? ownedManifest(manifestWith([boundaryFor(SESSION_ID, local[0]!)]))
+            : ownedManifest();
         }
         targetPosts += 1;
         committed = true;
-        return jobFor(JSON.parse(String(init?.body)) as SegmentCreate, {
+        return ownedJob(JSON.parse(String(init?.body)) as SegmentCreate, {
           status: "succeeded",
           error: null,
           finished_at: "2026-08-22T00:00:00.000Z",
@@ -1470,7 +1698,7 @@ describe("job completion fencing", () => {
     let targetPosts = 0;
     const service: ReflectionService = {
       request: vi.fn(async (path) => {
-        if (path.includes("/sessions/")) return manifest;
+        if (path.includes("/sessions/")) return ownedManifest(manifest);
         targetPosts += 1;
         throw new Error("posted changed target");
       }),
@@ -1523,12 +1751,12 @@ describe("job completion fencing", () => {
       request: vi.fn(async (path) => {
         if (path.includes("/sessions/")) {
           return targetExists
-            ? manifestWith([], [failedTarget])
-            : emptyManifest();
+            ? ownedManifest(manifestWith([], [failedTarget]))
+            : ownedManifest();
         }
         targetPosts += 1;
         targetExists = true;
-        return failedJob;
+        return { ...failedJob, source_id: LEGACY_SOURCE.id };
       }),
       getJob: vi.fn(),
       retryJob: vi.fn(async () => failedJob),
@@ -1564,14 +1792,16 @@ describe("job completion fencing", () => {
       request: vi.fn(async (path, init) => {
         if (path.includes("/sessions/")) {
           return targetExists
-            ? manifestWith([
-                boundaryFor(SESSION_ID, local, { projection_version: 0 }),
-              ])
-            : emptyManifest();
+            ? ownedManifest(
+                manifestWith([
+                  boundaryFor(SESSION_ID, local, { projection_version: 0 }),
+                ]),
+              )
+            : ownedManifest();
         }
         targetPosts += 1;
         targetExists = true;
-        return jobFor(JSON.parse(String(init?.body)) as SegmentCreate, {
+        return ownedJob(JSON.parse(String(init?.body)) as SegmentCreate, {
           status: "succeeded",
           error: null,
           projection_version: 0,
@@ -1619,7 +1849,9 @@ describe("job completion fencing", () => {
     });
     const service: ReflectionService = {
       request: vi.fn(async () =>
-        manifestWith([], [targetFor(SESSION_ID, local, "failed")]),
+        ownedManifest(
+          manifestWith([], [targetFor(SESSION_ID, local, "failed")]),
+        ),
       ),
       getJob: vi.fn(async () => failedJob),
       retryJob: vi.fn(async () => failedJob),
@@ -1826,7 +2058,7 @@ describe("state, locking, and cleanup", () => {
     };
     const service: ReflectionService = {
       request: vi.fn(async () => ({
-        ...emptyManifest(invalid.id),
+        ...ownedManifest(emptyManifest(invalid.id)),
         manifest_version: 1,
       })),
       getJob: vi.fn(),

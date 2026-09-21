@@ -1,4 +1,6 @@
+import { createHash } from "node:crypto";
 import {
+  existsSync,
   mkdirSync,
   readFileSync,
   renameSync,
@@ -123,13 +125,37 @@ function legacyContextLimit(
 }
 
 export class ProjectionStateStore {
-  constructor(private readonly directory: string) {}
+  constructor(
+    private readonly directory: string,
+    private readonly sourceId?: string,
+    private readonly identityScheme?: "legacy" | "source-v1",
+  ) {}
 
   get(sessionId: string): ProjectionSessionState | undefined {
+    const path = this.path(sessionId);
+    const marker = `${path}.legacy-migrated`;
+    const current = this.read(path);
+    if (current !== undefined) return current;
+    if (
+      this.sourceId !== undefined &&
+      this.identityScheme === "legacy" &&
+      !existsSync(path) &&
+      !existsSync(marker)
+    ) {
+      const legacy = this.read(this.legacyPath(sessionId));
+      // Reading legacy state never adopts it on disk. A concurrent set/delete
+      // wins; adoption is deferred until the next normal state write.
+      const latest = this.read(path);
+      if (latest !== undefined) return latest;
+      if (existsSync(path) || existsSync(marker)) return undefined;
+      return legacy;
+    }
+    return undefined;
+  }
+
+  private read(path: string): ProjectionSessionState | undefined {
     try {
-      const value: unknown = JSON.parse(
-        readFileSync(this.path(sessionId), "utf8"),
-      );
+      const value: unknown = JSON.parse(readFileSync(path, "utf8"));
       if (typeof value !== "object" || value === null) return;
       const stored = value as Partial<
         | StoredProjectionStateV1
@@ -150,7 +176,8 @@ export class ProjectionStateStore {
   }
 
   set(sessionId: string, state: ProjectionSessionState): void {
-    mkdirSync(this.directory, { recursive: true, mode: 0o700 });
+    this.markMigrated(sessionId);
+    mkdirSync(this.sourceDirectory(), { recursive: true, mode: 0o700 });
     const path = this.path(sessionId);
     const temporary = `${path}.${process.pid}.tmp`;
     const value: StoredProjectionStateV4 = { version: 4, state };
@@ -166,10 +193,36 @@ export class ProjectionStateStore {
   }
 
   delete(sessionId: string): void {
+    this.markMigrated(sessionId);
     rmSync(this.path(sessionId), { force: true });
   }
 
+  private markMigrated(sessionId: string): void {
+    if (this.sourceId === undefined) return;
+    if (existsSync(`${this.path(sessionId)}.legacy-migrated`)) return;
+    mkdirSync(this.sourceDirectory(), { recursive: true, mode: 0o700 });
+    writeFileSync(`${this.path(sessionId)}.legacy-migrated`, "", {
+      mode: 0o600,
+    });
+  }
+
   private path(sessionId: string): string {
+    return join(
+      this.sourceDirectory(),
+      `${encodeURIComponent(sessionId)}.json`,
+    );
+  }
+
+  private legacyPath(sessionId: string): string {
     return join(this.directory, `${encodeURIComponent(sessionId)}.json`);
+  }
+
+  private sourceDirectory(): string {
+    return this.sourceId === undefined
+      ? this.directory
+      : join(
+          this.directory,
+          `source-${createHash("sha256").update(this.sourceId).digest("hex")}`,
+        );
   }
 }

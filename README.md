@@ -261,3 +261,45 @@ cmp /tmp/reflection-dry-run-1.json /tmp/reflection-dry-run-2.json
 Once any v2 row exists, old Python, plugin, and backfill binaries cannot safely write to that database. If the Node deployment fails after migration, keep all writers stopped and either fix forward with v2-capable code or restore the pre-migration backup as a coordinated full rollback before starting `aa83637`. Starting only the old binary against the migrated database is not a rollback.
 
 The Node production canary has passed. Removing the Python rollback files remains a separate explicit decision; until then, their presence is intentional.
+
+### CP005/006 source ownership preparation
+
+**No production rollout until CP007.** The historical stop-first checklist above is not authorization to deploy this source-aware revision. Plain `pnpm start` is not sufficient on an unprepared database: startup rejects missing source-aware indexes or retained global boundary indexes.
+
+For an explicitly approved environment, run the operator commands from an installed Node 24 checkout with `DATABASE_URL` exported securely (and the same `MIGRATION_LOCK_ID` as the server, if overridden):
+
+The supported container deliverable is the explicit `source-operator` target:
+
+```bash
+docker build --target source-operator -t reflection-source-operator .
+docker run --rm --read-only --network none reflection-source-operator --help
+```
+
+This target retains the server/shared sources and installed dependencies, runs as `node`, and defaults to operator help. It starts no API or worker; the default final `runtime` target is unchanged and does not contain the operator. For approved database operations, supply `DATABASE_URL` securely and attach the operator to the approved database network, replacing `--help` with the action and arguments below (not `node scripts/source-ownership.mjs`). Migrations are packaged at `/app/migrations`; pass `MIGRATION_LOCK_ID` if overridden on the server. No endpoint or credential is embedded in the image.
+
+The image deliverable does not authorize production execution or require direct managed-database access from the assistant. CP008 must still coordinate credentials, network access, writer shutdown, and operator execution through documented deployment controls.
+
+1. Run `node scripts/source-ownership.mjs expand`. This uses the server's checksummed transactional migration runner without starting an API or worker. On a database already at migration008, expansion009 preserves old-writer compatibility; earlier pending migrations retain their own stop-first requirements.
+2. Register each source explicitly: `node scripts/source-ownership.mjs register --id LEGACY_ID --kind opencode-v1 --identity-scheme legacy`, and similarly register new sources using `--kind opencode-v2 --identity-scheme source-v1`. Expansion never inserts sources automatically.
+3. Run `node scripts/source-ownership.mjs install-indexes` to build and verify source-aware indexes concurrently.
+4. Stop all old writers, then run `node scripts/source-ownership.mjs cutover --old-writers-stopped`. This removes only the superseded global boundary indexes, not UUID primary keys or claims foreign keys.
+5. Start the source-aware backend and compatible clients only after the preceding preparation and the CP007 rollout gate.
+6. Run `node scripts/source-ownership.mjs backfill --legacy-source LEGACY_ID --batch-size 100`, then `node scripts/source-ownership.mjs enforce --old-writers-stopped` after confirming old writers remain stopped and ownership is complete.
+
+All operator actions serialize on the migration advisory lock with a five-second lock wait. Concurrent index builds have a 30-minute statement timeout; timed-out operations are retryable after inspecting contention. `MIGRATIONS_DIR` optionally overrides the expansion migration directory. Expansion, index installation, cutover, and enforcement are separate phases; do not use a failing application startup as the expansion mechanism.
+
+### Disposable rollout rehearsal (CP007)
+
+From the repository root, with Docker available:
+
+```bash
+pnpm test:rollout-rehearsal --new 64ff248
+```
+
+The old revision is pinned to `8187636`; `--new` defaults to committed `HEAD`. Uncommitted application changes are deliberately excluded. The runner archives each revision independently, builds its real API/worker and plugin, and records source trees, artifact hashes, dependency inputs, migrations and image identities. Only the provider engine/embeddings and OpenCode SDK are synthetic. Builds need registry access; execution uses an internal Docker network, disposable PostgreSQL, isolated HOME directories, no host mounts or published ports, and no production credentials. Containers/network are cleaned up on success or failure. Reports and build logs remain under the printed OS-temp path.
+
+The scenario exercises old-compatible expansion, mixed-client refusal, interrupted concurrent indexes, graceful and forced worker shutdown, staged-result reuse, paired history reads, concurrent ingestion during interrupted backfill, repeated enforcement, and restores into separate databases. It verifies original source rows and final enforcement preserve data, rather than checking counts alone.
+
+The synthetic HTTP outage budget is five seconds, including a two-second stop grace and the fixture cutover backup. This is **not a production-scale timing guarantee**. The current Compose default is fifteen minutes: CP008 must configure a supported short stop timeout matching the tested policy, or separately verify an API-available drain procedure. Old SQL writers must be gone before cutover; the command-line confirmation does not discover them.
+
+Recovery after cutover should prefer completing the source-aware rollout. The tested cutover-boundary backup preserves all work accepted before that snapshot, including active/staged/pending jobs, but does not preserve later writes. Do not automatically downgrade or restore an older backup after new writes: CP008 must preserve/replay those writes or use a sufficiently current recovery point. The initial older baseline restore is only a point-in-time rollback demonstration.

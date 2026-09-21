@@ -1,23 +1,17 @@
-import { createHash, randomUUID } from "node:crypto";
-import { readdir, readFile } from "node:fs/promises";
-import { join } from "node:path";
+import { randomUUID } from "node:crypto";
+import { applyMigrations as runMigrations } from "./migrations.js";
 
 import {
   PROJECTION_SAFE_VERSION,
   parseExtractionResult,
-  parseJobResponse,
   parseQueueStatusResponse,
-  parseSegmentCreate,
-  parseSegmentResponse,
   validateClaimObject,
   type ExtractionResult,
-  type JobResponse,
   type JobStatus,
   type JobStatusCounts,
   type QueueStatusResponse,
   type SegmentBoundary,
   type SegmentCreate,
-  type SegmentResponse,
   type SegmentSummary,
   type SegmentTargetBoundary,
   type SourceBoundary,
@@ -25,7 +19,6 @@ import {
 import {
   normalizeName,
   projectionFingerprintForBoundary,
-  segmentIdForRequest,
   sourceFingerprint,
   unionCandidates,
   type ClaimSupport,
@@ -33,6 +26,18 @@ import {
   type PreparedSegment,
   type RecallCandidate,
 } from "@reflection/shared/domain";
+import {
+  decodePersistedSegment,
+  parseSourceJobResponse,
+  parseSourceSegmentCreate,
+  parseSourceSegmentResponse,
+  sourceSegmentIdForRequest,
+  type SourceInfo,
+  type SourceJobResponse,
+  type SourceSegmentCreate,
+  type SourceSegmentResponse,
+  type SourceSession,
+} from "@reflection/shared/sources";
 import {
   Client,
   Pool,
@@ -46,6 +51,14 @@ import {
   EXTRACTION_VALIDATION_VERSION,
   type ValidatedExtractionResult,
 } from "./extraction-validation.js";
+import {
+  OwnershipValidationError,
+  effectiveOwnerSql,
+  effectiveSource,
+  listRegisteredSources,
+  registeredSource,
+  validateSegmentOwnership,
+} from "./source-ownership.js";
 
 pgTypes.setTypeParser(1184, (value) => value);
 
@@ -57,6 +70,17 @@ function summaryHasContentSql(expression: string): string {
 }
 
 const COMMITTED_SEGMENT_ELIGIBILITY_SQL = `
+  ${effectiveOwnerSql("s")} IN (SELECT source_id FROM reflection_sources)
+  AND (t.segment_id IS NULL OR (
+      ${effectiveOwnerSql("t")} = ${effectiveOwnerSql("s")}
+      AND (NOT (t.payload ? 'source_id') OR t.payload->>'source_id' = ${effectiveOwnerSql("t")})
+      AND EXISTS (SELECT 1 FROM extraction_jobs owned_job
+          WHERE owned_job.id = t.job_id AND owned_job.segment_id = s.id
+            AND ${effectiveOwnerSql("owned_job")} = ${effectiveOwnerSql("s")}
+            AND (owned_job.payload IS NULL OR NOT (owned_job.payload ? 'source_id')
+                 OR owned_job.payload->>'source_id' = ${effectiveOwnerSql("s")}))
+  ))
+  AND
   ${summaryHasContentSql("s.summary")}
   AND s.projection_commit_fingerprint = reflection_projection_fingerprint(
       s.id,
@@ -116,6 +140,7 @@ export interface ClaimedJob {
   sourceGeneration: bigint;
   sourceFingerprint: string;
   attempts: number;
+  sourceId: string;
   request: SegmentCreate;
   extractionResult: ValidatedExtractionResult | null;
 }
@@ -169,6 +194,7 @@ interface JobResponseRow extends QueryResultRow {
   started_at: PgTimestamp | null;
   finished_at: PgTimestamp | null;
   next_attempt_at: PgTimestamp;
+  source_id: string | null;
 }
 
 interface EnqueueJobRow extends QueryResultRow {
@@ -230,6 +256,7 @@ interface ClaimedJobRow extends QueryResultRow {
   source_fingerprint: string | null;
   extraction_result: unknown | null;
   processing_priority: number;
+  source_id: string | null;
 }
 
 interface RecallRow extends QueryResultRow {
@@ -244,6 +271,7 @@ interface RecallRow extends QueryResultRow {
   segment_id: string;
   similarity: number | string;
   seed_similarity?: number | string | null;
+  source_id: string | null;
 }
 
 interface StatusCountsRow extends QueryResultRow {
@@ -457,8 +485,19 @@ function boundaryMatchesRequest(
   );
 }
 
-function targetRequest(target: TargetRow): SegmentCreate {
-  return parseSegmentCreate(parsedJson(target.payload));
+function targetRequest(
+  target: TargetRow,
+  source: SourceInfo,
+): SourceSegmentCreate {
+  return decodePersistedSegment(parsedJson(target.payload), source.id);
+}
+
+function legacyPayload(value: unknown, sourceId: string): string {
+  const { source_id: _owner, ...request } = decodePersistedSegment(
+    parsedJson(value),
+    sourceId,
+  );
+  return jsonb(request);
 }
 
 function targetMatchesRequest(
@@ -466,6 +505,7 @@ function targetMatchesRequest(
   request: SegmentCreate,
   segmentId: string,
   fingerprint: string,
+  source: SourceInfo,
 ): boolean {
   if (
     target === undefined ||
@@ -476,7 +516,7 @@ function targetMatchesRequest(
     return false;
   }
   try {
-    const persisted = targetRequest(target);
+    const persisted = targetRequest(target, source);
     return (
       persisted.session_id === request.session_id &&
       persisted.start_user_message_id === request.start_user_message_id &&
@@ -485,7 +525,7 @@ function targetMatchesRequest(
       persisted.start_source_message_id === request.start_source_message_id &&
       persisted.end_source_message_id === request.end_source_message_id &&
       persisted.projection_version === request.projection_version &&
-      segmentIdForRequest(persisted) === segmentId &&
+      sourceSegmentIdForRequest(persisted, source) === segmentId &&
       sourceFingerprint(persisted) === fingerprint
     );
   } catch {
@@ -496,6 +536,7 @@ function targetMatchesRequest(
 export function failedTargetMatchesJob(
   target: TargetRow | undefined,
   job: LockedFailedJobRow,
+  source: SourceInfo,
 ): target is TargetRow {
   if (
     target === undefined ||
@@ -506,9 +547,9 @@ export function failedTargetMatchesJob(
   ) {
     return false;
   }
-  let targetSource: SegmentCreate;
+  let targetSource: SourceSegmentCreate;
   try {
-    targetSource = targetRequest(target);
+    targetSource = targetRequest(target, source);
   } catch {
     return false;
   }
@@ -518,7 +559,7 @@ export function failedTargetMatchesJob(
     targetSource.projection_version === job.projection_version &&
     targetSource.session_id === job.session_id &&
     targetSource.start_user_message_id === job.start_user_message_id &&
-    segmentIdForRequest(targetSource) === job.segment_id &&
+    sourceSegmentIdForRequest(targetSource, source) === job.segment_id &&
     sourceFingerprint(targetSource) === job.source_fingerprint
   );
 }
@@ -526,6 +567,7 @@ export function failedTargetMatchesJob(
 function targetMatchesJob(
   target: TargetRow | undefined,
   job: ClaimedJob,
+  source: SourceInfo,
 ): boolean {
   if (
     target === undefined ||
@@ -542,6 +584,7 @@ function targetMatchesJob(
     job.request,
     job.segmentId,
     job.sourceFingerprint,
+    source,
   );
 }
 
@@ -673,6 +716,62 @@ export class Database {
 
   async open(): Promise<void> {
     await this.applyMigrations(this.#settings.migrationsDir);
+    for (const [name, table, columns, version] of [
+      [
+        "segments_source_v1_start_key",
+        "segments",
+        "source_id, session_id, start_user_message_id",
+        1,
+      ],
+      [
+        "segments_source_v2_start_key",
+        "segments",
+        "source_id, session_id, start_source_message_id",
+        2,
+      ],
+      [
+        "extraction_jobs_source_v1_boundary_key",
+        "extraction_jobs",
+        "source_id, session_id, start_user_message_id, end_user_message_id",
+        1,
+      ],
+      [
+        "extraction_jobs_source_v2_boundary_key",
+        "extraction_jobs",
+        "source_id, session_id, start_source_message_id, end_source_message_id",
+        2,
+      ],
+    ] as const) {
+      const row = (
+        await this.pool.query(
+          `SELECT indisvalid, indisunique,
+        indrelid = $2::regclass AS correct_table,
+        pg_get_expr(indpred, indrelid) AS predicate,
+        ARRAY(SELECT pg_get_indexdef(indexrelid, n, true) FROM generate_series(1, indnatts) n) AS columns
+        FROM pg_index WHERE indexrelid = to_regclass($1)`,
+          [name, table],
+        )
+      ).rows[0];
+      if (
+        !row?.indisvalid ||
+        !row.indisunique ||
+        !row.correct_table ||
+        row.predicate !== `(source_boundary_version = ${version})` ||
+        row.columns.join(", ") !== columns
+      ) {
+        throw new Error(
+          "source indexes are not ready; run scripts/source-ownership.mjs install-indexes before startup",
+        );
+      }
+    }
+    const oldIndexes = await this.pool
+      .query(`SELECT 1 FROM pg_class WHERE oid IN (
+      to_regclass('segments_v1_start_key'), to_regclass('segments_v2_start_key'),
+      to_regclass('extraction_jobs_v1_boundary_key'), to_regclass('extraction_jobs_v2_boundary_key'))`);
+    if (oldIndexes.rowCount)
+      throw new Error(
+        "stop old writers and run source-ownership.mjs cutover before startup",
+      );
 
     const clients: PoolClient[] = [];
     try {
@@ -689,66 +788,16 @@ export class Database {
   }
 
   async applyMigrations(directory: string): Promise<void> {
-    const migrationNames = (await readdir(directory))
-      .filter((name) => name.endsWith(".sql"))
-      .sort();
-    if (migrationNames.length === 0) {
-      throw new Error(`no SQL migrations found in ${directory}`);
-    }
-
-    const migrations = await Promise.all(
-      migrationNames.map(async (name) => {
-        const sql = await readFile(join(directory, name), "utf8");
-        return {
-          name,
-          sql,
-          checksum: createHash("sha256").update(sql, "utf8").digest("hex"),
-        };
-      }),
-    );
     const connection = new Client({
       connectionString: this.#settings.databaseUrl,
     });
     await connection.connect();
     try {
-      await transaction(connection, async () => {
-        await connection.query("SELECT pg_advisory_xact_lock($1)", [
-          this.#settings.migrationLockId,
-        ]);
-        await connection.query(`
-          CREATE TABLE IF NOT EXISTS reflection_schema_migrations (
-              name TEXT PRIMARY KEY,
-              checksum CHAR(64) NOT NULL,
-              applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
-          )
-        `);
-        const recorded = new Map(
-          (
-            await connection.query<
-              QueryResultRow & { name: string; checksum: string }
-            >("SELECT name, checksum FROM reflection_schema_migrations")
-          ).rows.map((row) => [row.name, row.checksum]),
-        );
-        for (const migration of migrations) {
-          const checksum = recorded.get(migration.name);
-          if (checksum !== undefined) {
-            if (checksum !== migration.checksum) {
-              throw new Error(
-                `migration checksum mismatch for ${migration.name}`,
-              );
-            }
-            continue;
-          }
-          await connection.query(migration.sql);
-          await connection.query(
-            `
-            INSERT INTO reflection_schema_migrations (name, checksum)
-            VALUES ($1, $2)
-            `,
-            [migration.name, migration.checksum],
-          );
-        }
-      });
+      await runMigrations(
+        connection,
+        directory,
+        this.#settings.migrationLockId,
+      );
     } finally {
       await connection.end();
     }
@@ -756,6 +805,12 @@ export class Database {
 
   async healthcheck(): Promise<void> {
     await this.pool.query("SELECT 1");
+  }
+
+  async listSources(): Promise<SourceInfo[]> {
+    return this.#withConnection((connection) =>
+      listRegisteredSources(connection),
+    );
   }
 
   async queueStatus(): Promise<QueueStatusResponse> {
@@ -1010,6 +1065,35 @@ export class Database {
     );
   }
 
+  static async #validateClaim(
+    connection: ReservedClient,
+    job: ClaimedJob,
+  ): Promise<SourceInfo> {
+    const source = await registeredSource(connection, job.sourceId);
+    const request = decodePersistedSegment(job.request, source.id);
+    if (
+      sourceSegmentIdForRequest(request, source) !== job.segmentId ||
+      sourceFingerprint(request) !== job.sourceFingerprint
+    ) {
+      throw new Error("claimed source identity mismatch");
+    }
+    const row = (
+      await connection.query(
+        `SELECT segment_id, ${effectiveOwnerSql("j")} AS source_id FROM extraction_jobs j WHERE id = $1 FOR UPDATE`,
+        [job.id],
+      )
+    ).rows[0];
+    if (
+      row === undefined ||
+      row.segment_id !== job.segmentId ||
+      row.source_id !== source.id
+    ) {
+      throw new Error("claim does not match assigned job ownership");
+    }
+    await validateSegmentOwnership(connection, job.segmentId, source);
+    return source;
+  }
+
   async #withConnection<T>(
     operation: (connection: PoolClient) => Promise<T>,
   ): Promise<T> {
@@ -1030,13 +1114,28 @@ export class Database {
     );
   }
 
-  async enqueue(request: SegmentCreate): Promise<JobResponse> {
-    const segmentId = segmentIdForRequest(request);
-    const fingerprint = sourceFingerprint(request);
-    const payload = jsonb(request);
-
+  async enqueue(request: SourceSegmentCreate): Promise<SourceJobResponse> {
+    request = parseSourceSegmentCreate(request);
     return this.#withTransaction(async (connection) => {
+      const source = await registeredSource(connection, request.source_id);
+      const segmentId = sourceSegmentIdForRequest(request, source);
+      const fingerprint = sourceFingerprint(request);
+      const { source_id: _sourceId, ...legacyRequest } = request;
+      const payload = jsonb(legacyRequest);
+
       await Database.#lockSegment(connection, segmentId);
+      await validateSegmentOwnership(connection, segmentId, source);
+      // Adopt only this validated legacy group before source-prefixed upserts.
+      for (const [table, key] of [
+        ["segments", "id"],
+        ["extraction_jobs", "segment_id"],
+        ["segment_targets", "segment_id"],
+      ] as const) {
+        await connection.query(
+          `UPDATE ${table} SET source_id = $1 WHERE ${key} = $2 AND source_id IS NULL`,
+          [source.id, segmentId],
+        );
+      }
       const jobs = (
         await connection.query<EnqueueJobRow>(
           `
@@ -1045,10 +1144,11 @@ export class Database {
                  source_boundary_version, start_source_message_id,
                  end_source_message_id, processing_priority
           FROM extraction_jobs
-          WHERE segment_id = $1
-          FOR UPDATE
-          `,
-          [segmentId],
+           WHERE segment_id = $1
+             AND (source_id = $2 OR ($3::boolean AND source_id IS NULL))
+           FOR UPDATE
+           `,
+          [segmentId, source.id, source.identity_scheme === "legacy"],
         )
       ).rows;
       const target = (
@@ -1063,10 +1163,11 @@ export class Database {
                    summary_commit_fingerprint, processing_priority,
                    (${STAGED_TARGET_ELIGIBILITY_SQL}) AS staged_eligible
            FROM segment_targets AS t
-           WHERE t.segment_id = $1
-          FOR UPDATE
-          `,
-          [segmentId],
+            WHERE t.segment_id = $1
+              AND (t.source_id = $2 OR ($3::boolean AND t.source_id IS NULL))
+           FOR UPDATE
+           `,
+          [segmentId, source.id, source.identity_scheme === "legacy"],
         )
       ).rows[0];
       const currentSegment = (
@@ -1086,10 +1187,11 @@ export class Database {
                      s.projection_version
                  ) AS projection_safe
           FROM segments s
-          WHERE s.id = $1
-          FOR UPDATE
-          `,
-          [segmentId],
+           WHERE s.id = $1
+             AND (s.source_id = $2 OR ($3::boolean AND s.source_id IS NULL))
+           FOR UPDATE
+           `,
+          [segmentId, source.id, source.identity_scheme === "legacy"],
         )
       ).rows[0];
       const boundaryJob = jobs.find((item) =>
@@ -1109,7 +1211,8 @@ export class Database {
           const ignored = (
             await connection.query<{ id: PgBigInt } & QueryResultRow>(
               `
-               INSERT INTO extraction_jobs (
+                INSERT INTO extraction_jobs (
+                    source_id,
                    segment_id, session_id, start_user_message_id,
                    end_user_message_id, source_boundary_version,
                    start_source_message_id, end_source_message_id,
@@ -1117,12 +1220,13 @@ export class Database {
                    processing_priority, finished_at, error
                )
                VALUES (
-                   $1, $2, $3, $4, $5, $6, $7, $8, NULL, 'superseded', $9,
-                   $10, now(), 'snapshot was superseded'
+                    $1, $2, $3, $4, $5, $6, $7, $8, $9, NULL, 'superseded', $10,
+                    $11, now(), 'snapshot was superseded'
                )
                RETURNING id
               `,
               [
+                source.id,
                 segmentId,
                 request.session_id,
                 request.start_user_message_id,
@@ -1143,16 +1247,16 @@ export class Database {
         } else {
           jobId = boundaryJob.id;
         }
-        const row = await Database.#jobRow(connection, jobId);
+        const row = await Database.#jobRow(connection, jobId, source);
         if (row === undefined) {
           throw new Error("ignored job disappeared during enqueue");
         }
-        return Database.#jobResponse(row);
+        return Database.#jobResponse(row, source);
       }
 
       if (
         target !== undefined &&
-        targetMatchesRequest(target, request, segmentId, fingerprint)
+        targetMatchesRequest(target, request, segmentId, fingerprint, source)
       ) {
         const targetJob = jobs.find((job) => sameBigInt(job.id, target.job_id));
         const resetStaleExtraction =
@@ -1164,7 +1268,7 @@ export class Database {
           request.processing_priority,
         );
         const exactPayload = jsonb({
-          ...request,
+          ...legacyRequest,
           processing_priority: priority,
         });
         await connection.query(
@@ -1202,11 +1306,11 @@ export class Database {
            `,
           [exactPayload, priority, resetStaleExtraction, target.job_id],
         );
-        const row = await Database.#jobRow(connection, target.job_id);
+        const row = await Database.#jobRow(connection, target.job_id, source);
         if (row === undefined) {
           throw new Error("target job disappeared during enqueue");
         }
-        return Database.#jobResponse(row);
+        return Database.#jobResponse(row, source);
       }
 
       if (
@@ -1226,7 +1330,8 @@ export class Database {
           const settled = (
             await connection.query<{ id: PgBigInt } & QueryResultRow>(
               `
-               INSERT INTO extraction_jobs (
+                INSERT INTO extraction_jobs (
+                    source_id,
                    segment_id, session_id, start_user_message_id,
                    end_user_message_id, source_boundary_version,
                    start_source_message_id, end_source_message_id,
@@ -1234,12 +1339,13 @@ export class Database {
                    source_fingerprint, processing_priority, finished_at
                )
                VALUES (
-                   $1, $2, $3, $4, $5, $6, $7, $8, NULL, 'succeeded', $9,
-                   $10, $11, now()
+                    $1, $2, $3, $4, $5, $6, $7, $8, $9, NULL, 'succeeded', $10,
+                    $11, $12, now()
                )
                RETURNING id
               `,
               [
+                source.id,
                 segmentId,
                 request.session_id,
                 request.start_user_message_id,
@@ -1286,11 +1392,11 @@ export class Database {
             ],
           );
         }
-        const row = await Database.#jobRow(connection, jobId);
+        const row = await Database.#jobRow(connection, jobId, source);
         if (row === undefined) {
           throw new Error("settled job disappeared during enqueue");
         }
-        return Database.#jobResponse(row);
+        return Database.#jobResponse(row, source);
       }
 
       const generation =
@@ -1306,16 +1412,17 @@ export class Database {
         await connection.query<{ id: PgBigInt } & QueryResultRow>(
           `
           INSERT INTO extraction_jobs (
+              source_id,
               segment_id, session_id, start_user_message_id, end_user_message_id,
               source_boundary_version, start_source_message_id,
               end_source_message_id, projection_version, payload,
               source_generation, source_fingerprint, processing_priority
           )
-          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11, $12)
+          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, $11, $12, $13)
           ON CONFLICT ${
             request.source_boundary_version === 1
-              ? "(session_id, start_user_message_id, end_user_message_id) WHERE source_boundary_version = 1"
-              : "(session_id, start_source_message_id, end_source_message_id) WHERE source_boundary_version = 2"
+              ? "(source_id, session_id, start_user_message_id, end_user_message_id) WHERE source_boundary_version = 1"
+              : "(source_id, session_id, start_source_message_id, end_source_message_id) WHERE source_boundary_version = 2"
           }
           DO UPDATE SET
               segment_id = EXCLUDED.segment_id,
@@ -1333,9 +1440,11 @@ export class Database {
               status = 'pending', attempts = 0, lease_id = NULL, error = NULL,
               started_at = NULL, finished_at = NULL, next_attempt_at = now()
           WHERE extraction_jobs.status <> 'running'
+            AND extraction_jobs.segment_id = EXCLUDED.segment_id
           RETURNING id
           `,
           [
+            source.id,
             segmentId,
             request.session_id,
             request.start_user_message_id,
@@ -1361,12 +1470,13 @@ export class Database {
       }
       await connection.query(
         `
-        INSERT INTO segment_targets (
+          INSERT INTO segment_targets (
+              source_id,
             segment_id, job_id, end_user_message_id, source_boundary_version,
             start_source_message_id, end_source_message_id, projection_version,
             payload, source_generation, source_fingerprint, processing_priority
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10, $11)
+          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11, $12)
         ON CONFLICT (segment_id) DO UPDATE
         SET job_id = EXCLUDED.job_id,
             end_user_message_id = EXCLUDED.end_user_message_id,
@@ -1385,6 +1495,7 @@ export class Database {
             updated_at = now()
         `,
         [
+          source.id,
           segmentId,
           jobId,
           request.end_user_message_id,
@@ -1417,34 +1528,40 @@ export class Database {
           [supersededIds],
         );
       }
-      const row = await Database.#jobRow(connection, jobId);
+      const row = await Database.#jobRow(connection, jobId, source);
       if (row === undefined) {
         throw new Error("target job disappeared during enqueue");
       }
-      return Database.#jobResponse(row);
+      return Database.#jobResponse(row, source);
     });
   }
 
-  async getJob(jobId: number): Promise<JobResponse | null> {
+  async getJob(
+    sourceId: string,
+    requestedJobId: number,
+  ): Promise<SourceJobResponse | null> {
     return this.#withConnection(async (connection) => {
-      const row = await Database.#jobRow(connection, jobId);
-      return row === undefined ? null : Database.#jobResponse(row);
+      const source = await registeredSource(connection, sourceId);
+      const row = await Database.#jobRow(connection, requestedJobId, source);
+      return row === undefined ? null : Database.#jobResponse(row, source);
     });
   }
 
   static async #lockCurrentFailedTargetJob(
     connection: ReservedClient,
     jobId: number,
+    source: SourceInfo,
   ): Promise<LockedFailedTargetJobContext | null> {
     const segment = (
       await connection.query<{ segment_id: string } & QueryResultRow>(
-        "SELECT segment_id FROM extraction_jobs WHERE id = $1",
-        [jobId],
+        `SELECT segment_id FROM extraction_jobs j WHERE id = $1 AND ${effectiveOwnerSql("j")} = $2`,
+        [jobId, source.id],
       )
     ).rows[0];
     if (segment === undefined) return null;
 
     await Database.#lockSegment(connection, segment.segment_id);
+    await validateSegmentOwnership(connection, segment.segment_id, source);
     const job = (
       await connection.query<LockedFailedJobRow>(
         `
@@ -1453,11 +1570,11 @@ export class Database {
                projection_version, end_user_message_id,
                source_boundary_version, start_source_message_id,
                end_source_message_id
-        FROM extraction_jobs
-        WHERE id = $1
+        FROM extraction_jobs j
+        WHERE id = $1 AND segment_id = $2 AND ${effectiveOwnerSql("j")} = $3
         FOR UPDATE
         `,
-        [jobId],
+        [jobId, segment.segment_id, source.id],
       )
     ).rows[0];
     if (job === undefined) return null;
@@ -1490,7 +1607,7 @@ export class Database {
         "only terminal failed jobs can be retried",
       );
     }
-    if (!failedTargetMatchesJob(target, job)) {
+    if (!failedTargetMatchesJob(target, job, source)) {
       throw new JobNotRetryableError(
         "job cannot be retried because a newer snapshot exists for the segment",
       );
@@ -1499,13 +1616,16 @@ export class Database {
   }
 
   async retryFailedJob(
+    sourceId: string,
     jobId: number,
     options: RetryFailedJobOptions = {},
-  ): Promise<JobResponse | null> {
+  ): Promise<SourceJobResponse | null> {
     return this.#withTransaction(async (connection) => {
+      const source = await registeredSource(connection, sourceId);
       const context = await Database.#lockCurrentFailedTargetJob(
         connection,
         jobId,
+        source,
       );
       if (context === null) return null;
       const { job, target } = context;
@@ -1542,7 +1662,7 @@ export class Database {
           target.start_source_message_id,
           target.end_source_message_id,
           target.projection_version,
-          jsonb(target.payload),
+          legacyPayload(target.payload, source.id),
           target.source_generation,
           target.source_fingerprint,
           target.processing_priority,
@@ -1552,17 +1672,22 @@ export class Database {
       if ((updated.rowCount ?? 0) !== 1) {
         throw new Error("failed job changed while retrying");
       }
-      const row = await Database.#jobRow(connection, jobId);
+      const row = await Database.#jobRow(connection, jobId, source);
       if (row === undefined) throw new Error("retried job disappeared");
-      return Database.#jobResponse(row);
+      return Database.#jobResponse(row, source);
     });
   }
 
-  async supersedeFailedJob(jobId: number): Promise<JobResponse | null> {
+  async supersedeFailedJob(
+    sourceId: string,
+    jobId: number,
+  ): Promise<SourceJobResponse | null> {
     return this.#withTransaction(async (connection) => {
+      const source = await registeredSource(connection, sourceId);
       const context = await Database.#lockCurrentFailedTargetJob(
         connection,
         jobId,
+        source,
       );
       if (context === null) return null;
       const { job } = context;
@@ -1595,30 +1720,53 @@ export class Database {
         throw new Error("failed target changed while superseding");
       }
 
-      const row = await Database.#jobRow(connection, jobId);
+      const row = await Database.#jobRow(connection, jobId, source);
       if (row === undefined) throw new Error("superseded job disappeared");
-      return Database.#jobResponse(row);
+      return Database.#jobResponse(row, source);
     });
   }
 
+  static async #quarantinePersistedGroup(
+    connection: ReservedClient,
+    segmentId: string,
+  ): Promise<void> {
+    // Only queue selection/recovery may quarantine a persisted group. Caller-
+    // supplied claims must continue to fail without changing any record.
+    await connection.query(
+      `
+      UPDATE extraction_jobs
+      SET status = 'failed', lease_id = NULL, finished_at = now(),
+          error = 'OwnershipValidationError: persisted segment group quarantined'
+      WHERE segment_id = $1 AND status IN ('pending', 'running')
+    `,
+      [segmentId],
+    );
+  }
+
   async recoverRunningJobs(connection: ReservedClient): Promise<number> {
-    return transaction(connection, async () => {
-      const rows = (
-        await connection.query<{ segment_id: string } & QueryResultRow>(`
+    const rows = (
+      await connection.query<{ segment_id: string } & QueryResultRow>(`
           SELECT segment_id
           FROM extraction_jobs
           WHERE status = 'running'
           ORDER BY segment_id, id
         `)
-      ).rows;
-      const segmentIds = [...new Set(rows.map((row) => row.segment_id))];
-      if (segmentIds.length === 0) return 0;
-      for (const segmentId of segmentIds) {
+    ).rows;
+    const segmentIds = [...new Set(rows.map((row) => row.segment_id))];
+    let recovered = 0;
+    for (const segmentId of segmentIds) {
+      recovered += await transaction(connection, async () => {
         await Database.#lockSegment(connection, segmentId);
-      }
+        try {
+          await validateSegmentOwnership(connection, segmentId);
+        } catch (error) {
+          if (!(error instanceof OwnershipValidationError)) throw error;
+          await Database.#quarantinePersistedGroup(connection, segmentId);
+          return 0;
+        }
 
-      const result = await connection.query(
-        `
+        const result = await connection.query(
+          `
         WITH classified AS (
             SELECT jobs.id,
                    targets.job_id = jobs.id AS is_target,
@@ -1627,14 +1775,14 @@ export class Database {
                    targets.start_source_message_id AS target_start_source_message_id,
                    targets.end_source_message_id AS target_end_source_message_id,
                    targets.projection_version AS target_projection_version,
-                   targets.payload AS target_payload,
+                    targets.payload - 'source_id' AS target_payload,
                    targets.source_generation AS target_generation,
                    targets.source_fingerprint AS target_fingerprint,
                    targets.processing_priority AS target_processing_priority
             FROM extraction_jobs AS jobs
             LEFT JOIN segment_targets AS targets ON targets.segment_id = jobs.segment_id
             WHERE jobs.status = 'running'
-              AND jobs.segment_id = ANY($1::uuid[])
+              AND jobs.segment_id = $1
             FOR UPDATE OF jobs
         )
         UPDATE extraction_jobs AS jobs
@@ -1713,17 +1861,24 @@ export class Database {
         FROM classified
         WHERE jobs.id = classified.id
         `,
-        [segmentIds],
-      );
-      return result.rowCount ?? 0;
-    });
+          [segmentId],
+        );
+        return result.rowCount ?? 0;
+      });
+    }
+    return recovered;
   }
 
   async claimOldestJob(
     connection: ReservedClient,
-    excludedSessionIds: readonly string[] = [],
+    excludedSessions: readonly SourceSession[] = [],
   ): Promise<ClaimedJob | null> {
     return transaction(connection, async () => {
+      for (const sourceId of new Set(
+        excludedSessions.map((session) => session.sourceId),
+      )) {
+        await registeredSource(connection, sourceId);
+      }
       const pending = (
         await connection.query<ClaimedJobRow>(
           `
@@ -1732,11 +1887,11 @@ export class Database {
                      jobs.session_id,
                      targets.updated_at AS target_updated_at,
                      ROW_NUMBER() OVER (
-                         PARTITION BY jobs.session_id
+                          PARTITION BY ${effectiveOwnerSql("jobs")}, jobs.session_id
                          ORDER BY targets.updated_at NULLS LAST, jobs.id ASC
                      ) AS session_rank,
                      MAX(COALESCE(targets.processing_priority, jobs.processing_priority)) OVER (
-                         PARTITION BY jobs.session_id
+                          PARTITION BY ${effectiveOwnerSql("jobs")}, jobs.session_id
                      ) AS session_urgency
               FROM extraction_jobs AS jobs
               LEFT JOIN segment_targets AS targets
@@ -1754,7 +1909,12 @@ export class Database {
               WHERE jobs.status = 'pending'
                 AND jobs.next_attempt_at <= now()
                 AND (targets.segment_id IS NOT NULL OR jobs.source_fingerprint IS NULL)
-                AND NOT (jobs.session_id = ANY($1::text[]))
+                 AND NOT EXISTS (
+                     SELECT 1
+                     FROM unnest($1::text[], $2::text[]) AS excluded(source_id, session_id)
+                     WHERE excluded.source_id = ${effectiveOwnerSql("jobs")}
+                       AND excluded.session_id = jobs.session_id
+                 )
                 AND NOT EXISTS (
                     SELECT 1
                     FROM extraction_jobs AS running
@@ -1771,7 +1931,7 @@ export class Database {
                        id ASC
               LIMIT 1
           )
-          SELECT jobs.id, jobs.segment_id, jobs.session_id,
+           SELECT jobs.id, jobs.segment_id, jobs.session_id, jobs.source_id,
                  jobs.start_user_message_id, jobs.end_user_message_id,
                  jobs.source_boundary_version, jobs.start_source_message_id,
                  jobs.end_source_message_id, jobs.projection_version,
@@ -1817,12 +1977,41 @@ export class Database {
            AND targets.end_source_message_id
                IS NOT DISTINCT FROM jobs.end_source_message_id
           WHERE jobs.status = 'pending'
-          FOR UPDATE OF jobs
         `,
-          [Array.from(excludedSessionIds)],
+          [
+            excludedSessions.map((session) => session.sourceId),
+            excludedSessions.map((session) => session.sessionId),
+          ],
         )
       ).rows[0];
       if (pending === undefined) return null;
+      const source = await effectiveSource(connection, pending.source_id);
+      await Database.#lockSegment(connection, pending.segment_id);
+      try {
+        await validateSegmentOwnership(connection, pending.segment_id, source);
+      } catch (error) {
+        if (!(error instanceof OwnershipValidationError)) throw error;
+        await Database.#quarantinePersistedGroup(
+          connection,
+          pending.segment_id,
+        );
+        return null;
+      }
+      const refreshed = (
+        await connection.query<ClaimedJobRow & { status: string }>(
+          "SELECT * FROM extraction_jobs WHERE id = $1 FOR UPDATE",
+          [pending.id],
+        )
+      ).rows[0];
+      if (
+        refreshed === undefined ||
+        refreshed.status !== "pending" ||
+        !sameBigInt(refreshed.source_generation, pending.source_generation) ||
+        refreshed.source_fingerprint !== pending.source_fingerprint ||
+        refreshed.projection_version !== pending.projection_version ||
+        jsonb(refreshed.payload) !== jsonb(pending.payload)
+      )
+        return null;
 
       if (pending.payload === null) {
         await connection.query(
@@ -1838,9 +2027,9 @@ export class Database {
       }
       const payload = parsedJson(pending.payload);
 
-      let request: SegmentCreate;
+      let request: SourceSegmentCreate;
       try {
-        request = parseSegmentCreate(payload);
+        request = decodePersistedSegment(payload, source.id);
       } catch (error) {
         const persistedError = truncateCodePoints(
           `invalid persisted payload: ${errorMessage(error)}`,
@@ -1867,7 +2056,7 @@ export class Database {
         request.end_source_message_id !== pending.end_source_message_id ||
         request.projection_version !== pending.projection_version ||
         request.processing_priority !== pending.processing_priority ||
-        segmentIdForRequest(request) !== pending.segment_id ||
+        sourceSegmentIdForRequest(request, source) !== pending.segment_id ||
         persistedFingerprint === null ||
         sourceFingerprint(request) !== persistedFingerprint
       ) {
@@ -1922,6 +2111,7 @@ export class Database {
         )
       ).rows[0];
       if (claimed === undefined) throw new Error("claimed job disappeared");
+      const { source_id: _owner, ...legacyRequest } = request;
       return {
         id: checkedBigIntToNumber(pending.id, "job id"),
         segmentId: pending.segment_id,
@@ -1932,7 +2122,8 @@ export class Database {
         ),
         sourceFingerprint: persistedFingerprint,
         attempts: claimed.attempts,
-        request,
+        sourceId: source.id,
+        request: legacyRequest,
         extractionResult,
       };
     });
@@ -1958,6 +2149,7 @@ export class Database {
 
     return this.#withTransaction(async (connection) => {
       await Database.#lockSegment(connection, job.segmentId);
+      const source = await Database.#validateClaim(connection, job);
       const current = (
         await connection.query<
           QueryResultRow & {
@@ -2012,7 +2204,7 @@ export class Database {
           [job.segmentId],
         )
       ).rows[0];
-      const targetMatches = targetMatchesJob(target, job);
+      const targetMatches = targetMatchesJob(target, job, source);
       if (!targetMatches) {
         await this.#requeueLatestTarget(connection, job, target);
         return true;
@@ -2106,7 +2298,7 @@ export class Database {
           target.start_source_message_id,
           target.end_source_message_id,
           target.projection_version,
-          jsonb(target.payload),
+          legacyPayload(target.payload, job.sourceId),
           target.source_generation,
           target.source_fingerprint,
           target.processing_priority,
@@ -2151,7 +2343,7 @@ export class Database {
         target.start_source_message_id,
         target.end_source_message_id,
         target.projection_version,
-        jsonb(target.payload),
+        legacyPayload(target.payload, job.sourceId),
         target.source_generation,
         target.source_fingerprint,
         target.processing_priority,
@@ -2178,6 +2370,7 @@ export class Database {
 
     return this.#withTransaction(async (connection) => {
       await Database.#lockSegment(connection, job.segmentId);
+      const source = await Database.#validateClaim(connection, job);
       const current = (
         await connection.query<
           QueryResultRow & {
@@ -2232,7 +2425,8 @@ export class Database {
         )
       ).rows[0];
       const currentMatches = persistedJobMatchesClaim(current, job);
-      if (!currentMatches || !targetMatchesJob(target, job)) {
+      if (!currentMatches) return false;
+      if (!targetMatchesJob(target, job, source)) {
         await this.#requeueLatestTarget(connection, job, target);
         return false;
       }
@@ -2279,10 +2473,11 @@ export class Database {
   }
 
   async priorSummaries(
+    sourceId: string,
     sessionId: string,
     currentSegmentId: string,
   ): Promise<string[]> {
-    return (await this.segmentSummaries(sessionId))
+    return (await this.segmentSummaries(sourceId, sessionId))
       .filter((summary) => summary.id !== currentSegmentId)
       .map((summary) => summary.summary);
   }
@@ -2413,6 +2608,7 @@ export class Database {
 
     return this.#withTransaction(async (connection) => {
       await Database.#lockSegment(connection, job.segmentId);
+      const source = await Database.#validateClaim(connection, job);
       const currentJob = (
         await connection.query<
           QueryResultRow & {
@@ -2468,10 +2664,8 @@ export class Database {
           [job.segmentId],
         )
       ).rows[0];
-      const targetMatches =
-        targetMatchesJob(target, job) &&
-        persistedJobMatchesClaim(currentJob, job);
-      if (!targetMatches) {
+      if (!persistedJobMatchesClaim(currentJob, job)) return false;
+      if (!targetMatchesJob(target, job, source)) {
         await this.#requeueLatestTarget(connection, job, target);
         return false;
       }
@@ -2605,11 +2799,11 @@ export class Database {
             id, session_id, start_user_message_id, end_user_message_id,
             source_boundary_version, start_source_message_id,
             end_source_message_id, summary, projection_version,
-            projection_commit_fingerprint, source_generation, source_fingerprint
+            projection_commit_fingerprint, source_generation, source_fingerprint, source_id
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
         ON CONFLICT (id) DO UPDATE
-        SET session_id = EXCLUDED.session_id,
+        SET source_id = EXCLUDED.source_id, session_id = EXCLUDED.session_id,
             start_user_message_id = EXCLUDED.start_user_message_id,
             end_user_message_id = EXCLUDED.end_user_message_id,
             source_boundary_version = EXCLUDED.source_boundary_version,
@@ -2635,6 +2829,7 @@ export class Database {
           projectionCommitFingerprint,
           job.sourceGeneration,
           job.sourceFingerprint,
+          job.sourceId,
         ],
       );
       await connection.query("DELETE FROM claims WHERE segment_id = $1", [
@@ -2747,8 +2942,12 @@ export class Database {
     });
   }
 
-  async getSegment(segmentId: string): Promise<SegmentResponse | null> {
+  async getSegment(
+    sourceId: string,
+    segmentId: string,
+  ): Promise<SourceSegmentResponse | null> {
     return this.#withConnection(async (connection) => {
+      const source = await registeredSource(connection, sourceId);
       const segment = (
         await connection.query<
           QueryResultRow & {
@@ -2770,9 +2969,10 @@ export class Database {
                  end_source_message_id, summary,
                  created_at::text AS created_at, updated_at::text AS updated_at
           FROM segments
-          WHERE id = $1
-          `,
-          [segmentId],
+           WHERE id = $1
+             AND (source_id = $2 OR ($3::boolean AND source_id IS NULL))
+           `,
+          [segmentId, source.id, source.identity_scheme === "legacy"],
         )
       ).rows[0];
       if (segment === undefined) return null;
@@ -2798,7 +2998,7 @@ export class Database {
           [segmentId],
         )
       ).rows;
-      return parseSegmentResponse({
+      const response = {
         ...sourceBoundary(segment),
         id: segment.id,
         session_id: segment.session_id,
@@ -2818,42 +3018,53 @@ export class Database {
         ),
         created_at: timestamp(segment.created_at),
         updated_at: timestamp(segment.updated_at),
-      });
+      };
+      return parseSourceSegmentResponse(
+        { ...response, source_id: source.id },
+        source.id,
+      );
     });
   }
 
-  async segmentSummaries(sessionId: string): Promise<SegmentSummary[]> {
-    const [summaries] = await this.sessionSegmentListing(sessionId);
+  async segmentSummaries(
+    sourceId: string,
+    sessionId: string,
+  ): Promise<SegmentSummary[]> {
+    const [summaries] = await this.sessionSegmentListing(sourceId, sessionId);
     return summaries;
   }
 
   async sessionSegmentListing(
-    sessionId: string,
+    sourceId: string,
+    requestedSessionId: string,
   ): Promise<[SegmentSummary[], SegmentBoundary[], SegmentTargetBoundary[]]> {
-    const rows = await this.#withConnection(
-      async (connection) =>
-        (
-          await connection.query<
-            QueryResultRow & {
-              row_kind: "committed" | "target";
-              id: string;
-              start_user_message_id: string | null;
-              end_user_message_id: string;
-              source_boundary_version: number;
-              start_source_message_id: string | null;
-              end_source_message_id: string | null;
-              projection_version: number;
-              source_eligible: boolean;
-              staged_eligible: boolean;
-              source_fingerprint: string | null;
-              summary: string | null;
-              extraction_result: unknown | null;
-              payload: unknown | null;
-              status: string | null;
-              ordered_at: PgTimestamp;
-            }
-          >(
-            `
+    const sessionId = requestedSessionId;
+    const source = await this.#withConnection((connection) =>
+      registeredSource(connection, sourceId),
+    );
+    const rows = await this.#withConnection(async (connection) => {
+      return (
+        await connection.query<
+          QueryResultRow & {
+            row_kind: "committed" | "target";
+            id: string;
+            start_user_message_id: string | null;
+            end_user_message_id: string;
+            source_boundary_version: number;
+            start_source_message_id: string | null;
+            end_source_message_id: string | null;
+            projection_version: number;
+            source_eligible: boolean;
+            staged_eligible: boolean;
+            source_fingerprint: string | null;
+            summary: string | null;
+            extraction_result: unknown | null;
+            payload: unknown | null;
+            status: string | null;
+            ordered_at: PgTimestamp;
+          }
+        >(
+          `
           WITH committed AS (
                SELECT 'committed' AS row_kind, s.id,
                       s.start_user_message_id, s.end_user_message_id,
@@ -2870,7 +3081,8 @@ export class Database {
                      s.created_at AS ordered_at
               FROM segments s
               LEFT JOIN segment_targets t ON t.segment_id = s.id
-              WHERE s.session_id = $1
+               WHERE s.session_id = $1
+                 AND (s.source_id = $2 OR ($3::boolean AND s.source_id IS NULL))
           ), desired AS (
               SELECT 'target' AS row_kind, t.segment_id AS id,
                       t.payload->>'start_user_message_id' AS start_user_message_id,
@@ -2888,17 +3100,24 @@ export class Database {
                      t.updated_at AS ordered_at
               FROM segment_targets t
               JOIN extraction_jobs j ON j.id = t.job_id
-              WHERE t.payload->>'session_id' = $1
+              LEFT JOIN segments current_segment ON current_segment.id = t.segment_id
+               WHERE t.payload->>'session_id' = $1
+                 AND (t.source_id = $2 OR ($3::boolean AND t.source_id IS NULL))
+                 AND ${effectiveOwnerSql("j")} = $2
+                 AND j.segment_id = t.segment_id
+                 AND (j.payload IS NULL OR NOT (j.payload ? 'source_id') OR j.payload->>'source_id' = $2)
+                 AND (NOT (t.payload ? 'source_id') OR t.payload->>'source_id' = $2)
+                 AND (current_segment.id IS NULL OR ${effectiveOwnerSql("current_segment")} = $2)
           )
           SELECT * FROM committed
           UNION ALL
           SELECT * FROM desired
           ORDER BY ordered_at, id, row_kind
           `,
-            [sessionId],
-          )
-        ).rows,
-    );
+          [sessionId, source.id, source.identity_scheme === "legacy"],
+        )
+      ).rows;
+    });
 
     const effective = new Map<
       string,
@@ -2945,7 +3164,10 @@ export class Database {
         ) {
           throw new Error("target boundary has invalid persisted data");
         }
-        const request = parseSegmentCreate(parsedJson(row.payload));
+        const request = decodePersistedSegment(
+          parsedJson(row.payload),
+          source.id,
+        );
         if (
           request.session_id !== sessionId ||
           request.start_user_message_id !== row.start_user_message_id ||
@@ -2954,7 +3176,7 @@ export class Database {
           request.start_source_message_id !== row.start_source_message_id ||
           request.end_source_message_id !== row.end_source_message_id ||
           request.projection_version !== row.projection_version ||
-          segmentIdForRequest(request) !== row.id ||
+          sourceSegmentIdForRequest(request, source) !== row.id ||
           sourceFingerprint(request) !== row.source_fingerprint
         ) {
           throw new Error("target boundary has mismatched persisted data");
@@ -3012,12 +3234,12 @@ export class Database {
           `
           SELECT c.subject_text, c.subject_entity_id, c.predicate, c.confidence,
                  c.object_entity_text, c.object_entity_id, c.object_value,
-                 c.equivalence_key, c.segment_id,
+                  c.equivalence_key, c.segment_id, ${effectiveOwnerSql("s")} AS source_id,
                  1 - (c.embedding <=> $1::vector) AS similarity
-          FROM claims c
-          JOIN segments s ON s.id = c.segment_id
-          LEFT JOIN segment_targets t ON t.segment_id = s.id
-          WHERE ${COMMITTED_SEGMENT_ELIGIBILITY_SQL}
+           FROM claims c
+           JOIN segments s ON s.id = c.segment_id
+           LEFT JOIN segment_targets t ON t.segment_id = s.id
+           WHERE ${COMMITTED_SEGMENT_ELIGIBILITY_SQL}
           ORDER BY c.embedding <=> $1::vector
           LIMIT $2
           `,
@@ -3041,12 +3263,12 @@ export class Database {
           `
           SELECT c.subject_text, c.subject_entity_id, c.predicate, c.confidence,
                  c.object_entity_text, c.object_entity_id, c.object_value,
-                 c.equivalence_key, c.segment_id,
+                  c.equivalence_key, c.segment_id, ${effectiveOwnerSql("s")} AS source_id,
                  1 - (c.embedding <=> $1::vector) AS similarity
-          FROM claims c
-          JOIN segments s ON s.id = c.segment_id
-          LEFT JOIN segment_targets t ON t.segment_id = s.id
-          WHERE ${COMMITTED_SEGMENT_ELIGIBILITY_SQL}
+           FROM claims c
+           JOIN segments s ON s.id = c.segment_id
+           LEFT JOIN segment_targets t ON t.segment_id = s.id
+           WHERE ${COMMITTED_SEGMENT_ELIGIBILITY_SQL}
             AND (c.subject_entity_id = $2 OR c.object_entity_id = $2)
           ORDER BY c.embedding <=> $1::vector
           LIMIT $3
@@ -3072,20 +3294,24 @@ export class Database {
         await connection.query<
           QueryResultRow & {
             equivalence_key: string;
-            segment_ids: string[];
+            segments: Array<{ source_id: string; segment_id: string }>;
             support_count: PgBigInt;
             session_count: PgBigInt;
           }
         >(
           `
           SELECT c.equivalence_key,
-                 array_agg(DISTINCT c.segment_id ORDER BY c.segment_id) AS segment_ids,
-                 count(DISTINCT c.segment_id) AS support_count,
-                 count(DISTINCT s.session_id) AS session_count
+                  array_agg(DISTINCT jsonb_build_object(
+                      'source_id', ${effectiveOwnerSql("s")}, 'segment_id', c.segment_id
+                  ) ORDER BY jsonb_build_object(
+                      'source_id', ${effectiveOwnerSql("s")}, 'segment_id', c.segment_id
+                  )) AS segments,
+                  count(DISTINCT (${effectiveOwnerSql("s")}, c.segment_id)) AS support_count,
+                  count(DISTINCT (${effectiveOwnerSql("s")}, s.session_id)) AS session_count
           FROM claims c
           JOIN segments s ON s.id = c.segment_id
           LEFT JOIN segment_targets t ON t.segment_id = s.id
-          WHERE c.equivalence_key = ANY($1::bpchar[])
+           WHERE c.equivalence_key = ANY($1::bpchar[])
             AND ${COMMITTED_SEGMENT_ELIGIBILITY_SQL}
           GROUP BY c.equivalence_key
           `,
@@ -3096,7 +3322,7 @@ export class Database {
         rows.map((row) => [
           row.equivalence_key,
           {
-            segmentIds: row.segment_ids,
+            segments: row.segments,
             supportCount: checkedBigIntToNumber(
               row.support_count,
               "support count",
@@ -3114,6 +3340,7 @@ export class Database {
   static async #jobRow(
     connection: ReservedClient,
     jobId: PgBigInt,
+    source: SourceInfo,
   ): Promise<JobResponseRow | undefined> {
     return (
       await connection.query<JobResponseRow>(
@@ -3125,17 +3352,21 @@ export class Database {
                started_at::text AS started_at,
                finished_at::text AS finished_at,
                next_attempt_at::text AS next_attempt_at,
-               projection_version
+               projection_version, source_id
         FROM extraction_jobs
         WHERE id = $1
+          AND (source_id = $2 OR ($3::boolean AND source_id IS NULL))
         `,
-        [jobId],
+        [jobId, source.id, source.identity_scheme === "legacy"],
       )
     ).rows[0];
   }
 
-  static #jobResponse(row: JobResponseRow): JobResponse {
-    return parseJobResponse({
+  static #jobResponse(
+    row: JobResponseRow,
+    source: SourceInfo,
+  ): SourceJobResponse {
+    const response = {
       ...sourceBoundary(row),
       id: checkedBigIntToNumber(row.id, "job id"),
       segment_id: row.segment_id,
@@ -3150,10 +3381,16 @@ export class Database {
       started_at: nullableTimestamp(row.started_at),
       finished_at: nullableTimestamp(row.finished_at),
       next_attempt_at: timestamp(row.next_attempt_at),
-    });
+    };
+    return parseSourceJobResponse(
+      { ...response, source_id: source.id },
+      source.id,
+    );
   }
 
   static #recallCandidate(row: RecallRow, isDirect: boolean): RecallCandidate {
+    if (row.source_id === null)
+      throw new Error("recall row has no source ownership");
     return {
       subject: row.subject_text,
       subjectEntityId: row.subject_entity_id,
@@ -3163,6 +3400,7 @@ export class Database {
       objectEntityId: row.object_entity_id,
       objectValue: row.object_value,
       equivalenceKey: row.equivalence_key,
+      sourceId: row.source_id,
       segmentId: row.segment_id,
       similarity: Number(row.similarity),
       seedSimilarity:

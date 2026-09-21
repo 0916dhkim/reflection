@@ -402,6 +402,7 @@ function recall(
     objectEntityId: UUIDS[1]!,
     objectValue: null,
     equivalenceKey: key,
+    sourceId: "source-a",
     segmentId: UUIDS[2]!,
     similarity,
     seedSimilarity: null,
@@ -427,21 +428,33 @@ describe("recall ranking", () => {
       [
         "direct",
         {
-          segmentIds: [direct.segmentId, equivalent.segmentId],
+          segments: [
+            { source_id: direct.sourceId, segment_id: direct.segmentId },
+            {
+              source_id: equivalent.sourceId,
+              segment_id: equivalent.segmentId,
+            },
+          ],
           supportCount: 2,
           sessionCount: 3,
         },
       ],
       [
         "graph",
-        { segmentIds: [graph.segmentId], supportCount: 1, sessionCount: 1 },
+        {
+          segments: [
+            { source_id: graph.sourceId, segment_id: graph.segmentId },
+          ],
+          supportCount: 1,
+          sessionCount: 1,
+        },
       ],
     ]);
     const result = rankAndGroupClaims([direct, graph, equivalent], support);
     expect(result[0]!.score).toBeGreaterThan(result[1]!.score);
-    expect(result[0]!.segment_ids).toEqual([
-      direct.segmentId,
-      equivalent.segmentId,
+    expect(result[0]!.segments).toEqual([
+      { source_id: direct.sourceId, segment_id: direct.segmentId },
+      { source_id: equivalent.sourceId, segment_id: equivalent.segmentId },
     ]);
     expect(result[1]!.object_value).toBe("literal");
   });
@@ -453,7 +466,13 @@ describe("recall ranking", () => {
       new Map([
         [
           "claim",
-          { segmentIds: [item.segmentId], supportCount: 1, sessionCount: 1 },
+          {
+            segments: [
+              { source_id: item.sourceId, segment_id: item.segmentId },
+            ],
+            supportCount: 1,
+            sessionCount: 1,
+          },
         ],
       ]),
     )[0]!;
@@ -462,7 +481,13 @@ describe("recall ranking", () => {
       new Map([
         [
           "claim",
-          { segmentIds: [item.segmentId], supportCount: 20, sessionCount: 20 },
+          {
+            segments: [
+              { source_id: item.sourceId, segment_id: item.segmentId },
+            ],
+            supportCount: 20,
+            sessionCount: 20,
+          },
         ],
       ]),
     )[0]!;

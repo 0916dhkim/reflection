@@ -8,6 +8,7 @@ import type {
   Resolution,
   ResolutionResult,
   SearchClaim,
+  SegmentReference,
   SegmentCreate,
 } from "./contracts.js";
 
@@ -253,6 +254,7 @@ export interface RecallCandidate {
   objectEntityId: string | null;
   objectValue: string | null;
   equivalenceKey: string;
+  sourceId: string;
   segmentId: string;
   similarity: number;
   seedSimilarity: number | null;
@@ -260,7 +262,7 @@ export interface RecallCandidate {
 }
 
 export interface ClaimSupport {
-  segmentIds: string[];
+  segments: SegmentReference[];
   supportCount: number;
   sessionCount: number;
 }
@@ -434,7 +436,12 @@ export function rankAndGroupClaims(
         object_entity: candidate.objectEntity,
         object_entity_id: candidate.objectEntityId,
         object_value: candidate.objectValue,
-        segment_ids: support?.segmentIds ?? [candidate.segmentId],
+        segments: support?.segments ?? [
+          {
+            source_id: candidate.sourceId,
+            segment_id: candidate.segmentId,
+          },
+        ],
         support_count: support?.supportCount ?? 1,
         session_count: support?.sessionCount ?? 1,
         score,

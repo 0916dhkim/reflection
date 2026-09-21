@@ -54,6 +54,11 @@ export function codePointLength(value: string): number {
 }
 
 const IdentifierSchema = Type.String({ minLength: 1, maxLength: 500 });
+const SourceIdentifierSchema = Type.String({
+  minLength: 1,
+  maxLength: 500,
+  pattern: ".*\\S.*",
+});
 const UuidSchema = Type.String({ pattern: UUID_PATTERN });
 const DateTimeSchema = Type.String();
 const Nullable = <T extends TSchema>(schema: T) =>
@@ -578,10 +583,19 @@ export function parseSearchRequest(value: unknown): SearchRequest {
   );
 }
 
+export const SegmentReferenceSchema = Type.Object(
+  {
+    source_id: SourceIdentifierSchema,
+    segment_id: UuidSchema,
+  },
+  { additionalProperties: false },
+);
+export type SegmentReference = Static<typeof SegmentReferenceSchema>;
+
 export const SearchClaimSchema = Type.Composite([
   ClaimDataSchema,
   Type.Object({
-    segment_ids: Type.Array(UuidSchema),
+    segments: Type.Array(SegmentReferenceSchema),
     support_count: Type.Integer(),
     session_count: Type.Integer(),
     score: Type.Number(),

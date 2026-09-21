@@ -3,6 +3,10 @@ import { TerminalExtractionValidationError } from "@reflection/shared/domain";
 
 import type { Settings } from "./config.js";
 import type { ClaimedJob, Database } from "./database.js";
+import {
+  sourceSessionKey,
+  type SourceSession,
+} from "@reflection/shared/sources";
 import type { ExtractionEngine } from "./extraction.js";
 
 type WorkerDatabase = Pick<
@@ -312,7 +316,7 @@ export class ExtractionWorker {
 
   async #workLoop(connection: PoolClient): Promise<void> {
     const activeTasks = new Set<Promise<void>>();
-    const activeSessions = new Set<string>();
+    const activeSessions = new Map<string, SourceSession>();
     let staleBackoff = false;
     let taskWaiter: (() => void) | null = null;
 
@@ -347,12 +351,12 @@ export class ExtractionWorker {
 
         const job = await this.#database.claimOldestJob(
           connection,
-          Array.from(activeSessions),
+          Array.from(activeSessions.values()),
         );
 
         if (this.#stopping) {
           if (job !== null) {
-            activeSessions.add(job.request.session_id);
+            this.#addActiveSession(activeSessions, job);
             const task = this.#dispatchJob(job, activeSessions, (result) => {
               if (result === "stale") staleBackoff = true;
             }).finally(() => {
@@ -384,7 +388,7 @@ export class ExtractionWorker {
           continue;
         }
 
-        activeSessions.add(job.request.session_id);
+        this.#addActiveSession(activeSessions, job);
         const task = this.#dispatchJob(job, activeSessions, (result) => {
           if (result === "stale") staleBackoff = true;
         }).finally(() => {
@@ -404,7 +408,7 @@ export class ExtractionWorker {
 
   async #dispatchJob(
     job: ClaimedJob,
-    activeSessions: Set<string>,
+    activeSessions: Map<string, SourceSession>,
     onFinished: (result: ProcessResult) => void,
   ): Promise<void> {
     try {
@@ -413,7 +417,7 @@ export class ExtractionWorker {
     } catch (error) {
       this.#logger.error(`unexpected error processing job ${job.id}`, error);
     } finally {
-      activeSessions.delete(job.request.session_id);
+      activeSessions.delete(this.#sessionKey(job));
     }
   }
 
@@ -423,6 +427,23 @@ export class ExtractionWorker {
       [this.#settings.workerLockId],
     );
     return Boolean(result.rows[0]?.acquired);
+  }
+
+  #sessionKey(job: ClaimedJob): string {
+    return sourceSessionKey({
+      sourceId: job.sourceId,
+      sessionId: job.request.session_id,
+    });
+  }
+
+  #addActiveSession(
+    sessions: Map<string, SourceSession>,
+    job: ClaimedJob,
+  ): void {
+    sessions.set(this.#sessionKey(job), {
+      sourceId: job.sourceId,
+      sessionId: job.request.session_id,
+    });
   }
 
   async #waitForWork(allowWake = true): Promise<void> {

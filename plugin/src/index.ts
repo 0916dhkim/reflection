@@ -4,17 +4,20 @@ import { join } from "node:path";
 
 import { tool, type Plugin } from "@opencode-ai/plugin";
 import {
-  parseSegmentResponse,
-  parseJobResponse,
-  parseSegmentCreate,
-  parseSessionSegmentsResponse,
   type JobStatus,
   type SegmentCreate,
-  type SegmentResponse,
-  type SegmentSummary,
   type SessionSegmentsResponse,
 } from "@reflection/shared/contracts";
-import { segmentIdForRequest } from "@reflection/shared/domain";
+import {
+  parseSourceInfo,
+  parseSourceSegmentCreate,
+  parseSourceJobResponse,
+  parseSourceSegmentResponse,
+  parseSourceSessionSegmentsResponse,
+  sourceSegmentIdForRequest,
+  type SourceInfo,
+  type SourceSegmentCreate,
+} from "@reflection/shared/sources";
 import {
   PROJECTION_LOSS_WARNING,
   type CommittedSegmentBoundary,
@@ -43,6 +46,11 @@ import {
 } from "./projection.js";
 import { ProjectionStateStore } from "./projection-state.js";
 import { stripStaleToolAttachments } from "./attachments.js";
+import {
+  assertReadableBoundary,
+  readHistory,
+  type SourceReaderConfig,
+} from "./history-reader.js";
 
 const CONFIG_PATH = join(homedir(), ".config", "opencode", "reflection.json");
 const PROJECTION_STATE_PATH = join(
@@ -70,6 +78,7 @@ interface ReflectionConfig {
   url: string;
   apiKey: string;
   sourceId: string;
+  sources: Record<string, SourceReaderConfig>;
   contextProjection: boolean;
 }
 
@@ -85,8 +94,6 @@ interface ApiResult {
   data: unknown;
   detail: string;
 }
-
-type StoredSegment = SegmentResponse;
 
 interface SegmentListing {
   summaries: StoredSegmentSummary[];
@@ -118,6 +125,60 @@ interface TargetUpdateState {
   tail: Promise<void>;
   failure?: Error;
   failedSegmentKey?: string;
+}
+
+function parseSources(
+  value: unknown,
+): Record<string, SourceReaderConfig> | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return null;
+  }
+  const result: Record<string, SourceReaderConfig> = Object.create(null);
+  for (const [id, entry] of Object.entries(value)) {
+    if (
+      id.trim().length === 0 ||
+      id !== id.trim() ||
+      id.length > 500 ||
+      typeof entry !== "object" ||
+      entry === null ||
+      Array.isArray(entry)
+    ) {
+      return null;
+    }
+    const source = entry as Record<string, unknown>;
+    if (
+      (source.kind !== "opencode-v1" && source.kind !== "opencode-v2") ||
+      typeof source.url !== "string" ||
+      source.url.length === 0 ||
+      (source.username !== undefined && typeof source.username !== "string") ||
+      (source.password !== undefined && typeof source.password !== "string") ||
+      (source.directory !== undefined && typeof source.directory !== "string")
+    ) {
+      return null;
+    }
+    try {
+      const url = new URL(source.url);
+      if (
+        !["http:", "https:"].includes(url.protocol) ||
+        url.username ||
+        url.password ||
+        (source.username === undefined) !== (source.password === undefined)
+      )
+        return null;
+    } catch {
+      return null;
+    }
+    result[id] = {
+      kind: source.kind,
+      url: source.url.replace(/\/$/, ""),
+      ...(source.username === undefined ? {} : { username: source.username }),
+      ...(source.password === undefined ? {} : { password: source.password }),
+      ...(source.directory === undefined
+        ? {}
+        : { directory: source.directory }),
+    };
+  }
+  return result;
 }
 
 interface IdlePassState {
@@ -181,12 +242,20 @@ function loadConfig(): ConfigLoadResult {
       "sourceId" in value && typeof value.sourceId === "string"
         ? value.sourceId.trim()
         : null;
-    if (sourceId !== null && sourceId.length > 0 && sourceId.length <= 500) {
+    const sources = "sources" in value ? parseSources(value.sources) : null;
+    if (
+      sourceId !== null &&
+      sourceId.length > 0 &&
+      sourceId.length <= 500 &&
+      sources !== null &&
+      sources[sourceId] !== undefined
+    ) {
       return {
         config: {
           url: value.url.replace(/\/$/, ""),
           apiKey: value.apiKey,
           sourceId,
+          sources,
           contextProjection: projectionRequested,
         },
         error: "",
@@ -197,6 +266,18 @@ function loadConfig(): ConfigLoadResult {
       return {
         config: null,
         error: `missing required sourceId in config at ${CONFIG_PATH}`,
+        projectionRequested,
+      };
+    }
+    if (
+      sourceId !== null &&
+      sourceId.length > 0 &&
+      sourceId.length <= 500 &&
+      (sources === null || sources[sourceId] === undefined)
+    ) {
+      return {
+        config: null,
+        error: `missing or invalid sources config for sourceId at ${CONFIG_PATH}`,
         projectionRequested,
       };
     }
@@ -229,18 +310,46 @@ async function apiCall(
     };
   }
 
+  const errorDetail = (value: string): string => {
+    const secrets = [
+      config.apiKey,
+      ...Object.values(config.sources).flatMap((source) => [
+        source.url,
+        source.username,
+        source.password,
+        ...(source.username !== undefined && source.password !== undefined
+          ? [
+              Buffer.from(`${source.username}:${source.password}`).toString(
+                "base64",
+              ),
+            ]
+          : []),
+      ]),
+    ].filter(
+      (value): value is string => typeof value === "string" && value.length > 0,
+    );
+    // Redact before truncating, including credentials a backend might echo.
+    for (const secret of secrets.sort((a, b) => b.length - a.length)) {
+      value = value.split(secret).join("[REDACTED]");
+    }
+    return safeErrorDetail(value, "");
+  };
+
   const request = requestSignal(init.signal, timeoutMs);
   try {
+    request.signal.throwIfAborted();
     const headers = new Headers(init.headers);
     headers.set("X-Api-Key", config.apiKey);
     const response = await fetch(`${config.url}${path}`, {
       ...init,
       headers,
       signal: request.signal,
+      redirect: "error",
     });
     const body = response.ok
       ? await response.text()
       : await boundedErrorText(response);
+    request.signal.throwIfAborted();
     let data: unknown = body;
     if (body.length > 0) {
       try {
@@ -253,7 +362,7 @@ async function apiCall(
       ok: response.ok,
       status: response.status,
       data,
-      detail: response.ok ? "" : safeErrorDetail(body, config.apiKey),
+      detail: response.ok ? "" : errorDetail(body),
     };
   } catch (error) {
     if (init.signal?.aborted) {
@@ -263,21 +372,12 @@ async function apiCall(
       ok: false,
       status: 0,
       data: null,
-      detail: safeErrorDetail(
+      detail: errorDetail(
         String(request.signal.aborted ? request.signal.reason : error),
-        config.apiKey,
       ),
     };
   } finally {
     request.dispose();
-  }
-}
-
-function parseStoredSegment(data: unknown): StoredSegment | null {
-  try {
-    return parseSegmentResponse(data);
-  } catch {
-    return null;
   }
 }
 
@@ -374,9 +474,11 @@ function toTargetBoundary(
 function parseSegmentListing(
   data: unknown,
   sessionId: string,
+  sourceId: string,
 ): SegmentListing | null {
   try {
-    const parsed = parseSessionSegmentsResponse(data);
+    const { source_id: _sourceId, ...parsed } =
+      parseSourceSessionSegmentsResponse(data, sourceId);
     if (parsed.session_id !== sessionId) return null;
     return {
       summaries: parsed.segments,
@@ -395,6 +497,14 @@ function formatData(data: unknown): string {
 function formatApiFailure(operation: string, response: ApiResult): string {
   const detail = response.detail ? `: ${response.detail}` : "";
   return `${operation} failed (${response.status})${detail}`;
+}
+
+function parseOwnedJob(data: unknown, sourceId: string) {
+  const { source_id: _sourceId, ...job } = parseSourceJobResponse(
+    data,
+    sourceId,
+  );
+  return job;
 }
 
 async function waitForDelay(
@@ -422,7 +532,7 @@ export const Reflection: Plugin = async ({ client, directory }) => {
   const initialConfig = loadConfig();
   const writerConfig = initialConfig;
   const projectionEnabled = initialConfig.projectionRequested;
-  const projectionState = new ProjectionStateStore(PROJECTION_STATE_PATH);
+  let projectionState: ProjectionStateStore | null = null;
   const modelLimits = new Map<string, ModelLimits>();
   const compactingSessions = new Map<string, number>();
   const sessionGenerations = new Map<string, number>();
@@ -466,6 +576,76 @@ export const Reflection: Plugin = async ({ client, directory }) => {
     string,
     Map<string, { fingerprint: string; processingPriority: number }>
   >();
+  let registeredOwnSource: SourceInfo | undefined;
+  const ownSource = async (signal?: AbortSignal): Promise<SourceInfo> => {
+    if (!writerConfig.config) {
+      throw new Error(writerConfig.error);
+    }
+    signal?.throwIfAborted();
+    if (registeredOwnSource) return registeredOwnSource;
+    const response = await apiCall(
+      `/v1/sources/${encodeURIComponent(writerConfig.config!.sourceId)}`,
+      { method: "GET", signal },
+      PROJECTION_REQUEST_TIMEOUT_MS,
+      writerConfig,
+    );
+    if (!response.ok) {
+      throw new Error(formatApiFailure("source registry", response));
+    }
+    const source = parseSourceInfo(response.data);
+    if (source.id !== writerConfig.config!.sourceId) {
+      throw new Error("source registry returned a mismatched source");
+    }
+    const configured = writerConfig.config!.sources[source.id];
+    if (
+      !configured ||
+      configured.kind !== source.kind ||
+      source.kind !== "opencode-v1"
+    ) {
+      throw new Error(
+        "source registry kind does not match local configuration",
+      );
+    }
+    projectionState ??= new ProjectionStateStore(
+      PROJECTION_STATE_PATH,
+      source.id,
+      source.identity_scheme,
+    );
+    registeredOwnSource = source;
+    return source;
+  };
+  const sourceInfo = async (
+    sourceId: string,
+    signal?: AbortSignal,
+  ): Promise<SourceInfo> => {
+    const config = writerConfig.config;
+    if (!config) {
+      throw new Error(writerConfig.error);
+    }
+    if (sourceId === config.sourceId) {
+      return ownSource(signal);
+    }
+    const response = await apiCall(
+      `/v1/sources/${encodeURIComponent(sourceId)}`,
+      { method: "GET", signal },
+      PROJECTION_REQUEST_TIMEOUT_MS,
+      writerConfig,
+    );
+    if (!response.ok) {
+      throw new Error(formatApiFailure("source registry", response));
+    }
+    const source = parseSourceInfo(response.data);
+    if (source.id !== sourceId) {
+      throw new Error("source registry returned a mismatched source");
+    }
+    const configured = config.sources[source.id];
+    if (!configured || configured.kind !== source.kind) {
+      throw new Error(
+        "source is unavailable or its kind does not match local configuration",
+      );
+    }
+    return source;
+  };
   const deletedSessions = new Set<string>();
   const sessionTurnValidations = new Map<
     string,
@@ -609,6 +789,7 @@ export const Reflection: Plugin = async ({ client, directory }) => {
     messages: readonly OpenCodeMessage[] | null,
     signal: AbortSignal,
   ): Promise<string[]> => {
+    const source = await ownSource(signal);
     const fingerprints =
       successfulSegmentFingerprints.get(sessionId) ??
       new Map<string, { fingerprint: string; processingPriority: number }>();
@@ -620,7 +801,11 @@ export const Reflection: Plugin = async ({ client, directory }) => {
         continue;
       }
       const rawBody = submissionBody(sessionId, segment, processingPriority);
-      const segmentKey = segmentIdForRequest(rawBody);
+      const sourceBody: SourceSegmentCreate = {
+        ...rawBody,
+        source_id: source.id,
+      };
+      const segmentKey = sourceSegmentIdForRequest(sourceBody, source);
       const fingerprint = submissionSourceFingerprint(sessionId, segment);
       const fail = async (failure: string): Promise<void> => {
         await log(failure);
@@ -628,9 +813,9 @@ export const Reflection: Plugin = async ({ client, directory }) => {
           throw new SegmentSubmissionError(failure, segmentKey);
         }
       };
-      let body: SegmentCreate;
+      let body: SourceSegmentCreate;
       try {
-        body = parseSegmentCreate(rawBody);
+        body = parseSourceSegmentCreate(sourceBody);
       } catch (error) {
         await fail(
           `segment submission for ${sessionId} failed local validation: ${String(error)}`,
@@ -657,7 +842,7 @@ export const Reflection: Plugin = async ({ client, directory }) => {
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ ...body, source_id: config.sourceId }),
+          body: JSON.stringify(body),
           signal,
         },
         TARGET_POST_TIMEOUT_MS,
@@ -673,7 +858,7 @@ export const Reflection: Plugin = async ({ client, directory }) => {
       }
       let job;
       try {
-        job = parseJobResponse(response.data);
+        job = parseOwnedJob(response.data, source.id);
       } catch (error) {
         await fail(
           `segment submission for ${sessionId} returned an invalid job: ${String(error)}`,
@@ -715,7 +900,7 @@ export const Reflection: Plugin = async ({ client, directory }) => {
           continue;
         }
         try {
-          job = parseJobResponse(retry.data);
+          job = parseOwnedJob(retry.data, source.id);
         } catch (error) {
           await fail(
             `segment retry for ${sessionId} returned an invalid job: ${String(error)}`,
@@ -809,8 +994,9 @@ export const Reflection: Plugin = async ({ client, directory }) => {
     signal?: AbortSignal,
     timeoutMs = PROJECTION_REQUEST_TIMEOUT_MS,
   ): Promise<SegmentListing> => {
+    const source = await ownSource(signal);
     const response = await apiCall(
-      `/v1/sessions/${encodeURIComponent(sessionId)}/segments`,
+      `/v1/sessions/${encodeURIComponent(sessionId)}/segments?source_id=${encodeURIComponent(source.id)}`,
       { method: "GET", signal },
       timeoutMs,
       writerConfig,
@@ -820,7 +1006,7 @@ export const Reflection: Plugin = async ({ client, directory }) => {
         formatApiFailure("context projection", response),
       );
     }
-    const listing = parseSegmentListing(response.data, sessionId);
+    const listing = parseSegmentListing(response.data, sessionId, source.id);
     if (!listing) {
       throw new Error("context projection failed: invalid segment summaries");
     }
@@ -896,6 +1082,7 @@ export const Reflection: Plugin = async ({ client, directory }) => {
     }
     const operation = registerSessionOperation(sessionId, parentSignal);
     try {
+      const source = await ownSource(operation.signal);
       const successfulSegmentKeys = await submitSegments(
         sessionId,
         segments,
@@ -915,8 +1102,12 @@ export const Reflection: Plugin = async ({ client, directory }) => {
         fresh: successfulSegmentKeys.length > 0,
         successfulSegmentKeys,
         observedSegmentKeys: segments.map((segment) =>
-          segmentIdForRequest(
-            submissionBody(sessionId, segment, processingPriority),
+          sourceSegmentIdForRequest(
+            {
+              ...submissionBody(sessionId, segment, processingPriority),
+              source_id: source.id,
+            },
+            source,
           ),
         ),
       };
@@ -1173,7 +1364,15 @@ export const Reflection: Plugin = async ({ client, directory }) => {
         successfulSegmentFingerprints.delete(sessionId);
         automaticRetries.delete(sessionId);
         inactiveSessionChecks.delete(sessionId);
-        projectionState.delete(sessionId);
+        if (writerConfig.config) {
+          (
+            projectionState ??
+            new ProjectionStateStore(
+              PROJECTION_STATE_PATH,
+              writerConfig.config.sourceId,
+            )
+          ).delete(sessionId);
+        }
         sessionTurnValidations.delete(sessionId);
         return;
       }
@@ -1226,9 +1425,15 @@ export const Reflection: Plugin = async ({ client, directory }) => {
       });
       activeProjections.add(projectionCompletion);
       try {
+        const source = await ownSource(operation.signal);
+        operation.signal.throwIfAborted();
+        const stateStore = projectionState;
+        if (!stateStore) {
+          throw new Error("Reflection could not initialize projection state");
+        }
         const latestUser = latestUserMessage(messages);
         const currentTurnUserMessageId = latestUser?.info.id;
-        const previous = projectionState.get(model.sessionId);
+        const previous = stateStore.get(model.sessionId);
         const limits = await getModelLimits(
           model.providerId,
           model.modelId,
@@ -1279,6 +1484,14 @@ export const Reflection: Plugin = async ({ client, directory }) => {
 
         const result = await projectMessages({
           messages,
+          segmentIdentity: (sessionId, segment) =>
+            sourceSegmentIdForRequest(
+              {
+                ...submissionBody(sessionId, segment, 0),
+                source_id: source.id,
+              },
+              source,
+            ),
           ...limits,
           previous,
           skipPrefixFingerprint: isSameTurnAsValidated,
@@ -1353,7 +1566,10 @@ export const Reflection: Plugin = async ({ client, directory }) => {
                   archivedSegments.map((segment) => {
                     const body = submissionBody(model.sessionId, segment, 0);
                     return [
-                      segmentIdForRequest(body),
+                      sourceSegmentIdForRequest(
+                        { ...body, source_id: source.id },
+                        source,
+                      ),
                       submissionSourceFingerprint(model.sessionId, segment),
                     ] as const;
                   }),
@@ -1386,6 +1602,14 @@ export const Reflection: Plugin = async ({ client, directory }) => {
                   projectionSourcesFingerprint({
                     sessionId: model.sessionId,
                     archivedSegments,
+                    identity: (sessionId, segment) =>
+                      sourceSegmentIdForRequest(
+                        {
+                          ...submissionBody(sessionId, segment, 0),
+                          source_id: source.id,
+                        },
+                        source,
+                      ),
                   }) === checkpoint.canonicalSourceFingerprint
                 );
               },
@@ -1455,7 +1679,7 @@ export const Reflection: Plugin = async ({ client, directory }) => {
           );
         }
         if (JSON.stringify(previous) !== JSON.stringify(result.state)) {
-          projectionState.set(model.sessionId, result.state);
+          stateStore.set(model.sessionId, result.state);
         }
         if (result.state.checkpoint && currentTurnUserMessageId) {
           sessionTurnValidations.set(model.sessionId, {
@@ -1556,27 +1780,52 @@ export const Reflection: Plugin = async ({ client, directory }) => {
         description:
           "Read the original ordered user and assistant text for a Reflection source segment.",
         args: {
+          source_id: tool.schema
+            .string()
+            .min(1)
+            .describe("Reflection source ID"),
           segment_id: tool.schema
             .string()
             .min(1)
             .describe("Reflection source segment ID"),
         },
-        async execute({ segment_id }, context) {
-          const response = await apiCall(
-            `/v1/segments/${encodeURIComponent(segment_id)}`,
-            {
-              method: "GET",
-              signal: context.abort,
-            },
-          );
-          if (!response.ok)
-            return formatApiFailure("memory_read_segment", response);
-
-          const segment = parseStoredSegment(response.data);
-          if (!segment || segment.id !== segment_id)
-            return "memory_read_segment failed: invalid segment metadata";
-
+        async execute({ source_id, segment_id }, context) {
+          if (
+            typeof source_id !== "string" ||
+            !source_id.trim() ||
+            source_id.length > 500 ||
+            typeof segment_id !== "string" ||
+            !segment_id.trim()
+          ) {
+            return formatData({
+              error: "memory_read_segment requires source_id and segment_id",
+            });
+          }
           try {
+            const source = await sourceInfo(source_id, context.abort);
+            const response = await apiCall(
+              `/v1/segments/${encodeURIComponent(segment_id)}?source_id=${encodeURIComponent(source_id)}`,
+              {
+                method: "GET",
+                signal: context.abort,
+              },
+              PROJECTION_REQUEST_TIMEOUT_MS,
+              writerConfig,
+            );
+            if (!response.ok) {
+              return formatData({
+                error: formatApiFailure("memory_read_segment", response),
+              });
+            }
+
+            const segment = parseSourceSegmentResponse(
+              response.data,
+              source.id,
+            );
+            if (segment.id !== segment_id || segment.source_id !== source_id) {
+              throw new Error("invalid segment metadata");
+            }
+            assertReadableBoundary(source, segment);
             const boundary: CommittedSegmentBoundary =
               segment.source_boundary_version === 1
                 ? {
@@ -1596,10 +1845,20 @@ export const Reflection: Plugin = async ({ client, directory }) => {
                     endSourceMessageId: segment.end_source_message_id,
                   };
             const messages = readSegmentMessages(
-              await getSessionMessages(segment.session_id, context.abort),
+              await readHistory(
+                source,
+                segment.session_id,
+                {
+                  sources: writerConfig.config?.sources ?? {},
+                  readOwnV1: getSessionMessages,
+                },
+                context.abort,
+                writerConfig.config?.sourceId,
+              ),
               boundary,
             );
             return formatData({
+              source_id,
               segment_id,
               session_id: segment.session_id,
               start_user_message_id: segment.start_user_message_id,
@@ -1613,7 +1872,9 @@ export const Reflection: Plugin = async ({ client, directory }) => {
             if (context.abort.aborted) {
               throw context.abort.reason ?? error;
             }
-            return `memory_read_segment failed: ${String(error)}`;
+            return formatData({
+              error: `memory_read_segment failed: ${String(error)}`,
+            });
           }
         },
       }),

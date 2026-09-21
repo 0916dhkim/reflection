@@ -74,6 +74,11 @@ describe("requestSignal", () => {
 });
 
 describe("safeErrorDetail", () => {
+  it("normalizes already-redacted details without an additional secret", () => {
+    expect(safeErrorDetail("failure\n[REDACTED]", "")).toBe(
+      "failure [REDACTED]",
+    );
+  });
   it("redacts the API key, normalizes whitespace, and bounds output", () => {
     const detail = safeErrorDetail(
       `failure\nsecret-key\t${"x".repeat(600)}`,
