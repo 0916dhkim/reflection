@@ -89,6 +89,10 @@ services:
     networks: [restore]
     volumes:
       - restore-data:/var/lib/postgresql/data
+      # Keep evidence referenced after one-shot jobs exit, rather than dangling
+      # and eligible for volume pruning. Retain this service through cutover.
+      - backup:/retained/backup:ro
+      - reports:/retained/reports:ro
 
 networks:
   source:

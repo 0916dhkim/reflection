@@ -568,6 +568,15 @@ try {
     ],
   );
   assert(config.services["report-check"].volumes.every((v) => v.read_only));
+  assert.deepEqual(
+    config.services["restore-db"].volumes
+      .filter((v) => v.target.startsWith("/retained/"))
+      .map((v) => [v.source, v.read_only]),
+    [
+      ["backup", true],
+      ["reports", true],
+    ],
+  );
   assert.equal(
     config.services.verify.depends_on["restore-db"].condition,
     "service_healthy",
