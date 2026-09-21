@@ -1,0 +1,17 @@
+{
+  "update": "disable",
+  "share": "disabled",
+  "snapshots": false,
+  "warming": false,
+  "compaction": {
+    "auto": false
+  },
+  "plugins": [
+    {
+      "package": "REPLACE_WITH_ABSOLUTE_BUNDLE_DIRECTORY",
+      "options": {
+        "configPath": "REPLACE_WITH_ABSOLUTE_REFLECTION_V2_CONFIG"
+      }
+    }
+  ]
+}

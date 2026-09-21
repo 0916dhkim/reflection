@@ -321,3 +321,39 @@ Projection archives only verified complete source ranges, preserves complete too
 The SDK does not supply native abort signals to Promise callbacks. Plugin-owned operations have bounded deadlines and are cancelled on observed terminal/deletion events; underlying non-abortable SDK calls can still finish after cancellation. Checkpoint/source verification prevents trusting stale state. Retry delivery uses authoritative job reconciliation and best-effort at-most-one confirmed retry, not an exactly-once network guarantee.
 
 `pnpm check` verifies both bundles. `pnpm test:opencode-v2` runs the original isolated API probe and the actual native Reflection bundle against the published binary with a synthetic Reflection HTTP service and provider. It checks native tool execution, priority-50 idle ingestion, foreground projection, source fingerprints, actual-user preservation, pending/unavailable summaries, native-compaction refusal, background completion, partial-stream interruption, and image input. Real PostgreSQL tests separately exercise the native ingestion lifecycle and SQL/hash parity; these component tests do not replace CP012's final deployed dual-instance verification.
+
+### CP012 OpenCode delivery package
+
+This package is a delivery artifact and documentation only. It does not install a bundle, create a launcher, start or restart OpenCode, migrate a database, register a source, copy history, or adopt v2 in production.
+
+From a clean, tracked checkout, build both actual plugin bundles, independently verify their standalone imports, and publish one new directory outside the repository and outside the user home/config/data/service paths:
+
+```bash
+pnpm package:opencode --out /absolute/operator-chosen/delivery
+# Equivalent direct command:
+node scripts/package-opencode.mjs --out /absolute/operator-chosen/delivery
+```
+
+`--out` is required, must be absolute, and must name a path that does not yet exist. The packager refuses unknown flags, a dirty tracked tree, untracked nonignored files, a repository destination, and home/config/data/service locations. It captures the checkout identity before building and rejects an artifact if the commit, tree, or lockfile changes during the build. It stages alongside the requested destination, holds a sibling cooperative reservation lock, verifies the destination is still absent, and then renames the complete artifact. The lock prevents cooperating packagers from colliding; POSIX rename cannot protect against a process that ignores that reservation and races the final rename. It never deletes a supplied directory. A development-only `--allow-dirty` package is marked `"dirty": true` in `manifest.json`; it is not a clean release claim. A failed build removes only its own staging directory.
+
+The artifact contains only `v1/reflection.js`, native-discovery `v2/index.js`, `examples/`, and `manifest.json`; it does not include this repository, `node_modules`, a live v1 state/database, credentials, or a tar dependency. The manifest records the Git commit/tree, lockfile SHA-256, and byte size/SHA-256 for each delivered file. To independently inspect it, compare the bundle hashes and sizes in `manifest.json` with the two compiled source artifacts from the recorded commit.
+
+The example JSON files deliberately contain invalid placeholders. Preserve the existing real Reflection base URL and API key rather than guessing an API path from these examples. Manually edit absolute paths and credentials before any future operator-approved trial; do not render real keys, source URLs, or passwords through the packager. Each config's own source entry is required. Basic reader credentials are optional, and the operator must verify the authentication policy of the actual v1 `127.0.0.1:4096` endpoint before adding them. The v2 reader uses loopback port `4097` and placeholder basic credentials. Both configs retain stable, source-scoped IDs (`danny-opencode-v1` and `danny-opencode-v2`) while permitting independent URLs. `contextProjection.enabled` is required for the native config.
+
+For a future **internal trial only**, keep every v2 path separate from v1. For example, an operator may choose one private `<v2-root>` and manually set `HOME=<v2-root>/home`, `XDG_CONFIG_HOME=<v2-root>/config`, `XDG_DATA_HOME=<v2-root>/data`, `XDG_STATE_HOME=<v2-root>/state`, `XDG_CACHE_HOME=<v2-root>/cache`, `TMPDIR=<v2-root>/tmp`, and a separate workspace. Set both `OPENCODE_CONFIG=<v2-root>/config/opencode-v2.json` and `OPENCODE_CONFIG_DIR=<v2-root>/config/opencode`; point the native config at an absolute v2 bundle directory and the isolated Reflection v2 config. HOME isolation also hides global Git, SSH, and AGENT settings, so the operator must review that consequence before adoption. Keep `OPENCODE_PASSWORD` in the environment rather than a literal command argument or log. Do not copy/import a source database or automatically import old v1 history.
+
+Use only the chosen OpenCode **2.0.8** release binary for that future trial. The operator must run its `--version` check, verify the upstream release archive with the integrity data actually published for that artifact, and record the SHA-256 of the extracted exact binary. The supplied OpenCode JSON intentionally omits model/provider configuration and credentials: v2 schema/configuration differs from v1 and those settings must be ported and reviewed separately, outside the Reflection gate. The exercised harness is Linux ARM64 only; platform compatibility, real-provider behavior, GTK, and configuration adoption remain external checks that this packager does not perform. No system service, LaunchAgent, or enabled daemon is generated here.
+
+Before any native writer source is registered or used, an approved native-capable backend must be deployed. At this packaging baseline, production `b75f4d1` is schema 009 and does not accept native boundary version 3; PRs 19 and 20 are unmerged. Hold automatic deployment before merging the native release, and prepare the same release's operator with privately supplied database credentials. The planned operator sequence is:
+
+```bash
+# Approved operator only; never a test fixture pointed at production.
+node scripts/source-ownership.mjs expand
+node scripts/source-ownership.mjs install-indexes
+# Deploy the matching native-capable backend and verify readiness before:
+node scripts/source-ownership.mjs register --id danny-opencode-v2 --kind opencode-v2 --identity-scheme source-v1
+```
+
+The index-preparation step validates migration 010's boundary constraints and creates its native indexes before the new backend starts. Registration is a plain INSERT: first check `GET /v1/sources/danny-opencode-v2`, and do not blindly repeat it or alter an existing identity. Do not repeat the completed CP008 cutover/backfill or re-register `danny-opencode-v1`. The updated v1 bundle supports native-v3 reads; install its matching reader map and have the user restart v1 only at a coordinated time. Keep the isolated v2 writer disabled until the remaining adoption checks pass. CP012 protocol/package verification does not make all of OpenCode ready: GTK, target-platform behavior, and provider configuration remain external gates.
+
+Recovery is operator-controlled: leave the existing v1 service and paths untouched; stop only the isolated v2 instance if it must be stopped. Reflection memories remain source-scoped, and this package performs no automatic restore, rollback, source registration, or history import.
