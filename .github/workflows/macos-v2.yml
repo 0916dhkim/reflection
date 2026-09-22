@@ -1,0 +1,54 @@
+name: macOS v2 native/web readiness
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/macos-v2.yml"
+      - "scripts/macos-runtime/**"
+      - "scripts/package.json"
+      - "plugin/**"
+      - "package.json"
+      - "pnpm-lock.yaml"
+      - "packages/opencode-v2-plugin/**"
+      - "packages/opencode-v2-core/**"
+      - "packages/shared/**"
+
+permissions:
+  contents: read
+
+jobs:
+  native-web:
+    name: native web (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-15, macos-26]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        with:
+          version: 10.33.0
+          run_install: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24.18.0
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm test:macos-v2:safety
+      - run: pnpm --filter @reflection/backfill exec playwright install chromium webkit
+        env:
+          PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/reflection-macos-v2-browsers
+      - run: pnpm test:macos-v2
+        env:
+          PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/reflection-macos-v2-browsers
+          EXPECTED_MACOS_MAJOR: ${{ matrix.runner == 'macos-15' && '15' || '26' }}
+      - if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: macos-v2-report-${{ matrix.runner }}
+          path: ${{ runner.temp }}/reflection-macos-v2-report-*.json
+          if-no-files-found: ignore
+          retention-days: 3

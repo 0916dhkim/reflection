@@ -10,5 +10,8 @@
   },
   "dependencies": {
     "@reflection/shared": "workspace:*"
+  },
+  "devDependencies": {
+    "playwright": "1.63.0"
   }
 }
