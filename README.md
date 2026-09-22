@@ -324,6 +324,25 @@ The SDK does not supply native abort signals to Promise callbacks. Plugin-owned 
 
 ### CP012 OpenCode delivery package
 
+#### Inactive coexistence installation
+
+`scripts/instance/prepare.mjs` is a separate, explicitly invoked preparation tool. It verifies the pinned Darwin ARM64 2.0.8 binary and policy-capable Reflection bundle, then exclusively creates a new private root with those assets, a Node launcher/helper and a blocked manifest. It never runs the binary (including `--version`), creates active configuration/credentials/activation approval, imports a database, registers a source, installs a LaunchAgent or changes v1.
+
+```sh
+node /absolute/checkout/scripts/instance/prepare.mjs \
+  --root /absolute/new-coexistence-root \
+  --user-home /absolute/current-os-user-home \
+  --binary /absolute/verified-native-binary \
+  --bundle /absolute/policy-delivery/v2/index.js
+node /absolute/new-coexistence-root/bin/launch.mjs --check
+```
+
+Only `--check` is appropriate at preparation. It validates assets, critical paths, private modes and v1-state separation without starting any process or creating a database. `--serve` remains blocked without separately bound native/Reflection/policy configuration, a matching private web password and an `activation.json` receipt. The receipt is an explicit owner attestation of coordinated v1 port/reader/source/access checks, tied to manifest/config hashes—not a cryptographic signature or independent proof those external actions happened. Future binding must use the full native schema decoder; the standalone launcher verifies critical runtime bindings only.
+
+The launcher uses the private native binary directly, loopback4096, a new environment with isolated HOME/XDG/DB/temp/PTY/pnpm state, and an exclusive owned lock. Public Node/pnpm executable directories may be shared, not v1 state. It does not inherit shell profiles, credential variables or `NODE_OPTIONS`. Child output is discarded rather than appended unfiltered by the launcher; native-owned application logs are private, not guaranteed redacted. No stale lock is automatically removed and no recorded PID is signalled. SIGKILL can require operator lock recovery. Node lacks atomic `openat`/compare-and-unlink, so checked filesystem isolation is not an OS sandbox against another process with the same UID.
+
+This root is **temporary coexistence isolation**. Internal assets use root-relative paths, but moving it does not rewrite bound config references, session locations, project identities or plugin storage. Conventional v2 defaults are config `~/.config/opencode`, data/DB/logs `~/.local/share/opencode`, cache `~/.cache/opencode`, and state `~/.local/state/opencode`. Moving there requires explicit v1 retirement, backups/archive, reviewed config rebinding and validation before cleanup; never merge the databases. Workspace relocation is a separate decision because sessions store absolute locations. No automatic conventional-layout mode exists in this launcher.
+
 #### Optional native user policy
 
 The v2 plugin accepts an optional absolute `options.userPolicyPath` alongside `options.configPath`. Omitting it preserves the existing plugin behavior. A present but invalid/unreadable profile retains blocking guards rather than enabling native fallback. Use a bundle built from this implementation: older delivery bundles do not implement this option.
