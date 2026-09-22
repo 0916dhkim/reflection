@@ -794,18 +794,27 @@ try {
       await assertUnused(4098);
     },
   );
-  await phase("Darwin same-DB process lock rejects second port", async () => {
-    const duplicate = native(environment, 4098);
-    const result = await exited(duplicate, 15_000);
-    await terminate(duplicate);
-    assert.ok(result && result.code !== 0);
-    assert.match(
-      duplicate.output,
-      /Process lock is already held|ProcessLockHeldError/,
-    );
-    await assertUnused(4098);
-    await ready(origin, password, server);
-  });
+  await phase(
+    "characterize foreground same-DB behavior on another port",
+    async () => {
+      const duplicate = native(environment, 4098);
+      // The presence of an upstream ProcessLock utility is not evidence that
+      // foreground serve acquires it. Verify the observed shared-state risk.
+      await ready("http://127.0.0.1:4098", password, duplicate);
+      assert.equal(
+        (await api("http://127.0.0.1:4098", password, `/session/${session.id}`))
+          .data.id,
+        session.id,
+      );
+      report.metadata.foregroundSharedDatabasePermitted = true;
+      report.remaining.push(
+        "Foreground serve permits a second port on the same database. Private instance configuration/launcher must prevent shared roots; no native single-writer lock guarantee is claimed.",
+      );
+      await terminate(duplicate);
+      await assertUnused(4098);
+      await ready(origin, password, server);
+    },
+  );
   await phase("native SQLite restart and untouched 4096 sentinel", async () => {
     assert.equal(
       (await readFile(environment.OPENCODE_DB)).subarray(0, 16).toString(),

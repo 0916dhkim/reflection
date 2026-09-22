@@ -47,7 +47,10 @@ the lane never removes quarantine.
   Browser routing blocks other origins; data/blob UI resources remain allowed.
 - Strict port 4097 loopback listener; independent valid port-4098 baseline before
   occupied-port and invalid-DB negatives; explicit bind/SQLite error evidence;
-  no silent 4098 switch; same-DB/different-port native process-lock failure.
+  no silent 4098 switch. Same-DB/different-port behavior is characterized, not
+  assumed to be rejected: foreground `serve` does not promise exclusive instance
+  ownership merely because an upstream ProcessLock utility exists. Deployment
+  must prevent accidental root/database sharing in its own configuration.
 - SQLite history persistence after restart and unchanged run-owned port-4096
   HTTP/file sentinel. The sentinel is not a real v1 runtime.
 

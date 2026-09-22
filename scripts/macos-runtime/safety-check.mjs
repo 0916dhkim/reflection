@@ -205,7 +205,7 @@ test("browser gate remains fatal for all page errors and runs after native DB ga
   const browserPhase = runner.indexOf('await phase("Chromium and WebKit');
   for (const phase of [
     "independent baseline then port collision",
-    "Darwin same-DB process lock",
+    "characterize foreground same-DB behavior",
     "native SQLite restart",
   ])
     assert.ok(runner.indexOf(phase) < browserPhase);
