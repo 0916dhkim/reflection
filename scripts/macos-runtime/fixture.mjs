@@ -13,6 +13,127 @@ export const PROMPT =
   "Search Reflection for the synthetic fixture marker, read the returned citation, and return only the marker from the exact source.";
 export const TITLE = "macOS native Reflection fixture";
 
+// Pinned 7673: session.log emits SessionEvent.Durable directly as SSE data;
+// execution.ts:51-56 -> to-session-error.ts:64 preserves the thrown message.
+// Unknown shapes/reasons are diagnostics only, never alternate refusal proofs.
+export function policyRefusalEvidence(
+  text,
+  sessionID,
+  expected,
+  nativeOutput = "",
+) {
+  const result = {
+    matched: false,
+    overflow: Buffer.byteLength(text) > 256 * 1024,
+    malformed: 0,
+    streamFailure: false,
+    eventCount: 0,
+    terminalCount: 0,
+    matchingFailures: 0,
+    nativeOutputExpectedReason: nativeOutput.includes(expected),
+    events: [],
+  };
+  if (result.overflow) return result;
+  for (const frame of text.split(/\r?\n\r?\n/)) {
+    const lines = frame.split(/\r?\n/);
+    const data = lines
+      .filter((line) => line.startsWith("data:"))
+      .map((line) => line.slice(5).replace(/^ /, ""))
+      .join("\n");
+    if (!data) continue;
+    if (++result.eventCount > 128) {
+      result.overflow = true;
+      break;
+    }
+    if (lines.some((line) => line === "event: effect/httpapi/stream/failure"))
+      result.streamFailure = true;
+    let event;
+    try {
+      event = JSON.parse(data);
+    } catch {
+      result.malformed++;
+      continue;
+    }
+    const kind = [
+      "session.execution.started",
+      "session.execution.failed",
+      "session.execution.succeeded",
+      "session.execution.interrupted",
+      "log.synced",
+    ].includes(event?.type)
+      ? event.type
+      : "other";
+    const error = event?.data?.error;
+    const message = typeof error?.message === "string" ? error.message : "";
+    const sessionMatches = event?.data?.sessionID === sessionID;
+    const durableMatches =
+      event?.durable?.aggregateID === sessionID &&
+      Number.isInteger(event.durable.seq) &&
+      event.durable.seq >= 0 &&
+      event.durable.version === 1;
+    const expectedMessage = message.includes(expected);
+    if (
+      [
+        "session.execution.failed",
+        "session.execution.succeeded",
+        "session.execution.interrupted",
+      ].includes(kind)
+    )
+      result.terminalCount++;
+    if (
+      kind === "session.execution.failed" &&
+      sessionMatches &&
+      durableMatches &&
+      error?.type === "unknown" &&
+      expected.length > 0 &&
+      expectedMessage
+    )
+      result.matchingFailures++;
+    // Fixed labels/booleans only: never copy error text, IDs, arbitrary keys or values.
+    result.events.push({
+      kind,
+      sessionMatches,
+      durableMatches,
+      dataObject: event?.data != null && typeof event.data === "object",
+      nestedEventType: typeof event?.data?.type === "string",
+      errorObject: error != null && typeof error === "object",
+      errorType: [
+        "unknown",
+        "aborted",
+        "provider.no-route",
+        "provider.auth",
+        "provider.transport",
+        "provider.internal",
+        "provider.invalid-request",
+      ].includes(error?.type)
+        ? error.type
+        : error?.type == null
+          ? "absent"
+          : "other",
+      status:
+        Number.isInteger(error?.status) &&
+        error.status >= 100 &&
+        error.status <= 599
+          ? error.status
+          : null,
+      hasMessage: message.length > 0,
+      expectedMessage,
+      reflectionMessage: message.startsWith("Reflection:"),
+      genericValidationMessage:
+        message ===
+        "Reflection: operation failed validation or is unavailable; no native fallback",
+    });
+    if (result.events.length > 8) result.events.shift();
+  }
+  result.matched =
+    result.matchingFailures === 1 &&
+    result.terminalCount === 1 &&
+    !result.overflow &&
+    !result.malformed &&
+    !result.streamFailure;
+  return result;
+}
+
 export function toolContent(message) {
   return typeof message.content === "string"
     ? message.content

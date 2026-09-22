@@ -38,6 +38,7 @@ import {
   PROMPT,
   POLICY_SEED_TEXT,
   toolContent,
+  policyRefusalEvidence,
 } from "./fixture.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -801,6 +802,16 @@ try {
   await phase(
     "opt-in user policy native wire, fresh instructions and hard refusal",
     async () => {
+      const policyReport = (report.metadata.userPolicy = {
+        policyEnabled: true,
+        provider: "openrouter",
+        model: "google/fixture-model",
+        baselineProviderRequests: fixture.provider.length,
+        providerRequests: 0,
+        currentCase: "startup",
+        roundtrips: [],
+        refusals: [],
+      });
       const policyRoot = join(root, "policy");
       const policyOrigin = "http://127.0.0.1:4098";
       await layout(policyRoot);
@@ -884,6 +895,8 @@ try {
           ),
           "Late native override must be selectable to exercise hard refusal",
         );
+        policyReport.catalogFiltered = true;
+        policyReport.lateOverrideSelectable = true;
         const newSession = async (id = "google/fixture-model") => {
           const result = (
             await api(policyOrigin, password, "/session", {
@@ -952,7 +965,8 @@ try {
           created_at: now,
           updated_at: now,
         });
-        const roundtrip = async (memory) => {
+        const roundtrip = async (name, memory) => {
+          policyReport.currentCase = name;
           policyFixture.beginCase();
           const before = policyFixture.provider.length;
           const originalBefore = (await originals()).length;
@@ -1021,17 +1035,32 @@ try {
             canonicalizeNativeHistory(await messages(policySeed.id)),
             canonicalizeNativeHistory(seedHistory),
           );
+          policyReport.providerRequests = policyFixture.provider.length;
+          policyReport.roundtrips.push({
+            name,
+            providerRequests: wire.length,
+            exactOnceWireEncoding: true,
+            storedHistoryUnchanged: true,
+            orderedInstructions: true,
+          });
         };
-        await roundtrip("MEMORY_MACOS_INITIAL_SENTINEL");
+        await roundtrip("initial", "MEMORY_MACOS_INITIAL_SENTINEL");
         await writeFile(
           join(policyRoot, "instructions/MEMORY.md"),
           "MEMORY_MACOS_CHANGED_SENTINEL\n",
         );
-        await roundtrip("MEMORY_MACOS_CHANGED_SENTINEL");
-        const refuse = async (id, expected) => {
+        await roundtrip("fresh-instructions", "MEMORY_MACOS_CHANGED_SENTINEL");
+        policyReport.freshInstructions = true;
+        const refuse = async (name, id, expected) => {
+          policyReport.currentCase = name;
+          const evidence = { name, outcome: "running" };
+          policyReport.refusals.push(evidence);
           const before = policyFixture.requests.filter(
             (item) => item.path === "/v1/chat/completions",
           ).length;
+          // This owned child's buffer is diagnostic-only. Reset it so reason
+          // classification cannot accidentally match a prior refusal's output.
+          policyServer.output = "";
           await prompt(id);
           // Context hooks can fail before an assistant message exists. The durable
           // execution terminal is the native public failure contract in that case.
@@ -1040,43 +1069,49 @@ try {
             `/api/experimental/session/${id}/log?follow=false`,
             goodAuth(password),
           );
-          assert.equal(response.status, 200);
-          const events = (await response.text())
-            .split(/\r?\n/)
-            .filter((line) => line.startsWith("data:"))
-            .map((line) => JSON.parse(line.slice(5)));
-          assert.ok(
-            events.some(
-              (event) =>
-                event.type === "session.execution.failed" &&
-                event.data.sessionID === id &&
-                event.data.error?.message.includes(expected),
-            ),
-            "Expected explicit policy refusal",
-          );
-          assert.equal(
+          evidence.logStatus = response.status;
+          evidence.providerRequestDelta =
             policyFixture.requests.filter(
               (item) => item.path === "/v1/chat/completions",
-            ).length,
-            before,
+            ).length - before;
+          evidence.terminal = policyRefusalEvidence(
+            await response.text(),
+            id,
+            expected,
+            policyServer.output,
+          );
+          evidence.outcome = "failed";
+          assert.equal(response.status, 200);
+          assert.equal(
+            evidence.providerRequestDelta,
+            0,
             "Refusal dispatched provider request",
           );
+          assert.ok(
+            evidence.terminal.matched,
+            `Expected explicit policy refusal: ${name}`,
+          );
           await ready(policyOrigin, password, policyServer);
+          evidence.outcome = "passed";
         };
         await rm(join(policyRoot, "instructions/MEMORY.md"));
         await refuse(
+          "missing-instruction",
           (await newSession()).id,
           "Reflection: user policy instructions unavailable; request blocked",
         );
+        policyReport.missingFileRefused = true;
         await writeFile(
           join(policyRoot, "instructions/MEMORY.md"),
           "MEMORY_MACOS_CHANGED_SENTINEL\n",
         );
         await refuse(
+          "late-model-override",
           (await newSession("google/fixture-late-override")).id,
           "user policy forbids selected model",
         );
-        await roundtrip("MEMORY_MACOS_CHANGED_SENTINEL");
+        policyReport.lateOverrideRefused = true;
+        await roundtrip("recovery", "MEMORY_MACOS_CHANGED_SENTINEL");
         assert.equal(policyFixture.provider.length, 9);
         assert.equal(
           fixture.provider.length,
@@ -1105,7 +1140,7 @@ try {
           refused: 0,
           primaryRequests: 9,
         });
-        report.metadata.userPolicy = {
+        Object.assign(policyReport, {
           policyEnabled: true,
           provider: "openrouter",
           model: "google/fixture-model",
@@ -1120,8 +1155,10 @@ try {
           catalogFiltered: true,
           lateOverrideRefused: true,
           recoveryRoundtrip: true,
-        };
+          currentCase: "complete",
+        });
       } finally {
+        policyReport.providerRequests = policyFixture.provider.length;
         if (policyServer) await terminate(policyServer);
         await policyFixture.close();
       }

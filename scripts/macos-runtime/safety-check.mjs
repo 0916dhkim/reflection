@@ -18,6 +18,7 @@ import {
   POLICY_SEED_TEXT,
   toolResult,
   createReflectionFixture,
+  policyRefusalEvidence,
 } from "./fixture.mjs";
 import { readFile } from "node:fs/promises";
 import { runInNewContext } from "node:vm";
@@ -1512,6 +1513,155 @@ test("OpenRouter Google roundtrip preserves braces, refs, nested JSON and reject
     completionChunks({ text: MARKER }, 3, body.model)[0].model,
     body.model,
   );
+});
+
+test("native refusal evidence requires the direct durable event and the specific policy reason", () => {
+  // 7673 schema/event.ts + session-event.ts Execution.Failed, emitted directly
+  // by HttpApi StreamSse(data), not the SDK's client-side event wrapper.
+  const sessionID = "synthetic-session";
+  const expected =
+    "Reflection: user policy instructions unavailable; request blocked";
+  const failure = {
+    id: "event-fixture",
+    type: "session.execution.failed",
+    created: 1,
+    durable: { aggregateID: sessionID, seq: 4, version: 1 },
+    data: { sessionID, error: { type: "unknown", message: expected } },
+  };
+  const sse = (event, name = "message") =>
+    `event: ${name}\ndata: ${JSON.stringify(event)}\n\n`;
+  const marker = sse({ type: "log.synced", aggregateID: sessionID, seq: 4 });
+  const positive = policyRefusalEvidence(
+    sse(failure) + marker,
+    sessionID,
+    expected,
+  );
+  assert.equal(positive.matched, true);
+  assert.equal(positive.events[0].errorType, "unknown");
+  assert.equal(
+    positive.nativeOutputExpectedReason,
+    false,
+    "log output is not required or sufficient proof",
+  );
+  assert.equal(
+    policyRefusalEvidence(
+      (sse(failure) + marker).replaceAll("\n", "\r\n"),
+      sessionID,
+      expected,
+    ).matched,
+    true,
+  );
+  for (const mutate of [
+    (e) => {
+      e.type = "session.execution.succeeded";
+    },
+    (e) => {
+      e.type = "session.execution.interrupted";
+    },
+    (e) => {
+      e.data.sessionID = "other-session";
+    },
+    (e) => {
+      e.durable.aggregateID = "other-session";
+    },
+    (e) => {
+      delete e.durable;
+    },
+    (e) => {
+      e.durable.version = 2;
+    },
+    (e) => {
+      e.durable.seq = -1;
+    },
+    (e) => {
+      e.data.error.type = "provider.auth";
+    },
+    (e) => {
+      e.data.error.message = "Unrelated failure";
+    },
+    (e) => {
+      e.data.error.message = "Reflection: user policy forbids selected model";
+    },
+    (e) => {
+      e.data.error.message =
+        "Reflection: operation failed validation or is unavailable; no native fallback";
+    },
+    (e) => {
+      delete e.data.error;
+    },
+  ]) {
+    const changed = structuredClone(failure);
+    mutate(changed);
+    assert.equal(
+      policyRefusalEvidence(sse(changed), sessionID, expected, expected)
+        .matched,
+      false,
+    );
+  }
+  const wrapped = policyRefusalEvidence(
+    sse({ data: failure }),
+    sessionID,
+    expected,
+    expected,
+  );
+  assert.equal(wrapped.matched, false);
+  assert.equal(wrapped.events[0].nestedEventType, true);
+  assert.equal(wrapped.nativeOutputExpectedReason, true);
+  for (const extra of [
+    sse(failure),
+    sse({ ...failure, type: "session.execution.succeeded" }),
+    "data: not-json\n\n",
+    sse({}, "effect/httpapi/stream/failure"),
+  ])
+    assert.equal(
+      policyRefusalEvidence(sse(failure) + extra, sessionID, expected).matched,
+      false,
+    );
+  assert.equal(
+    policyRefusalEvidence("", sessionID, expected, expected).matched,
+    false,
+  );
+  assert.equal(
+    policyRefusalEvidence(sse(failure), sessionID, "").matched,
+    false,
+  );
+});
+
+test("refusal diagnostics are bounded and never include raw error, instruction, credential or ID values", () => {
+  const privateText = "Bearer private-key private-instruction private-session";
+  const event = {
+    type: "arbitrary-private-type",
+    data: {
+      sessionID: "private-session",
+      error: { type: privateText, message: privateText, status: privateText },
+      [privateText]: privateText,
+    },
+  };
+  const frame = `data: ${JSON.stringify(event)}\n\n`;
+  const summary = policyRefusalEvidence(
+    frame.repeat(129),
+    "private-session",
+    "expected-policy-error",
+    privateText,
+  );
+  assert.equal(summary.overflow, true);
+  assert.equal(summary.matched, false);
+  assert.equal(summary.events.length, 8);
+  assert.doesNotMatch(JSON.stringify(summary), /private-|Bearer|arbitrary-/);
+  assert.equal(summary.events[0].errorType, "other");
+  assert.equal(summary.events[0].status, null);
+  assert.equal(
+    policyRefusalEvidence("x".repeat(256 * 1024 + 1), "id", "expected")
+      .overflow,
+    true,
+  );
+  const malformed = policyRefusalEvidence(
+    `data: ${privateText}\n\n`,
+    "id",
+    "expected",
+  );
+  assert.equal(malformed.malformed, 1);
+  assert.doesNotMatch(JSON.stringify(malformed), /private-|Bearer/);
 });
 
 test("source forwarding cannot target remote hosts and policy gate is mandatory before port reuse", async () => {
