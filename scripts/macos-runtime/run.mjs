@@ -768,7 +768,10 @@ try {
       const collisionExit = await exited(collision, 15_000);
       await terminate(collision);
       assert.ok(collisionExit && collisionExit.code !== 0);
-      assert.match(collision.output, /EADDRINUSE|address already in use/i);
+      assert.match(
+        collision.output,
+        /EADDRINUSE|address already in use|Failed to start server\. Is port 4097 in use\?/i,
+      );
       await assertUnused(4098);
       const blocked = join(other, "db/blocked.db");
       await mkdir(blocked);
