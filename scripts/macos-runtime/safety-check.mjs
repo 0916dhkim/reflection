@@ -95,8 +95,9 @@ test("sandbox denies writes and external networking with exact fixture ports", (
   assert.match(profile, /\(allow default\)/);
   assert.match(profile, /\(deny file-write\*\)/);
   assert.match(profile, /\(deny network\*\)/);
-  assert.match(profile, /remote ip "127\.0\.0\.1:4200"/);
-  assert.doesNotMatch(profile, /4096|127\.0\.0\.1:\*|allow network\*/);
+  assert.match(profile, /remote ip "localhost:4200"/);
+  assert.match(profile, /network-bind \(local ip "localhost:4097"/);
+  assert.doesNotMatch(profile, /4096|localhost:\*|allow network\*/);
   for (const ports of [[], [0], [65536], [4097.5], ["4097"]])
     assert.throws(() => sandboxProfile("/private/tmp/root", ports));
   assert.throws(() => sandboxProfile('/tmp/"escape', [4097]));

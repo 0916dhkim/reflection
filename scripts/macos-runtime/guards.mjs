@@ -105,7 +105,7 @@ export function sandboxProfile(root, ports) {
 (deny file-write*)
 (allow file-write* (subpath "${root}") (literal "/dev/null") (literal "/dev/tty") (regex #"^/dev/ttys[0-9]+$"))
 (deny network*)
-${ports.map((port) => `(allow network-outbound (remote ip "127.0.0.1:${port}"))\n(allow network-inbound (local ip "127.0.0.1:${port}"))`).join("\n")}
+${ports.map((port) => `(allow network-outbound (remote ip "localhost:${port}"))\n(allow network-inbound (local ip "localhost:${port}"))\n(allow network-bind (local ip "localhost:${port}"))`).join("\n")}
 `;
 }
 
