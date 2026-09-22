@@ -721,16 +721,6 @@ try {
       return session;
     },
   );
-  report.metadata.browsers = await phase(
-    "Chromium and WebKit rendered history and reload",
-    () =>
-      verifyBrowserContract({
-        origin,
-        password,
-        sessionId: session.id,
-        signal: abort.signal,
-      }),
-  );
   await phase("strict loopback native listener", async () => {
     const lines = (
       await capture("/usr/sbin/lsof", [
@@ -856,6 +846,19 @@ try {
     image: process.env.ImageOS,
     imageVersion: process.env.ImageVersion,
   };
+  // Mutated incrementally so a later browser failure cannot discard earlier
+  // results. Native listener/DB/lock/restart evidence is collected first.
+  report.metadata.browsers = {};
+  await phase("Chromium and WebKit rendered history and reload", () =>
+    verifyBrowserContract({
+      origin,
+      password,
+      sessionId: session.id,
+      directory: join(root, "workspace"),
+      signal: abort.signal,
+      results: report.metadata.browsers,
+    }),
+  );
   report.outcome = "passed";
 } catch (error) {
   report.error = safeError(error);

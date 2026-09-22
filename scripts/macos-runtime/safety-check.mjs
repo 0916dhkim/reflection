@@ -17,6 +17,201 @@ import {
   MARKER,
 } from "./fixture.mjs";
 import { readFile } from "node:fs/promises";
+import {
+  browserURL,
+  browserError,
+  finiteAPIState,
+  isReloadCancellation,
+} from "./browser.mjs";
+
+test("browser diagnostics omit query and credential values but correlate exact request URLs", () => {
+  const origin = "http://127.0.0.1:4097";
+  const directory = "/private/fixture/workspace";
+  const url = `${origin}/api/config?${new URLSearchParams({ "location[directory]": directory, token: "never-artifact-this" })}`;
+  const summary = browserURL(url, origin, directory);
+  assert.equal(summary.path, "/api/config");
+  assert.equal(summary.sameOrigin, true);
+  assert.equal(summary.directoryMatches, true);
+  assert.deepEqual(summary.queryKeys, ["location[directory]", "token"]);
+  assert.doesNotMatch(
+    JSON.stringify(summary),
+    /never-artifact-this|private\/fixture/,
+  );
+  assert.notEqual(browserURL(url + "2", origin, directory).key, summary.key);
+  assert.equal(browserURL(url, origin, "/wrong").directoryMatches, false);
+  assert.equal(
+    browserURL(url, "http://127.0.0.1:4098", directory).sameOrigin,
+    false,
+  );
+  assert.equal(
+    browserURL("data:text/plain,private-payload", origin, directory).path,
+    "[data:]",
+  );
+});
+
+test("browser errors redact registered fixture secrets even in JSON colon-space form", () => {
+  const password = "random-fixture+secret";
+  const basic = Buffer.from(`opencode:${password}`).toString("base64");
+  const error = new Error(
+    `{"password": "${password}"} Basic ${basic} ${encodeURIComponent(password)} http://127.0.0.1:4097/api/config?location=private /api/config?token=secret-query due to access control checks.`,
+  );
+  const redacted = browserError(error, password);
+  for (const secret of [
+    password,
+    basic,
+    encodeURIComponent(password),
+    "secret-query",
+    "location=private",
+  ])
+    assert.ok(!redacted.includes(secret));
+  assert.match(redacted, /due to access control checks/);
+});
+
+test("rendered history is not readiness while workspace config is in flight; SSE does not block", () => {
+  const config = {
+    id: 1,
+    document: 1,
+    sameOrigin: true,
+    path: "/api/config",
+    directoryMatches: true,
+    method: "GET",
+    startedAt: 10,
+    endedAt: null,
+    status: 200,
+  };
+  const sse = {
+    id: 2,
+    document: 1,
+    sameOrigin: true,
+    path: "/api/event",
+    method: "GET",
+    startedAt: 10,
+    endedAt: null,
+  };
+  assert.deepEqual(finiteAPIState([config, sse], 1, 1000), {
+    pending: [1],
+    configComplete: false,
+    ready: false,
+  });
+  const complete = { ...config, finished: true, endedAt: 100 };
+  assert.equal(finiteAPIState([complete, sse], 1, 349).ready, false);
+  assert.equal(finiteAPIState([complete, sse], 1, 350).ready, true);
+  assert.equal(
+    finiteAPIState([complete, sse], 2, 1000).ready,
+    false,
+    "reload must complete its own workspace config request",
+  );
+  assert.equal(
+    finiteAPIState([{ ...complete, directoryMatches: false }], 1, 1000).ready,
+    false,
+  );
+  for (const status of [401, 403, 500])
+    assert.equal(
+      finiteAPIState([{ ...complete, status }], 1, 1000).ready,
+      false,
+    );
+});
+
+test("delayed finite API work resets the bounded readiness window", () => {
+  const config = {
+    id: 1,
+    document: 1,
+    sameOrigin: true,
+    path: "/api/config",
+    directoryMatches: true,
+    method: "GET",
+    startedAt: 10,
+    endedAt: 100,
+    finished: true,
+    status: 200,
+  };
+  const late = {
+    ...config,
+    id: 2,
+    path: "/api/integration",
+    startedAt: 340,
+    endedAt: null,
+    finished: false,
+  };
+  assert.equal(finiteAPIState([config, late], 1, 400).ready, false);
+  assert.equal(
+    finiteAPIState([config, { ...late, endedAt: 400, finished: true }], 1, 649)
+      .ready,
+    false,
+  );
+  assert.equal(
+    finiteAPIState([config, { ...late, endedAt: 400, finished: true }], 1, 650)
+      .ready,
+    true,
+  );
+});
+
+test("reload cancellation requires old pending request, explicit cancellation, and navigation timing", () => {
+  const request = {
+    id: 1,
+    document: 1,
+    sameOrigin: true,
+    method: "GET",
+    failedAt: 110,
+    failure: "cancelled",
+    status: null,
+  };
+  const navigation = {
+    kind: "reload",
+    fromDocument: 1,
+    pending: [1],
+    startedAt: 100,
+    completedAt: 120,
+  };
+  assert.equal(isReloadCancellation(request, navigation), true);
+  for (const patch of [
+    { document: 2 },
+    { failedAt: 99 },
+    { failedAt: 121 },
+    { status: 401 },
+    { status: 403 },
+    { status: 200, responseStatuses: [401, 200] },
+    { sameOrigin: false },
+    { method: "POST" },
+    { failure: "Fetch API cannot load due to access control checks." },
+    { failure: "Load failed" },
+  ])
+    assert.equal(
+      isReloadCancellation({ ...request, ...patch }, navigation),
+      false,
+    );
+  for (const patch of [
+    { kind: "initial" },
+    { pending: [] },
+    { completedAt: undefined },
+  ])
+    assert.equal(
+      isReloadCancellation(request, { ...navigation, ...patch }),
+      false,
+    );
+});
+
+test("browser gate remains fatal for all page errors and runs after native DB gates", async () => {
+  const browser = await readFile(
+    new URL("./browser.mjs", import.meta.url),
+    "utf8",
+  );
+  assert.match(browser, /if \(diagnostics\.pageErrors\.length\)\s*throw Error/);
+  assert.doesNotMatch(
+    browser,
+    /waitUntil: ["']networkidle["']|extraHTTPHeaders/,
+  );
+  const runner = await readFile(new URL("./run.mjs", import.meta.url), "utf8");
+  const browserPhase = runner.indexOf('await phase("Chromium and WebKit');
+  for (const phase of [
+    "independent baseline then port collision",
+    "Darwin same-DB process lock",
+    "native SQLite restart",
+  ])
+    assert.ok(runner.indexOf(phase) < browserPhase);
+  assert.match(runner, /results: report\.metadata\.browsers/);
+  assert.ok(runner.indexOf("report.metadata.browsers = {}") < browserPhase);
+});
 
 test("runner guard rejects local and self-hosted execution", () => {
   assert.throws(() => assertGitHubHostedMacOS({}));
