@@ -1,10 +1,21 @@
 import { isAbsolute, relative, resolve } from "node:path";
+import { createHash } from "node:crypto";
+import { types } from "node:util";
 import { Config } from "@opencode/schema/config";
 import { Schema } from "effect";
 import { parseUserPolicy } from "../../packages/opencode-v2-plugin/src/user-policy.js";
 
 type ObjectValue = Record<string, unknown>;
 type SourcePath = readonly number[];
+type DestinationPath = (string | number)[];
+type SlotToken = Readonly<{ ownedSlot: true }>;
+const completedConversions = new WeakMap<
+  ConversionResult,
+  {
+    inputFingerprint: string;
+    preview: string;
+  }
+>();
 type Disposition = "mapped" | "externalized" | "redundant" | "blocked";
 /** Definition assets only; the later loader must verify regular files/directories and symlink containment. */
 type DefinitionMapping = {
@@ -74,6 +85,8 @@ export interface ConversionResult {
       | "oauth"
       | "setting";
     placeholder: string;
+    /** Relative to draftNativeConfig; recorded from owned tokens, never string matching. */
+    destinationPath: DestinationPath;
   }[];
   ledger: { sourcePath: SourcePath; disposition: Disposition }[];
   diagnostics: { code: string; fieldPath: SourcePath; blocking: boolean }[];
@@ -88,6 +101,149 @@ function object(value: unknown): value is ObjectValue {
     return false;
   const prototype = Object.getPrototypeOf(value);
   return prototype === Object.prototype || prototype === null;
+}
+
+// Inspect descriptors before any value access or JSON.stringify (including toJSON).
+function validateBindingJson(value: unknown, maxNodes: number): void {
+  let nodes = 0;
+  const active = new Set<object>();
+  const visit = (item: unknown, depth: number): void => {
+    if (++nodes > maxNodes || depth > 100) throw new Error();
+    if (item === null || typeof item === "string" || typeof item === "boolean")
+      return;
+    if (typeof item === "number" && Number.isFinite(item)) return;
+    if (typeof item !== "object" || item === null || types.isProxy(item))
+      throw new Error();
+    const array = Array.isArray(item);
+    if (
+      (array
+        ? Object.getPrototypeOf(item) !== Array.prototype
+        : !object(item)) ||
+      active.has(item)
+    )
+      throw new Error();
+    active.add(item);
+    const keys = Reflect.ownKeys(item);
+    if (keys.length > maxNodes) throw new Error();
+    let index = 0;
+    for (const key of keys) {
+      const descriptor = Object.getOwnPropertyDescriptor(item, key)!;
+      if (typeof key !== "string" || !("value" in descriptor))
+        throw new Error();
+      if (array && key === "length") continue;
+      if (!descriptor.enumerable || (array && key !== String(index++)))
+        throw new Error();
+      visit(descriptor.value, depth + 1);
+    }
+    if (array && index !== item.length) throw new Error();
+    active.delete(item);
+  };
+  visit(value, 0);
+}
+
+/**
+ * Pure private binding. Accepts only the unchanged result of a conversion in this
+ * process, not serialized artifacts. The expected hash is SHA256 of the exact
+ * JSON.stringify(inputSnapshot) bytes (UTF-8, property order preserved).
+ * Only privateBoundObject contains resolved values; failures have one fixed error.
+ * This does not authorize activation or validate operational server policy.
+ */
+export function bindConvertedConfig(
+  inputSnapshot: unknown,
+  conversion: ConversionResult,
+  expectedInputFingerprint: string,
+): { privateBoundObject: ObjectValue } {
+  try {
+    validateBindingJson(inputSnapshot, 20001);
+    if (!object(inputSnapshot)) throw new Error();
+    const fingerprint = createHash("sha256")
+      .update(JSON.stringify(inputSnapshot))
+      .digest("hex");
+    const registered = completedConversions.get(conversion);
+    if (
+      !registered ||
+      fingerprint !== expectedInputFingerprint ||
+      fingerprint !== registered.inputFingerprint
+    )
+      throw new Error();
+    validateBindingJson(conversion, 500000);
+    if (
+      conversion.conversionComplete !== true ||
+      conversion.nativeSchemaValid !== true ||
+      conversion.userPolicyValid !== true ||
+      conversion.activationReady !== false ||
+      JSON.stringify(conversion) !== registered.preview
+    )
+      throw new Error();
+    const decode = Schema.decodeUnknownSync(Config.Info, {
+      onExcessProperty: "error",
+    });
+    decode(conversion.draftNativeConfig);
+    parseUserPolicy(conversion.userPolicy);
+    const privateBoundObject = structuredClone(conversion.draftNativeConfig);
+    const destinations = new Set<string>();
+    const ids = new Set<string>();
+    for (const slot of conversion.secretSlots) {
+      if (
+        ids.has(slot.id) ||
+        !slot.sourcePath.length ||
+        !slot.destinationPath.length
+      )
+        throw new Error();
+      ids.add(slot.id);
+      let value: unknown = inputSnapshot;
+      for (const ordinal of slot.sourcePath) {
+        if (
+          !Number.isSafeInteger(ordinal) ||
+          ordinal < 0 ||
+          (!object(value) && !Array.isArray(value))
+        )
+          throw new Error();
+        const keys = Object.keys(value);
+        if (ordinal >= keys.length) throw new Error();
+        const descriptor = Object.getOwnPropertyDescriptor(
+          value,
+          keys[ordinal]!,
+        );
+        if (!descriptor || !("value" in descriptor)) throw new Error();
+        value = descriptor.value;
+      }
+      if (slot.kind !== "setting" && typeof value !== "string")
+        throw new Error();
+      const destination = JSON.stringify(slot.destinationPath);
+      if (destinations.has(destination)) throw new Error();
+      destinations.add(destination);
+      let parent: unknown = privateBoundObject;
+      for (const [index, key] of slot.destinationPath.entries()) {
+        if (Array.isArray(parent)) {
+          if (
+            typeof key !== "number" ||
+            !Number.isSafeInteger(key) ||
+            key < 0 ||
+            key >= parent.length
+          )
+            throw new Error();
+        } else if (!object(parent) || typeof key !== "string")
+          throw new Error();
+        const descriptor = Object.getOwnPropertyDescriptor(parent, key);
+        if (!descriptor || !("value" in descriptor)) throw new Error();
+        if (index === slot.destinationPath.length - 1) {
+          if (descriptor.value !== slot.placeholder) throw new Error();
+          Object.defineProperty(parent, key, {
+            value: structuredClone(value),
+            enumerable: true,
+            writable: true,
+            configurable: true,
+          });
+        } else parent = descriptor.value;
+      }
+    }
+    // Check actual values too, without returning decoder errors or normalized data.
+    decode(privateBoundObject);
+    return { privateBoundObject };
+  } catch {
+    throw new Error("PRIVATE_CONFIG_BINDING_REJECTED");
+  }
 }
 
 function privatePath(root: string, path: string): boolean {
@@ -123,6 +279,7 @@ export function convertV1ToNative208(
     activationReady: false,
   };
   const draft = result.draftNativeConfig;
+  const tokens = new WeakMap<object, ConversionResult["secretSlots"][number]>();
   const ledger = new Map<string, ConversionResult["ledger"][number]>();
   const publicStrings = new Set(context.publicStrings);
   const mark = (path: SourcePath, disposition: Disposition, deep = false) => {
@@ -149,16 +306,25 @@ export function convertV1ToNative208(
     value: unknown,
     path: SourcePath,
     kind: ConversionResult["secretSlots"][number]["kind"],
-  ): string => {
+  ): string | SlotToken => {
     if (typeof value !== "string" && kind !== "setting") {
       diagnostic("INVALID_STRING", path);
       return "INVALID_DRAFT";
     }
     const id = `slot-${result.secretSlots.length + 1}`;
     const placeholder = `__OPENCODE_PRIVATE_${id}__`;
-    result.secretSlots.push({ id, sourcePath: [...path], kind, placeholder });
+    const entry = {
+      id,
+      sourcePath: [...path],
+      kind,
+      placeholder,
+      destinationPath: [] as DestinationPath,
+    };
+    result.secretSlots.push(entry);
+    const token: SlotToken = Object.freeze({ ownedSlot: true });
+    tokens.set(token, entry);
     mark(path, "externalized");
-    return placeholder;
+    return token;
   };
   const declared = (value: unknown, path: SourcePath): value is string => {
     if (
@@ -384,6 +550,7 @@ export function convertV1ToNative208(
     return true;
   };
   try {
+    validateBindingJson(input, 20001);
     if (!inventory(input, [], 0) || !object(input)) {
       diagnostic("INVALID_JSON_INPUT", []);
       result.ledger = [...ledger.values()];
@@ -808,7 +975,7 @@ export function convertV1ToNative208(
           diagnostic("UNREVIEWED_PROVIDER_MAPPING", q);
         if (context.authUnavailableProviders?.includes(id))
           diagnostic("PROVIDER_AUTH_PENDING", q, false);
-        let endpoint: string | undefined;
+        let endpoint: string | SlotToken | undefined;
         fields(provider, q, {
           id: (v, r) => {
             if (v === id) mark(r, "redundant");
@@ -1114,6 +1281,29 @@ export function convertV1ToNative208(
       diagnostic("MANIFEST_DESTINATION_CONFLICT", []);
     destinations.set(destination, asset.source);
   }
+  const finalize = (value: unknown, path: DestinationPath): unknown => {
+    if (value === null || typeof value !== "object") return value;
+    const entry = tokens.get(value);
+    if (entry) {
+      if (entry.destinationPath.length)
+        diagnostic("SLOT_DESTINATION_INVALID", entry.sourcePath);
+      else entry.destinationPath = [...path];
+      return entry.placeholder;
+    }
+    for (const key of Object.keys(value)) {
+      const part = Array.isArray(value) ? Number(key) : key;
+      const descriptor = Object.getOwnPropertyDescriptor(value, key)!;
+      Object.defineProperty(value, key, {
+        ...descriptor,
+        value: finalize(descriptor.value, [...path, part]),
+      });
+    }
+    return value;
+  };
+  finalize(draft, []);
+  for (const entry of result.secretSlots)
+    if (!entry.destinationPath.length)
+      diagnostic("SLOT_DESTINATION_INVALID", entry.sourcePath);
   try {
     Schema.decodeUnknownSync(Config.Info, { onExcessProperty: "error" })(draft);
     result.nativeSchemaValid = true;
@@ -1135,5 +1325,12 @@ export function convertV1ToNative208(
     result.userPolicyValid &&
     !result.diagnostics.some((d) => d.blocking) &&
     result.ledger.every((entry) => entry.disposition !== "blocked");
+  if (result.conversionComplete)
+    completedConversions.set(result, {
+      inputFingerprint: createHash("sha256")
+        .update(JSON.stringify(input))
+        .digest("hex"),
+      preview: JSON.stringify(result),
+    });
   return result;
 }

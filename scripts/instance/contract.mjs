@@ -568,7 +568,7 @@ function requiredText(value) {
   );
 }
 
-function validateActiveConfig(
+export function validateActiveConfig(
   root,
   nativeConfig,
   reflectionConfig,

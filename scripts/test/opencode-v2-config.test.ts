@@ -1,10 +1,12 @@
 import { describe, expect, it, vi } from "vitest";
 import os from "node:os";
+import { createHash } from "node:crypto";
 import { Config } from "@opencode/schema/config";
 import { Schema } from "effect";
 import { parseUserPolicy } from "../../packages/opencode-v2-plugin/src/user-policy.js";
 import {
   convertV1ToNative208,
+  bindConvertedConfig,
   type ConversionContext,
   type ConversionResult,
 } from "../src/opencode-v2-config.js";
@@ -200,7 +202,7 @@ function convert(input: unknown, overrides: Partial<ConversionContext> = {}) {
   return convertV1ToNative208(input, { ...context, ...overrides });
 }
 
-// Only test code reconstructs private bindings. No renderer or retained private values ship.
+// Legacy preview assertions index synthetic source values by marker, not destinations.
 function bindings(
   input: unknown,
   result: ConversionResult,
@@ -217,6 +219,392 @@ function bindings(
     }),
   );
 }
+
+describe("pure private binding", () => {
+  const fingerprint = (input: unknown) =>
+    createHash("sha256").update(JSON.stringify(input)).digest("hex");
+  const bind = (input: unknown, result = convert(input)) =>
+    bindConvertedConfig(input, result, fingerprint(input));
+
+  it("records only owned destinations despite public and inserted marker collisions", () => {
+    const marker = "__OPENCODE_PRIVATE_slot-1__";
+    const inserted = "__OPENCODE_PRIVATE_slot-2__";
+    const input = {
+      username: inserted,
+      agent: { "fast-coder": { prompt: SECRET, options: { value: marker } } },
+    };
+    const result = convert(input, {
+      publicStrings: [...context.publicStrings, marker],
+    });
+    expect(result.conversionComplete).toBe(true);
+    expect(result.secretSlots.map((slot) => slot.destinationPath)).toEqual([
+      ["username"],
+      ["agents", "fast-coder", "system"],
+    ]);
+    expect(bind(input, result).privateBoundObject).toMatchObject({
+      username: inserted,
+      agents: {
+        "fast-coder": { system: SECRET, request: { body: { value: marker } } },
+      },
+    });
+  });
+
+  it("reconstructs synthetic current MCP env/args/prompts and preserves source, preview and policy", () => {
+    const input = fixture();
+    const result = convert(input);
+    const beforeInput = structuredClone(input);
+    const beforeResult = structuredClone(result);
+    const { privateBoundObject } = bind(input, result);
+    expect(privateBoundObject.mcp).toEqual({
+      timeout: { startup: 30000, catalog: 30000, execution: 60000 },
+      servers: {
+        Notion: {
+          type: "remote",
+          codemode: false,
+          disabled: false,
+          timeout: { startup: 30000, catalog: 30000, execution: 60000 },
+          url: input.mcp.Notion.url,
+          headers: input.mcp.Notion.headers,
+          oauth: {
+            client_id: SECRET,
+            client_secret: SECRET,
+            scope: SECRET,
+            redirect_uri: input.mcp.Notion.oauth.redirectUri,
+            callback_port: 3456,
+          },
+        },
+        figma: {
+          type: "local",
+          codemode: false,
+          disabled: false,
+          timeout: { startup: 30000, catalog: 30000, execution: 60000 },
+          command: ["/public/bin/pnx", ...input.mcp.figma.command.slice(1)],
+          environment: input.mcp.figma.environment,
+        },
+        disabled: {
+          type: "remote",
+          codemode: false,
+          disabled: true,
+          timeout: { startup: 90000, catalog: 90000, execution: 90000 },
+          url: input.mcp.disabled.url,
+          oauth: false,
+        },
+      },
+    });
+    expect(privateBoundObject.agents).toEqual({
+      "fast-coder": {
+        model: {
+          providerID: "openai",
+          model: "gpt-5.6-terra-fast",
+          variant: "high",
+        },
+        mode: "subagent",
+        system: input.agent["fast-coder"].prompt,
+        description: input.agent["fast-coder"].description,
+        permissions: [{ action: "question", resource: "*", effect: "deny" }],
+        request: {
+          body: { temperature: 0.8, top_p: 0.9, reasoningEffort: "high" },
+        },
+      },
+    });
+    expect(input).toEqual(beforeInput);
+    expect(result).toEqual(beforeResult);
+    expect(JSON.stringify(result)).not.toContain(SECRET);
+    expect(() =>
+      Schema.decodeUnknownSync(Config.Info, { onExcessProperty: "error" })(
+        privateBoundObject,
+      ),
+    ).not.toThrow();
+    privateBoundObject.username = "changed only private output";
+    expect(bind(input, result).privateBoundObject.username).toBe(SECRET);
+  });
+
+  it("binds numeric, boolean, null and nested array setting leaves without string coercion", () => {
+    const options = {
+      nested: { token: [987654321, false, null, { value: SECRET }] },
+    };
+    const input = {
+      provider: { openai: { api: "https://synthetic.invalid", options } },
+    };
+    const result = convert(input);
+    expect(result.conversionComplete).toBe(true);
+    expect(bind(input, result).privateBoundObject.providers).toEqual({
+      openai: { settings: { ...options, baseURL: input.provider.openai.api } },
+    });
+    expect(
+      result.secretSlots.some((slot) => slot.destinationPath.includes(3)),
+    ).toBe(true);
+  });
+
+  it("rejects reordered or changed source snapshots before ordinal resolution", () => {
+    const input = { username: SECRET, snapshot: false };
+    const result = convert(input);
+    for (const changed of [
+      { snapshot: false, username: SECRET },
+      { ...input, username: "changed" },
+    ]) {
+      expect(() =>
+        bindConvertedConfig(changed, result, fingerprint(input)),
+      ).toThrow("PRIVATE_CONFIG_BINDING_REJECTED");
+      expect(() =>
+        bindConvertedConfig(changed, result, fingerprint(changed)),
+      ).toThrow("PRIVATE_CONFIG_BINDING_REJECTED");
+    }
+    expect(() => bindConvertedConfig(input, result, "incorrect")).toThrow(
+      "PRIVATE_CONFIG_BINDING_REJECTED",
+    );
+    expect(
+      bind(structuredClone(input), result).privateBoundObject.username,
+    ).toBe(SECRET);
+  });
+
+  it.each<[string, (result: ConversionResult) => void]>([
+    [
+      "duplicate destination",
+      (r) => {
+        r.secretSlots[1]!.destinationPath = r.secretSlots[0]!.destinationPath;
+      },
+    ],
+    [
+      "missing destination",
+      (r) => {
+        Reflect.deleteProperty(r.secretSlots[0]!, "destinationPath");
+      },
+    ],
+    [
+      "unresolved source",
+      (r) => {
+        r.secretSlots[0]!.sourcePath = [999999];
+      },
+    ],
+    [
+      "negative source",
+      (r) => {
+        r.secretSlots[0]!.sourcePath = [-1];
+      },
+    ],
+    [
+      "fractional source",
+      (r) => {
+        r.secretSlots[0]!.sourcePath = [0.5];
+      },
+    ],
+    [
+      "unknown slot",
+      (r) => {
+        r.secretSlots[0]!.id = "unknown";
+      },
+    ],
+    [
+      "unknown kind",
+      (r) => {
+        Object.defineProperty(r.secretSlots[0]!, "kind", { value: "unknown" });
+      },
+    ],
+    [
+      "removed slot",
+      (r) => {
+        r.secretSlots.pop();
+      },
+    ],
+    [
+      "extra slot",
+      (r) => {
+        r.secretSlots.push({ ...r.secretSlots[0]! });
+      },
+    ],
+    [
+      "unresolved destination",
+      (r) => {
+        r.secretSlots[0]!.destinationPath = ["missing"];
+      },
+    ],
+    [
+      "prototype destination",
+      (r) => {
+        r.secretSlots[0]!.destinationPath = ["__proto__", "polluted"];
+      },
+    ],
+    [
+      "placeholder mismatch",
+      (r) => {
+        r.draftNativeConfig.username = "changed";
+      },
+    ],
+    [
+      "extra schema key",
+      (r) => {
+        r.draftNativeConfig.exfiltrate = "https://synthetic.invalid";
+      },
+    ],
+    [
+      "schema-valid public mutation",
+      (r) => {
+        r.draftNativeConfig.share = "auto";
+      },
+    ],
+    [
+      "policy mutation",
+      (r) => {
+        r.userPolicy.instructionFiles = [];
+      },
+    ],
+    [
+      "incomplete",
+      (r) => {
+        r.conversionComplete = false;
+      },
+    ],
+    [
+      "invalid native",
+      (r) => {
+        r.nativeSchemaValid = false;
+      },
+    ],
+    [
+      "invalid policy",
+      (r) => {
+        r.userPolicyValid = false;
+      },
+    ],
+    [
+      "activation",
+      (r) => {
+        Object.defineProperty(r, "activationReady", { value: true });
+      },
+    ],
+  ])("rejects changed conversion: %s", (_name, mutate) => {
+    const input = fixture();
+    const result = convert(input);
+    mutate(result);
+    expect(() => bind(input, result)).toThrow(
+      new Error("PRIVATE_CONFIG_BINDING_REJECTED"),
+    );
+  });
+
+  it("refuses serialized conversion artifacts and incomplete conversions", () => {
+    const input = { username: SECRET };
+    expect(() => bind(input, structuredClone(convert(input)))).toThrow(
+      "PRIVATE_CONFIG_BINDING_REJECTED",
+    );
+    expect(() => bind({ unknown: SECRET })).toThrow(
+      "PRIVATE_CONFIG_BINDING_REJECTED",
+    );
+  });
+
+  it("blocks a slot discarded by endpoint normalization instead of publishing an unbound slot", () => {
+    const result = convert({
+      provider: {
+        openai: {
+          api: "synthetic-endpoint-one",
+          options: { baseURL: "synthetic-endpoint-two" },
+        },
+      },
+    });
+    expect(result.conversionComplete).toBe(false);
+    expect(codes(result)).toContain("SLOT_DESTINATION_INVALID");
+    expect(JSON.stringify(result)).not.toContain("synthetic-endpoint");
+  });
+
+  it("rejects getter-bearing conversion metadata without invoking it or reflecting its error", () => {
+    const input = { username: SECRET };
+    const result = convert(input);
+    const read = vi.fn(() => {
+      throw new Error(SECRET);
+    });
+    Object.defineProperty(result.secretSlots[0]!, "destinationPath", {
+      get: read,
+    });
+    expect(() => bind(input, result)).toThrow(
+      new Error("PRIVATE_CONFIG_BINDING_REJECTED"),
+    );
+    expect(read).not.toHaveBeenCalled();
+  });
+
+  it("does not read OS environment while binding", () => {
+    const input = { username: SECRET };
+    const result = convert(input);
+    const expected = fingerprint(input);
+    let reads = 0;
+    const guarded = new Proxy(process, {
+      get(target, key, receiver) {
+        if (key === "env") {
+          reads++;
+          throw new Error("Unexpected environment lookup");
+        }
+        return Reflect.get(target, key, receiver);
+      },
+    });
+    let bound: ReturnType<typeof bindConvertedConfig>;
+    try {
+      vi.stubGlobal("process", guarded);
+      bound = bindConvertedConfig(input, result, expected);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+    expect(reads).toBe(0);
+    expect(bound.privateBoundObject.username).toBe(SECRET);
+  });
+
+  it("rejects non-JSON source structures without invoking getters, proxies or toJSON", () => {
+    const read = vi.fn(() => {
+      throw new Error(SECRET);
+    });
+    const cycle: Record<string, unknown> = {};
+    cycle.self = cycle;
+    const sparse = new Array(2);
+    sparse[1] = SECRET;
+    const getter = Object.defineProperty({}, "username", {
+      get: read,
+      enumerable: true,
+    });
+    const hiddenGetter = Object.defineProperty({}, "toJSON", { get: read });
+    const inherited = Object.create({ username: SECRET });
+    const proxy = new Proxy({}, { ownKeys: read });
+    const deep: unknown = Array.from({ length: 102 }).reduce<unknown>(
+      (v) => [v],
+      SECRET,
+    );
+    const huge = new Array(20002).fill(null);
+    const result = convert({ username: SECRET });
+    for (const input of [
+      getter,
+      hiddenGetter,
+      inherited,
+      proxy,
+      cycle,
+      { sparse },
+      { deep },
+      { huge },
+      { n: NaN },
+      { fn: read },
+      { value: undefined },
+      { [Symbol()]: SECRET },
+    ]) {
+      expect(() => bindConvertedConfig(input, result, "unused")).toThrow(
+        new Error("PRIVATE_CONFIG_BINDING_REJECTED"),
+      );
+    }
+    expect(read).not.toHaveBeenCalled();
+  });
+
+  it("treats declared __proto__ keys as own data without prototype pollution", () => {
+    const input = JSON.parse(
+      '{"provider":{"openai":{"options":{"__proto__":{"token":"synthetic-private"}}}}}',
+    );
+    const result = convert(input, {
+      publicStrings: [...context.publicStrings, "__proto__"],
+    });
+    expect(result.conversionComplete).toBe(true);
+    const bound = bind(input, result).privateBoundObject;
+    expect(bound.providers).toEqual({
+      openai: {
+        settings: JSON.parse('{"__proto__":{"token":"synthetic-private"}}'),
+      },
+    });
+    expect(Object.hasOwn(Object.prototype, "token")).toBe(false);
+  });
+});
 
 describe("pure v1.18.29 to native 2.0.8 planning conversion", () => {
   describe("actual user-policy parser agreement", () => {

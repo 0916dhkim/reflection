@@ -5,6 +5,7 @@ import { createServer } from "node:http";
 import {
   chmod,
   copyFile,
+  lstat,
   mkdtemp,
   mkdir,
   readFile,
@@ -448,6 +449,32 @@ async function assertUnused(port) {
   }
 }
 
+function directSettingsAuthEvidence(fixture, credentialConnectCalls) {
+  assert.equal(credentialConnectCalls, 0);
+  assert.deepEqual(fixture.errors, []);
+  assert.equal(
+    fixture.requests.filter((item) => item.path === "/v1/chat/completions")
+      .length,
+    9,
+  );
+  // fixture.provider only records requests after Bearer fixture-only validation.
+  // A listed model/integration (or a rejected HTTP request) is not auth proof.
+  assert.deepEqual(
+    fixture.provider.map((item) => item.turn),
+    Array.from({ length: 3 }, () => [
+      "memory_search",
+      "memory_read_segment",
+      "final",
+    ]).flat(),
+  );
+  assert.ok(
+    fixture.provider.every(
+      (item) => item.policyEnabled && item.model === "google/fixture-model",
+    ),
+  );
+  return { directSettingsAuth: true, credentialConnectCalls };
+}
+
 const deadline = setTimeout(() => {
   abort.abort(Error("Global eight-minute deadline"));
   for (const child of children) killGroup(child, "SIGKILL");
@@ -815,6 +842,14 @@ try {
       });
       const policyRoot = join(root, "policy");
       const policyOrigin = "http://127.0.0.1:4098";
+      let credentialConnectCalls = 0;
+      const api = (origin, password, path, body) => {
+        if (path.split("?")[0].endsWith("/connect/key"))
+          credentialConnectCalls++;
+        return nativeAPI(origin, password, path, body, {
+          signal: abort.signal,
+        });
+      };
       await layout(policyRoot);
       const originals = async () =>
         JSON.parse(
@@ -833,6 +868,22 @@ try {
           ...childEnvironment({ root: policyRoot, password }),
           OPENCODE_CONFIG_PROJECT_DISABLE: "0",
         };
+        assert.equal(Object.hasOwn(policyEnv, "OPENROUTER_API_KEY"), false);
+        assert.deepEqual(await readdir(policyEnv.XDG_DATA_HOME), []);
+        await assert.rejects(lstat(policyEnv.OPENCODE_DB), { code: "ENOENT" });
+        const assertNoLegacyCredentials = async () => {
+          for (const name of [
+            "auth.json",
+            "opencode-next.db",
+            "opencode-next.db-wal",
+            "opencode-next.db-shm",
+          ])
+            await assert.rejects(
+              lstat(join(policyEnv.XDG_DATA_HOME, "opencode", name)),
+              { code: "ENOENT" },
+            );
+        };
+        await assertNoLegacyCredentials();
         const policySandbox = join(policyRoot, "sandbox.sb");
         await writeFile(
           policySandbox,
@@ -861,13 +912,21 @@ try {
         const location = new URLSearchParams({
           "location[directory]": join(policyRoot, "workspace"),
         });
-        await api(policyOrigin, password, `/integration?${location}`);
-        await api(
-          policyOrigin,
-          password,
-          `/integration/openrouter/connect/key?${location}`,
-          { key: "fixture-only", label: "Synthetic policy fixture" },
-        );
+        const assertNoConnections = async () => {
+          // Pinned 2.0.8 list awaits plugin activation and returns data[].connections.
+          // Config settings auth is not an integration connection.
+          const integrations = (
+            await api(policyOrigin, password, `/integration?${location}`)
+          ).data;
+          assert.ok(Array.isArray(integrations));
+          assert.equal(
+            integrations.filter((item) => item.id === "openrouter").length,
+            1,
+          );
+          for (const integration of integrations)
+            assert.deepEqual(integration.connections, []);
+        };
+        await assertNoConnections();
         const catalog = (
           await api(policyOrigin, password, `/model?${location}`)
         ).data;
@@ -1226,7 +1285,10 @@ try {
           refused: 0,
           primaryRequests: 9,
         });
+        await assertNoConnections();
+        await assertNoLegacyCredentials();
         Object.assign(policyReport, {
+          ...directSettingsAuthEvidence(policyFixture, credentialConnectCalls),
           policyEnabled: true,
           provider: "openrouter",
           model: "google/fixture-model",

@@ -22,7 +22,7 @@ import {
   policyGlobalRefusalEvidence,
 } from "./fixture.mjs";
 import { readFile } from "node:fs/promises";
-import { runInNewContext } from "node:vm";
+import { runInNewContext, runInThisContext } from "node:vm";
 import {
   browserURL,
   browserError,
@@ -1828,6 +1828,105 @@ test("fixture roots and URLs cannot escape the disposable loopback boundary", ()
   assert.throws(() => assertLoopbackUrl("https://example.com"));
 });
 
+test("direct settings auth proof requires nine accepted protocol requests, not integration listing", async () => {
+  // Extract only the pure assertion helper; importing run.mjs would execute its guard.
+  const runner = await readFile(new URL("./run.mjs", import.meta.url), "utf8");
+  const helper = runner.match(
+    /function directSettingsAuthEvidence\([^]*?\n\}/,
+  )?.[0];
+  assert.ok(helper);
+  const evidence = runInThisContext(`(assert) => (${helper})`)(assert);
+  const fixture = {
+    errors: [],
+    requests: Array.from({ length: 9 }, () => ({
+      path: "/v1/chat/completions",
+    })),
+    provider: Array.from({ length: 3 }, () =>
+      ["memory_search", "memory_read_segment", "final"].map((turn) => ({
+        turn,
+        policyEnabled: true,
+        model: "google/fixture-model",
+      })),
+    ).flat(),
+  };
+  assert.equal(evidence(fixture, 0).directSettingsAuth, true);
+  assert.equal(evidence(fixture, 0).credentialConnectCalls, 0);
+  assert.throws(() => evidence(fixture, 1));
+  for (const mutate of [
+    (f) => {
+      f.requests = [];
+      f.provider = [];
+    },
+    (f) => {
+      f.provider = []; // HTTP attempts alone include auth rejections.
+    },
+    (f) => {
+      f.provider.pop();
+    },
+    (f) => {
+      f.requests.push({ path: "/v1/chat/completions" });
+    },
+    (f) => {
+      f.errors.push("fixture failure");
+    },
+    (f) => {
+      f.provider[0].turn = "final";
+    },
+    (f) => {
+      f.provider[0].policyEnabled = false;
+    },
+    (f) => {
+      f.provider[0].model = "fixture-model";
+    },
+  ]) {
+    const changed = structuredClone(fixture);
+    mutate(changed);
+    assert.throws(() => evidence(changed, 0));
+  }
+  const fixtureSource = await readFile(
+    new URL("./fixture.mjs", import.meta.url),
+    "utf8",
+  );
+  const authorization = fixtureSource.indexOf(
+    'if (request.headers.authorization !== "Bearer fixture-only")',
+  );
+  assert.ok(authorization >= 0);
+  assert.match(
+    fixtureSource.slice(authorization),
+    /^if \([^]*?\)\s*return send\(403, \{\}\);/,
+  );
+  assert.ok(authorization < fixtureSource.indexOf("provider.push("));
+  const phase = runner.slice(
+    runner.indexOf('"opt-in user policy native wire'),
+    runner.indexOf('await phase("strict loopback native listener"'),
+  );
+  assert.doesNotMatch(phase, /\/integration\/openrouter\/connect\/key/);
+  assert.match(
+    phase,
+    /Object\.hasOwn\(policyEnv, "OPENROUTER_API_KEY"\), false/,
+  );
+  assert.match(phase, /await readdir\(policyEnv\.XDG_DATA_HOME\), \[\]/);
+  assert.match(phase, /assert\.rejects\(lstat\(policyEnv\.OPENCODE_DB\)/);
+  assert.match(
+    phase,
+    /await api\(policyOrigin, password, `\/integration\?\$\{location\}`\)/,
+  );
+  assert.match(phase, /assert\.deepEqual\(integration\.connections, \[\]\)/);
+  assert.equal(phase.match(/await assertNoConnections\(\)/g)?.length, 2);
+  assert.equal(phase.match(/await assertNoLegacyCredentials\(\)/g)?.length, 2);
+  assert.ok(
+    phase.indexOf("await assertNoLegacyCredentials()") <
+      phase.indexOf("policyServer = native("),
+  );
+  const proof = phase.indexOf("...directSettingsAuthEvidence(");
+  assert.ok(proof > phase.indexOf('await roundtrip("recovery"'));
+  assert.ok(proof > phase.indexOf("primaryRequests: 9"));
+  assert.doesNotMatch(
+    phase.slice(0, proof),
+    /directSettingsAuth: true|credentialConnectCalls: 0/,
+  );
+});
+
 test("child environment is allowlisted and errors redact fixture credentials", () => {
   const environment = childEnvironment({
     root: "/tmp/root",
@@ -1836,6 +1935,7 @@ test("child environment is allowlisted and errors redact fixture credentials", (
   assert.equal(environment.HOME, "/tmp/root/home");
   assert.equal("GITHUB_TOKEN" in environment, false);
   assert.equal("SSH_AUTH_SOCK" in environment, false);
+  assert.equal("OPENROUTER_API_KEY" in environment, false);
   assert.match(
     safeError("password=secret Basic abc https://example.test/token"),
     /redacted/,
