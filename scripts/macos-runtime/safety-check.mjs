@@ -24,7 +24,799 @@ import {
   finiteAPIState,
   isReloadCancellation,
   installBrowserLifecycleObserver,
+  classifyWebKitTeardown,
+  hasJavaScriptFailure,
 } from "./browser.mjs";
+
+function teardownProof() {
+  const oldTag = "a".repeat(32);
+  const newTag = "b".repeat(32);
+  const event = (kind, documentTag, sequence, receivedAt, fields = {}) => ({
+    kind,
+    documentTag,
+    sequence,
+    receivedAt,
+    at: receivedAt,
+    timeOrigin: 100000,
+    observedDocument: documentTag === oldTag ? 1 : 2,
+    afterPagehide: false,
+    phase: "reload:navigation",
+    ...fields,
+  });
+  const target = {
+    path: "/api/config",
+    sameOrigin: true,
+    directoryMatches: true,
+    queryKeys: ["location[directory]"],
+  };
+  const config = {
+    ...target,
+    id: 83,
+    key: "a".repeat(16),
+    method: "GET",
+    type: "fetch",
+    document: 1,
+    status: 200,
+    responseStatuses: [200],
+    finished: true,
+    routing: "continue",
+    startedAt: 480,
+    endedAt: 500,
+  };
+  const asset = {
+    id: 84,
+    type: "script",
+    sameOrigin: true,
+    document: 1,
+    path: "/_assets/index.js",
+    status: 200,
+    finished: true,
+  };
+  return {
+    browser: "webkit",
+    origin: "http://127.0.0.1:4097",
+    assets: 2,
+    checks: {
+      initial: { history: true, rendered: true, finiteAPI: true },
+      reload: { history: true, rendered: true, finiteAPI: true },
+      assets: true,
+    },
+    diagnostics: {
+      overflow: false,
+      requests: [
+        config,
+        { ...config, id: 180, document: 2, startedAt: 1300, endedAt: 1350 },
+        asset,
+        { ...asset, id: 181, document: 2 },
+      ],
+      navigations: [
+        {
+          kind: "reload",
+          fromDocument: 1,
+          startedAt: 1000,
+          committedAt: 1100,
+          completedAt: 1200,
+        },
+      ],
+      lifecycleEvents: [
+        event("installed", oldTag, 1, 100, { phase: "initial:committed" }),
+        event("fetch", oldTag, 2, 480, { ...target, phase: "initial:render" }),
+        event("fetch", oldTag, 3, 1010, target),
+        event("pagehide", oldTag, 4, 1020, {
+          persisted: false,
+          afterPagehide: true,
+        }),
+        event("fetch", oldTag, 5, 1030, { ...target, afterPagehide: true }),
+        event("installed", newTag, 1, 1110, { phase: "reload:committed" }),
+        event("fetch", newTag, 2, 1300, { ...target, phase: "reload:render" }),
+      ],
+      pageErrors: [1011, 1031].map((at) => ({
+        at,
+        document: 1,
+        phase: "reload:navigation",
+        requestIds: [83],
+        message:
+          "/127.0.0.1:4097/api/config?[query redacted] due to access control checks.",
+      })),
+    },
+  };
+}
+
+test("only the fully evidenced WebKit engine pair is classified; input errors are preserved", () => {
+  const proof = teardownProof();
+  const original = structuredClone(proof);
+  const classified = classifyWebKitTeardown(proof);
+  assert.equal(classified.length, 2);
+  assert.deepEqual(
+    classified.map((entry) => entry.fetchSequence),
+    [3, 5],
+  );
+  assert.deepEqual(
+    classified.map((entry) => entry.afterPagehide),
+    [false, true],
+  );
+  assert.ok(
+    classified.every(
+      (entry) =>
+        entry.proofRun === "35694815360" &&
+        entry.classification === "webkit-config-reload-engine-diagnostic",
+    ),
+  );
+  assert.deepEqual(
+    proof,
+    original,
+    "classification does not mutate or delete errors",
+  );
+});
+
+test("WebKit classification fails closed across missing evidence and unrelated-error matrix", (t) => {
+  const mutations = [
+    [
+      "additional config network attempt",
+      (p) => {
+        p.diagnostics.requests.push({ ...p.diagnostics.requests[0], id: 999 });
+      },
+    ],
+    [
+      "additional cancelled config network attempt",
+      (p) => {
+        p.diagnostics.requests.push({
+          ...p.diagnostics.requests[0],
+          id: 999,
+          failure: "cancelled",
+          status: null,
+          responseStatuses: [],
+        });
+      },
+    ],
+    [
+      "Chromium",
+      (p) => {
+        p.browser = "chromium";
+      },
+    ],
+    [
+      "Firefox",
+      (p) => {
+        p.browser = "firefox";
+      },
+    ],
+    [
+      "unknown browser",
+      (p) => {
+        delete p.browser;
+      },
+    ],
+    [
+      "external origin",
+      (p) => {
+        p.origin = "http://example.com";
+      },
+    ],
+    [
+      "wrong origin port",
+      (p) => {
+        p.origin = "http://127.0.0.1:4098";
+      },
+    ],
+    [
+      "missing checks",
+      (p) => {
+        delete p.checks;
+      },
+    ],
+    [
+      "no asset gate",
+      (p) => {
+        delete p.checks.assets;
+      },
+    ],
+    [
+      "failed asset gate",
+      (p) => {
+        p.checks.assets = false;
+      },
+    ],
+    [
+      "no assets",
+      (p) => {
+        p.assets = 0;
+      },
+    ],
+    [
+      "asset count mismatch",
+      (p) => {
+        p.assets = 3;
+      },
+    ],
+    [
+      "failed asset HTTP",
+      (p) => {
+        p.diagnostics.requests[2].status = 404;
+      },
+    ],
+    [
+      "unfinished asset",
+      (p) => {
+        p.diagnostics.requests[2].finished = false;
+      },
+    ],
+    [
+      "cancelled asset",
+      (p) => {
+        p.diagnostics.requests[2].failure = "cancelled";
+      },
+    ],
+    [
+      "overflow/decode error",
+      (p) => {
+        p.diagnostics.overflow = true;
+      },
+    ],
+    [
+      "unknown overflow",
+      (p) => {
+        delete p.diagnostics.overflow;
+      },
+    ],
+    [
+      "no diagnostics",
+      (p) => {
+        delete p.diagnostics;
+      },
+    ],
+    [
+      "no page error",
+      (p) => {
+        p.diagnostics.pageErrors = [];
+      },
+    ],
+    [
+      "only one error",
+      (p) => {
+        p.diagnostics.pageErrors.pop();
+      },
+    ],
+    [
+      "extra unrelated error",
+      (p) => {
+        p.diagnostics.pageErrors.push({ message: "unrelated failure" });
+      },
+    ],
+    [
+      "missing error message",
+      (p) => {
+        delete p.diagnostics.pageErrors[0].message;
+      },
+    ],
+    [
+      "random message",
+      (p) => {
+        p.diagnostics.pageErrors[0].message =
+          "random due to access control checks.";
+      },
+    ],
+    [
+      "wrong error endpoint",
+      (p) => {
+        p.diagnostics.pageErrors[0].message =
+          p.diagnostics.pageErrors[0].message.replace("/config", "/model");
+      },
+    ],
+    [
+      "extra message suffix",
+      (p) => {
+        p.diagnostics.pageErrors[0].message += " another error";
+      },
+    ],
+    [
+      "different provider in message",
+      (p) => {
+        p.diagnostics.pageErrors[0].message =
+          p.diagnostics.pageErrors[0].message.replace(
+            "127.0.0.1:4097",
+            "provider.example",
+          );
+      },
+    ],
+    [
+      "missing URL correlation",
+      (p) => {
+        p.diagnostics.pageErrors[0].requestIds = [];
+      },
+    ],
+    [
+      "wrong URL correlation",
+      (p) => {
+        p.diagnostics.pageErrors[0].requestIds = [999];
+      },
+    ],
+    [
+      "ambiguous URL correlation",
+      (p) => {
+        p.diagnostics.pageErrors[0].requestIds.push(180);
+      },
+    ],
+    [
+      "new-document error",
+      (p) => {
+        p.diagnostics.pageErrors[0].document = 2;
+      },
+    ],
+    [
+      "error outside reload phase",
+      (p) => {
+        p.diagnostics.pageErrors[0].phase = "initial:render";
+      },
+    ],
+    [
+      "error at reload start",
+      (p) => {
+        p.diagnostics.pageErrors[0].at = 1000;
+      },
+    ],
+    [
+      "error at commit",
+      (p) => {
+        p.diagnostics.pageErrors[1].at = 1100;
+      },
+    ],
+    [
+      "error before invocation",
+      (p) => {
+        p.diagnostics.pageErrors[0].at = 1009;
+      },
+    ],
+    [
+      "ambiguous preceding invocation",
+      (p) => {
+        p.diagnostics.pageErrors[0].at = 1030;
+      },
+    ],
+    [
+      "missing error time",
+      (p) => {
+        delete p.diagnostics.pageErrors[0].at;
+      },
+    ],
+    [
+      "no reload",
+      (p) => {
+        p.diagnostics.navigations = [];
+      },
+    ],
+    [
+      "duplicate reload",
+      (p) => {
+        p.diagnostics.navigations.push({ ...p.diagnostics.navigations[0] });
+      },
+    ],
+    [
+      "transition over 1000ms",
+      (p) => {
+        p.diagnostics.navigations[0].committedAt = 2001;
+      },
+    ],
+    [
+      "zero transition",
+      (p) => {
+        p.diagnostics.navigations[0].committedAt = 1000;
+      },
+    ],
+    [
+      "missing commit",
+      (p) => {
+        delete p.diagnostics.navigations[0].committedAt;
+      },
+    ],
+    [
+      "invalid completion",
+      (p) => {
+        p.diagnostics.navigations[0].completedAt = 1099;
+      },
+    ],
+    [
+      "wrong old document",
+      (p) => {
+        p.diagnostics.navigations[0].fromDocument = 2;
+      },
+    ],
+    [
+      "no old observer installation",
+      (p) => {
+        p.diagnostics.lifecycleEvents.shift();
+      },
+    ],
+    [
+      "no new observer installation",
+      (p) => {
+        p.diagnostics.lifecycleEvents.splice(5, 1);
+      },
+    ],
+    [
+      "new observer installed before commit",
+      (p) => {
+        p.diagnostics.lifecycleEvents[5].receivedAt = 1099;
+      },
+    ],
+    [
+      "late new observer installation",
+      (p) => {
+        p.diagnostics.lifecycleEvents[5].receivedAt = 1201;
+      },
+    ],
+    [
+      "missing observer sequence",
+      (p) => {
+        delete p.diagnostics.lifecycleEvents[2].sequence;
+      },
+    ],
+    [
+      "observer sequence gap",
+      (p) => {
+        p.diagnostics.lifecycleEvents[2].sequence = 4;
+      },
+    ],
+    [
+      "bad document tag",
+      (p) => {
+        p.diagnostics.lifecycleEvents[2].documentTag = "unknown";
+      },
+    ],
+    [
+      "wrong observed document",
+      (p) => {
+        p.diagnostics.lifecycleEvents[2].observedDocument = 2;
+      },
+    ],
+    [
+      "unknown observer kind",
+      (p) => {
+        p.diagnostics.lifecycleEvents[2].kind = "unknown";
+      },
+    ],
+    [
+      "unknown observer summary",
+      (p) => {
+        p.diagnostics.lifecycleEvents[2].summaryUnavailable = true;
+      },
+    ],
+    [
+      "unknown fetch target",
+      (p) => {
+        p.diagnostics.lifecycleEvents[2].targetUnavailable = true;
+      },
+    ],
+    [
+      "invalid observer clock",
+      (p) => {
+        p.diagnostics.lifecycleEvents[2].at = NaN;
+      },
+    ],
+    [
+      "missing observer receipt",
+      (p) => {
+        delete p.diagnostics.lifecycleEvents[2].receivedAt;
+      },
+    ],
+    [
+      "observer clock reverses",
+      (p) => {
+        p.diagnostics.lifecycleEvents[2].at = 1;
+      },
+    ],
+    [
+      "null observer event",
+      (p) => {
+        p.diagnostics.lifecycleEvents[2] = null;
+      },
+    ],
+    [
+      "no pagehide",
+      (p) => {
+        p.diagnostics.lifecycleEvents.splice(3, 1);
+      },
+    ],
+    [
+      "pagehide outside transition",
+      (p) => {
+        p.diagnostics.lifecycleEvents[3].receivedAt = 1100;
+      },
+    ],
+    [
+      "BFCache pagehide",
+      (p) => {
+        p.diagnostics.lifecycleEvents[3].persisted = true;
+      },
+    ],
+    [
+      "missing persisted evidence",
+      (p) => {
+        delete p.diagnostics.lifecycleEvents[3].persisted;
+      },
+    ],
+    [
+      "no post-pagehide fetch",
+      (p) => {
+        p.diagnostics.lifecycleEvents.splice(4, 1);
+      },
+    ],
+    [
+      "unknown hidden state",
+      (p) => {
+        delete p.diagnostics.lifecycleEvents[4].afterPagehide;
+      },
+    ],
+    [
+      "contradictory hidden state",
+      (p) => {
+        p.diagnostics.lifecycleEvents[4].afterPagehide = false;
+      },
+    ],
+    [
+      "wrong fetch endpoint",
+      (p) => {
+        p.diagnostics.lifecycleEvents[4].path = "/api/model";
+      },
+    ],
+    [
+      "external fetch",
+      (p) => {
+        p.diagnostics.lifecycleEvents[4].sameOrigin = false;
+      },
+    ],
+    [
+      "wrong fetch directory",
+      (p) => {
+        p.diagnostics.lifecycleEvents[4].directoryMatches = false;
+      },
+    ],
+    [
+      "wrong fetch query",
+      (p) => {
+        p.diagnostics.lifecycleEvents[4].queryKeys = ["directory"];
+      },
+    ],
+    [
+      "wrong fetch phase",
+      (p) => {
+        p.diagnostics.lifecycleEvents[4].phase = "reload:render";
+      },
+    ],
+    [
+      "fetch at transition start",
+      (p) => {
+        p.diagnostics.lifecycleEvents[2].receivedAt = 1000;
+      },
+    ],
+    [
+      "extra transition fetch",
+      (p) => {
+        p.diagnostics.lifecycleEvents.splice(5, 0, {
+          ...p.diagnostics.lifecycleEvents[4],
+          sequence: 6,
+          at: 1040,
+          receivedAt: 1040,
+        });
+      },
+    ],
+    [
+      "no HTTP before",
+      (p) => {
+        p.diagnostics.requests.shift();
+      },
+    ],
+    [
+      "no HTTP after",
+      (p) => {
+        p.diagnostics.requests.splice(1, 1);
+      },
+    ],
+    [
+      "config HTTP 401",
+      (p) => {
+        p.diagnostics.requests[0].status = 401;
+      },
+    ],
+    [
+      "config HTTP 403",
+      (p) => {
+        p.diagnostics.requests[1].status = 403;
+      },
+    ],
+    [
+      "config earlier auth rejection",
+      (p) => {
+        p.diagnostics.requests[0].responseStatuses = [401, 200];
+      },
+    ],
+    [
+      "config non-200 success",
+      (p) => {
+        p.diagnostics.requests[1].status = 201;
+      },
+    ],
+    [
+      "config not finished",
+      (p) => {
+        p.diagnostics.requests[0].finished = false;
+      },
+    ],
+    [
+      "config cancellation",
+      (p) => {
+        p.diagnostics.requests[0].failedAt = 500;
+      },
+    ],
+    [
+      "config failed despite 200",
+      (p) => {
+        p.diagnostics.requests[0].failure = "cancelled";
+      },
+    ],
+    [
+      "config blocked by harness",
+      (p) => {
+        p.diagnostics.requests[0].routing = "blocked-origin";
+      },
+    ],
+    [
+      "config wrong method",
+      (p) => {
+        p.diagnostics.requests[0].method = "POST";
+      },
+    ],
+    [
+      "config wrong directory",
+      (p) => {
+        p.diagnostics.requests[0].directoryMatches = false;
+      },
+    ],
+    [
+      "config cross-origin",
+      (p) => {
+        p.diagnostics.requests[0].sameOrigin = false;
+      },
+    ],
+    [
+      "config wrong key",
+      (p) => {
+        p.diagnostics.requests[1].key = "b".repeat(16);
+      },
+    ],
+    [
+      "config key missing",
+      (p) => {
+        delete p.diagnostics.requests[0].key;
+      },
+    ],
+    [
+      "config statuses missing",
+      (p) => {
+        delete p.diagnostics.requests[0].responseStatuses;
+      },
+    ],
+    [
+      "config statuses malformed",
+      (p) => {
+        p.diagnostics.requests[0].responseStatuses = {};
+      },
+    ],
+    [
+      "config statuses empty",
+      (p) => {
+        p.diagnostics.requests[0].responseStatuses = [];
+      },
+    ],
+    [
+      "config before still in flight",
+      (p) => {
+        p.diagnostics.requests[0].endedAt = 1000;
+      },
+    ],
+    [
+      "config after started before commit",
+      (p) => {
+        p.diagnostics.requests[1].startedAt = 1099;
+      },
+    ],
+    [
+      "config end time missing",
+      (p) => {
+        delete p.diagnostics.requests[0].endedAt;
+      },
+    ],
+    [
+      "actual JavaScript error",
+      (p) => {
+        p.diagnostics.lifecycleEvents.push({
+          kind: "window-error",
+          javascriptErrorEvent: true,
+        });
+      },
+    ],
+    [
+      "unknown window error",
+      (p) => {
+        p.diagnostics.lifecycleEvents.push({ kind: "window-error" });
+      },
+    ],
+    [
+      "actual unhandled rejection",
+      (p) => {
+        p.diagnostics.lifecycleEvents.push({ kind: "unhandled-rejection" });
+      },
+    ],
+  ];
+  for (const stage of ["initial", "reload"])
+    for (const check of ["history", "rendered", "finiteAPI"])
+      mutations.push([
+        `missing ${stage} ${check}`,
+        (p) => {
+          delete p.checks[stage][check];
+        },
+      ]);
+  for (const key of [
+    "requests",
+    "pageErrors",
+    "lifecycleEvents",
+    "navigations",
+  ])
+    mutations.push([
+      `missing ${key}`,
+      (p) => {
+        delete p.diagnostics[key];
+      },
+    ]);
+  for (const [label, mutate] of mutations) {
+    const proof = teardownProof();
+    mutate(proof);
+    assert.deepEqual(classifyWebKitTeardown(proof), [], label);
+  }
+  t.diagnostic(`${mutations.length} negative evidence variants rejected`);
+});
+
+test("pairing is bounded to 100ms and transition to 1000ms, inclusively", () => {
+  const proof = teardownProof();
+  Object.assign(proof.diagnostics.navigations[0], {
+    committedAt: 2000,
+    completedAt: 2100,
+  });
+  proof.diagnostics.lifecycleEvents[5].receivedAt = 2010;
+  proof.diagnostics.lifecycleEvents[6].receivedAt = 2200;
+  Object.assign(proof.diagnostics.requests[1], {
+    startedAt: 2200,
+    endedAt: 2250,
+  });
+  proof.diagnostics.pageErrors[1].at = 1130;
+  assert.equal(classifyWebKitTeardown(proof).length, 2);
+  proof.diagnostics.pageErrors[1].at = 1131;
+  assert.deepEqual(classifyWebKitTeardown(proof), []);
+});
+
+test("manifest HTTP 401 and resource errors remain separate; JS errors fail without pageerrors", () => {
+  const proof = teardownProof();
+  proof.diagnostics.requests.push({
+    id: 99,
+    path: "/site.webmanifest",
+    status: 401,
+  });
+  proof.diagnostics.lifecycleEvents.push({
+    ...proof.diagnostics.lifecycleEvents.at(-1),
+    kind: "window-error",
+    sequence: 3,
+    at: 1400,
+    receivedAt: 1400,
+    javascriptErrorEvent: false,
+  });
+  assert.equal(classifyWebKitTeardown(proof).length, 2);
+  assert.equal(hasJavaScriptFailure(proof.diagnostics.lifecycleEvents), false);
+  proof.diagnostics.pageErrors = [];
+  proof.diagnostics.lifecycleEvents.at(-1).javascriptErrorEvent = true;
+  assert.equal(hasJavaScriptFailure(proof.diagnostics.lifecycleEvents), true);
+  assert.deepEqual(classifyWebKitTeardown(proof), []);
+  assert.equal(hasJavaScriptFailure([{ kind: "unhandled-rejection" }]), true);
+});
 
 // Only a VM with fake window/console/fetch objects, never Playwright execution.
 function lifecycleFixture(fetch, { logThrows = false, seed = 7 } = {}) {
@@ -429,12 +1221,19 @@ test("reload cancellation requires old pending request, explicit cancellation, a
     );
 });
 
-test("browser gate remains fatal for all page errors and runs after native DB gates", async () => {
+test("browser gate retains JS and unclassified page errors and runs after native DB gates", async () => {
   const browser = await readFile(
     new URL("./browser.mjs", import.meta.url),
     "utf8",
   );
-  assert.match(browser, /if \(diagnostics\.pageErrors\.length\)\s*throw Error/);
+  assert.match(
+    browser,
+    /if \(diagnostics\.pageErrors\.length !== classified\.length\)\s*throw Error/,
+  );
+  assert.match(
+    browser,
+    /if \(hasJavaScriptFailure\(diagnostics\.lifecycleEvents\)\)\s*throw Error/,
+  );
   assert.ok(
     browser.indexOf("await context.addInitScript(") <
       browser.indexOf("await context.newPage()"),

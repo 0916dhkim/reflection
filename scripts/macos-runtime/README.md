@@ -63,6 +63,57 @@ gates** passed, not that every adoption gate is verified. Cleanup failure fails
 the run. Unimplemented watcher, PTY, SafeShell, pressure/media and broad-provider
 checks are listed separately as remaining work, never as passing phases.
 
+## WebKit Teardown Policy
+
+This is an explicit test-policy correction, not an upstream patch, a Basic-auth
+bypass, or a claim that Safari works universally. Hosted proof:
+[run 35694815360](https://github.com/0916dhkim/reflection/actions/runs/35694815360),
+head `07388b2`, on both macOS 15 and 26. The original run remains failed under
+its original all-page-errors policy. The corrected policy still needs a green
+hosted matrix run before claiming acceptance.
+
+The observer proved two new same-origin workspace-config fetch invocations in
+the departing document during reload, one before and one after `pagehide`.
+WebKit emitted two matching access-control engine diagnostics strictly before
+the new document committed. There were no window JavaScript ErrorEvents or
+unhandled rejections, and no observer overflow. Actual config HTTP requests
+finished with 200 before and after reload, and history/rendering/finite API
+checks plus all 120 assets succeeded. These are **not cancelled config network
+requests**: the original completed request IDs were URL correlations, while the
+new teardown fetches never became new network entries.
+
+Only WebKit can classify this exact pair, and only when all evidence is present:
+
+- Reload start-to-commit is positive and at most 1000 ms; both errors and the
+  matching old-document fetch invocations are strictly inside that interval.
+- Exactly two config-specific engine messages match the observed sanitized
+  message and the earlier successful request ID. Each uniquely pairs with a
+  preceding invocation no more than 100 ms earlier.
+- Both documents have observer installation records, valid document tags and
+  contiguous sequences; the old document has exactly one non-persisted pagehide
+  in the transition. One matching invocation precedes pagehide and one follows
+  it. Missing, malformed, truncated or unknown observation evidence refuses
+  classification.
+- The only two actual config network reads are finished HTTP 200 GETs before
+  and after reload for the same URL key and correct workspace; no config
+  request has a 401/403 response. An additional network-level config attempt
+  refuses classification, even if another read succeeded.
+- Initial/reload history, rendered content, finite API work and every requested
+  bundled JS/CSS asset succeed. Actual JavaScript ErrorEvents or unhandled
+  rejections fail independently, even if Playwright reported no page error.
+
+Original `pageErrors` are retained and annotated with classification evidence
+and the proof run. `knownEngineTeardownDiagnostics` is a separate count; all
+other page errors remain fatal. Resource error events are not mislabelled as
+JavaScript exceptions. Actual `/site.webmanifest` HTTP 401 responses are recorded
+separately as `pwa-manifest-http-401`: PWA/installability is not verified and the
+401 is not reclassified as an engine teardown event.
+
+The init-script observer remains observational: capture lifecycle listeners,
+sanitized console records and an original-promise-preserving fetch wrapper.
+It attaches no promise settlement handlers and never prevents error events.
+No served vendor code, native auth, CORS policy or routing restrictions change.
+
 ## Source Contracts
 
 Inspected OpenCode source revision:

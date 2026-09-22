@@ -92,6 +92,268 @@ export function isReloadCancellation(request, navigation) {
   );
 }
 
+export function hasJavaScriptFailure(events) {
+  return events.some(
+    (event) =>
+      event?.kind === "unhandled-rejection" ||
+      (event?.kind === "window-error" && event.javascriptErrorEvent !== false),
+  );
+}
+
+// Test-policy exception proven by hosted run 35694815360, not cancellation of
+// a config network request. Missing, ambiguous, or different evidence fails closed.
+export function classifyWebKitTeardown({
+  browser,
+  origin,
+  checks,
+  assets,
+  diagnostics,
+}) {
+  if (
+    browser !== "webkit" ||
+    checks?.assets !== true ||
+    !Number.isInteger(assets) ||
+    assets < 1 ||
+    !["initial", "reload"].every((stage) =>
+      ["history", "rendered", "finiteAPI"].every(
+        (check) => checks?.[stage]?.[check] === true,
+      ),
+    )
+  )
+    return [];
+  if (
+    diagnostics?.overflow !== false ||
+    !["requests", "pageErrors", "lifecycleEvents", "navigations"].every((key) =>
+      Array.isArray(diagnostics[key]),
+    )
+  )
+    return [];
+  const {
+    requests,
+    pageErrors,
+    lifecycleEvents: events,
+    navigations,
+  } = diagnostics;
+  if (
+    pageErrors.length !== 2 ||
+    hasJavaScriptFailure(events) ||
+    requests.some((request) => request == null)
+  )
+    return [];
+  const reloads = navigations.filter((nav) => nav?.kind === "reload");
+  if (reloads.length !== 1) return [];
+  const nav = reloads[0];
+  if (
+    nav.fromDocument !== 1 ||
+    ![nav.startedAt, nav.committedAt, nav.completedAt].every(Number.isFinite) ||
+    nav.startedAt < 0 ||
+    nav.committedAt <= nav.startedAt ||
+    nav.committedAt - nav.startedAt > 1000 ||
+    nav.completedAt < nav.committedAt
+  )
+    return [];
+  const during = (time) =>
+    Number.isFinite(time) && time > nav.startedAt && time < nav.committedAt;
+  const documents = new Map();
+  for (const event of events) {
+    if (
+      !event ||
+      !["installed", "pageshow", "pagehide", "fetch", "window-error"].includes(
+        event.kind,
+      ) ||
+      event.summaryUnavailable ||
+      event.targetUnavailable ||
+      !/^[a-f0-9]{32}$/.test(event.documentTag ?? "") ||
+      ![event.at, event.timeOrigin, event.receivedAt].every(Number.isFinite) ||
+      event.at < 0 ||
+      event.timeOrigin <= 0 ||
+      event.receivedAt < 0 ||
+      typeof event.afterPagehide !== "boolean" ||
+      ![1, 2].includes(event.observedDocument)
+    )
+      return [];
+    let doc = documents.get(event.documentTag);
+    if (!doc) {
+      if (
+        event.kind !== "installed" ||
+        event.sequence !== 1 ||
+        event.afterPagehide
+      )
+        return [];
+      doc = {
+        installed: event,
+        sequence: 0,
+        at: -Infinity,
+        receivedAt: -Infinity,
+        hidden: false,
+      };
+      documents.set(event.documentTag, doc);
+    } else if (event.kind === "installed") return [];
+    if (
+      event.sequence !== doc.sequence + 1 ||
+      event.at < doc.at ||
+      event.receivedAt < doc.receivedAt ||
+      event.observedDocument !== doc.installed.observedDocument
+    )
+      return [];
+    if (event.kind === "pagehide") doc.hidden = true;
+    if (event.kind === "pageshow") doc.hidden = false;
+    if (event.afterPagehide !== doc.hidden) return [];
+    Object.assign(doc, {
+      sequence: event.sequence,
+      at: event.at,
+      receivedAt: event.receivedAt,
+    });
+  }
+  const installed = [...documents.values()].map((doc) => doc.installed);
+  const old = installed.find((event) => event.observedDocument === 1);
+  const next = installed.find((event) => event.observedDocument === 2);
+  if (
+    installed.length !== 2 ||
+    !old ||
+    !next ||
+    old.receivedAt >= nav.startedAt ||
+    next.receivedAt < nav.committedAt ||
+    next.receivedAt > nav.completedAt
+  )
+    return [];
+  const hides = events.filter((event) => event.kind === "pagehide");
+  if (
+    hides.length !== 1 ||
+    hides[0].documentTag !== old.documentTag ||
+    hides[0].persisted !== false ||
+    !during(hides[0].receivedAt)
+  )
+    return [];
+  const configShape = (value) =>
+    value.path === "/api/config" &&
+    value.sameOrigin === true &&
+    value.directoryMatches === true &&
+    Array.isArray(value.queryKeys) &&
+    value.queryKeys.length === 1 &&
+    value.queryKeys[0] === "location[directory]";
+  const config = requests.filter((request) => request.path === "/api/config");
+  if (
+    config.length !== 2 ||
+    config.some(
+      (request) =>
+        !Array.isArray(request.responseStatuses) ||
+        request.status === 401 ||
+        request.status === 403 ||
+        request.responseStatuses.some(
+          (status) => status === 401 || status === 403,
+        ),
+    )
+  )
+    return [];
+  const success = (request) =>
+    configShape(request) &&
+    request.method === "GET" &&
+    request.status === 200 &&
+    request.finished === true &&
+    request.routing === "continue" &&
+    !request.failure &&
+    request.failedAt == null &&
+    Array.isArray(request.responseStatuses) &&
+    request.responseStatuses.length > 0 &&
+    request.responseStatuses.every((status) => status === 200) &&
+    Number.isInteger(request.id) &&
+    request.id > 0 &&
+    /^[a-f0-9]{16}$/.test(request.key ?? "") &&
+    [request.startedAt, request.endedAt].every(Number.isFinite) &&
+    request.startedAt >= 0 &&
+    request.endedAt >= request.startedAt;
+  const before = config.filter(
+    (request) =>
+      success(request) &&
+      request.document === 1 &&
+      request.endedAt < nav.startedAt,
+  );
+  const after = config.filter(
+    (request) =>
+      success(request) &&
+      request.document === 2 &&
+      request.startedAt >= nav.committedAt,
+  );
+  if (
+    before.length !== 1 ||
+    after.length !== 1 ||
+    before[0].key !== after[0].key
+  )
+    return [];
+  const assetRequests = requests.filter(
+    (request) =>
+      request.sameOrigin && ["script", "stylesheet"].includes(request.type),
+  );
+  if (
+    assetRequests.length !== assets ||
+    assetRequests.some(
+      (request) =>
+        request.finished !== true ||
+        request.failure ||
+        request.failedAt != null ||
+        !Number.isInteger(request.status) ||
+        request.status < 200 ||
+        request.status >= 300,
+    )
+  )
+    return [];
+  const invocations = events.filter(
+    (event) =>
+      event.kind === "fetch" &&
+      during(event.receivedAt) &&
+      event.documentTag === old.documentTag,
+  );
+  if (
+    invocations.length !== 2 ||
+    invocations.some(
+      (event) => !configShape(event) || event.phase !== "reload:navigation",
+    ) ||
+    invocations[0].afterPagehide ||
+    invocations[0].sequence >= hides[0].sequence ||
+    !invocations[1].afterPagehide ||
+    invocations[1].sequence <= hides[0].sequence
+  )
+    return [];
+  let expectedMessage;
+  try {
+    assertLoopbackUrl(origin);
+    expectedMessage = `/${new URL(origin).host}/api/config?[query redacted] due to access control checks.`;
+  } catch {
+    return [];
+  }
+  const classified = [];
+  for (const [index, error] of pageErrors.entries()) {
+    const invocation = invocations[index];
+    if (
+      !error ||
+      error.message !== expectedMessage ||
+      error.document !== 1 ||
+      error.phase !== "reload:navigation" ||
+      !during(error.at) ||
+      error.at < invocation.receivedAt ||
+      error.at - invocation.receivedAt > 100 ||
+      (index === 0 && error.at >= invocations[1].receivedAt) ||
+      !Array.isArray(error.requestIds) ||
+      error.requestIds.length !== 1 ||
+      error.requestIds[0] !== before[0].id
+    )
+      return [];
+    classified.push({
+      pageErrorIndex: index,
+      classification: "webkit-config-reload-engine-diagnostic",
+      proofRun: "35694815360",
+      documentTag: old.documentTag,
+      fetchSequence: invocation.sequence,
+      fetchReceivedAt: invocation.receivedAt,
+      afterPagehide: invocation.afterPagehide,
+      beforeConfigRequest: before[0].id,
+      afterConfigRequest: after[0].id,
+    });
+  }
+  return classified;
+}
+
 // Self-contained for addInitScript and VM-only tests. Nothing observes fetch's
 // promise settlement: even adding a catch would change unhandledrejection.
 export function installBrowserLifecycleObserver({
@@ -287,6 +549,7 @@ export async function verifyBrowserContract({
   for (const [name, browserType] of Object.entries({ chromium, webkit })) {
     const result = (results[name] = {
       outcome: "running",
+      knownEngineTeardownDiagnostics: 0,
       checks: { initial: {}, reload: {} },
       diagnostics: {
         requests: [],
@@ -634,8 +897,21 @@ export async function verifyBrowserContract({
         );
       if (diagnostics.overflow)
         throw Error("request diagnostic budget exceeded");
-      if (diagnostics.pageErrors.length)
-        throw Error(diagnostics.pageErrors[0].message);
+      result.checks.assets = true;
+      if (hasJavaScriptFailure(diagnostics.lifecycleEvents))
+        throw Error("Observed JavaScript ErrorEvent or unhandled rejection");
+      const classified = classifyWebKitTeardown({
+        browser: name,
+        origin,
+        ...result,
+      });
+      for (const entry of classified)
+        diagnostics.pageErrors[entry.pageErrorIndex].classification = entry;
+      result.knownEngineTeardownDiagnostics = classified.length;
+      if (diagnostics.pageErrors.length !== classified.length)
+        throw Error(
+          diagnostics.pageErrors.find((error) => !error.classification).message,
+        );
       result.outcome = "passed";
     } catch (error) {
       result.outcome = "failed";
@@ -644,6 +920,20 @@ export async function verifyBrowserContract({
     } finally {
       // Teardown intentionally cancels SSE; it is outside the assertions.
       collecting = false;
+      const manifests = diagnostics.requests.filter(
+        (request) =>
+          request.path === "/site.webmanifest" && request.status === 401,
+      );
+      result.limitations = manifests.length
+        ? [
+            {
+              code: "pwa-manifest-http-401",
+              requestIds: manifests.map((request) => request.id),
+              message:
+                "The PWA manifest returned HTTP 401. PWA/installability is not verified; this is independent of the engine teardown classification.",
+            },
+          ]
+        : [];
       diagnostics.lifecycleCoverage = {
         installedDocuments: [
           ...new Set(
