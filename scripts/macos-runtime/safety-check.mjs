@@ -17,12 +17,250 @@ import {
   MARKER,
 } from "./fixture.mjs";
 import { readFile } from "node:fs/promises";
+import { runInNewContext } from "node:vm";
 import {
   browserURL,
   browserError,
   finiteAPIState,
   isReloadCancellation,
+  installBrowserLifecycleObserver,
 } from "./browser.mjs";
+
+// Only a VM with fake window/console/fetch objects, never Playwright execution.
+function lifecycleFixture(fetch, { logThrows = false, seed = 7 } = {}) {
+  const lines = [];
+  const listeners = new Map();
+  let time = 0;
+  const origin = "http://127.0.0.1:4097";
+  const directory = "/private/fixture/workspace";
+  const channel = "fixture-observer:";
+  const target = {
+    fetch,
+    ErrorEvent: class {
+      constructor(properties) {
+        Object.assign(this, properties);
+      }
+    },
+    location: { origin, href: `${origin}/session-fixture` },
+    console: {
+      debug(text) {
+        if (logThrows) throw Error("logger unavailable");
+        lines.push(text);
+      },
+    },
+    performance: { timeOrigin: 100000, now: () => ++time },
+    crypto: { getRandomValues: (values) => values.fill(seed) },
+    addEventListener(type, listener, options) {
+      const entries = listeners.get(type) ?? [];
+      entries.push({ listener, options });
+      listeners.set(type, entries);
+    },
+  };
+  target.top = target;
+  runInNewContext(`(${installBrowserLifecycleObserver.toString()})(options)`, {
+    window: target,
+    URL,
+    Request,
+    options: { origin, directory, channel },
+  });
+  return {
+    target,
+    listeners,
+    origin,
+    directory,
+    records: () => lines.map((line) => JSON.parse(line.slice(channel.length))),
+    dispatch(type, event = {}) {
+      for (const { listener } of listeners.get(type) ?? []) listener(event);
+    },
+  };
+}
+
+test("lifecycle fetch wrapper preserves promise identity, receiver, arguments, and synchronous throws", () => {
+  const promise = Promise.resolve("untouched");
+  for (const name of ["then", "catch", "finally"])
+    Object.defineProperty(promise, name, {
+      get() {
+        throw Error(`observer accessed ${name}`);
+      },
+    });
+  let call;
+  const fixture = lifecycleFixture(function (...args) {
+    call = { receiver: this, args };
+    return promise;
+  });
+  const receiver = {};
+  const input = `${fixture.origin}/api/config?${new URLSearchParams({ "location[directory]": fixture.directory })}`;
+  const init = new Proxy(
+    {},
+    {
+      get() {
+        throw Error("observer inspected request options");
+      },
+    },
+  );
+  assert.equal(fixture.target.fetch.call(receiver, input, init), promise);
+  assert.equal(call.receiver, receiver);
+  assert.deepEqual(call.args, [input, init]);
+  assert.equal(fixture.records().at(-1).directoryMatches, true);
+  const failure = Error("native synchronous failure");
+  const throwing = lifecycleFixture(() => {
+    throw failure;
+  });
+  assert.throws(
+    () => throwing.target.fetch(input),
+    (error) => error === failure,
+  );
+  assert.doesNotMatch(
+    installBrowserLifecycleObserver.toString(),
+    /\.(then|catch|finally)\s*\(|preventDefault/,
+  );
+});
+
+test("capture pagehide precedes app callbacks; lifecycle records retain document tags and clocks", () => {
+  const result = {};
+  const fixture = lifecycleFixture(() => result);
+  fixture.target.fetch("/api/config");
+  fixture.target.addEventListener("pagehide", () =>
+    fixture.target.fetch("/api/config"),
+  );
+  fixture.dispatch("pagehide", { persisted: false });
+  fixture.dispatch("pageshow", { persisted: true });
+  fixture.target.fetch("/api/config");
+  const records = fixture.records();
+  assert.deepEqual(
+    records.map((record) => record.kind),
+    ["installed", "fetch", "pagehide", "fetch", "pageshow", "fetch"],
+  );
+  assert.deepEqual(
+    records
+      .filter((record) => record.kind === "fetch")
+      .map((record) => record.afterPagehide),
+    [false, true, false],
+  );
+  assert.equal(fixture.listeners.get("pagehide")[0].options.capture, true);
+  assert.equal(new Set(records.map((record) => record.documentTag)).size, 1);
+  assert.match(records[0].documentTag, /^[a-f0-9]{32}$/);
+  assert.deepEqual(
+    records.map((record) => record.sequence),
+    [1, 2, 3, 4, 5, 6],
+  );
+  assert.ok(
+    records.every(
+      (record, index) =>
+        record.at === index + 1 && record.timeOrigin === 100000,
+    ),
+  );
+  const next = lifecycleFixture(() => result, { seed: 8 });
+  assert.notEqual(next.records()[0].documentTag, records[0].documentTag);
+});
+
+test("lifecycle observation emits no URL, query values, credentials, body, or raw error text", () => {
+  const fixture = lifecycleFixture(() => ({}));
+  const url = new URL(`${fixture.origin}/api/config`);
+  url.username = "private-user";
+  url.password = "private-password";
+  url.searchParams.set("location[directory]", fixture.directory);
+  url.searchParams.set("token", "private-token");
+  fixture.target.fetch(url);
+  const request = new Request(`${fixture.origin}/api/config`, {
+    method: "POST",
+    headers: { Authorization: "Basic private-header" },
+    body: "private-body",
+  });
+  fixture.target.fetch(request);
+  assert.equal(request.bodyUsed, false);
+  fixture.target.fetch("data:text/plain,private-data");
+  const message = `Fetch API cannot load ${url} due to access control checks. private-body`;
+  const event = {
+    message,
+    error: Error(message),
+    reason: Error(message),
+    preventDefault() {
+      throw Error("must not suppress events");
+    },
+  };
+  fixture.dispatch("error", new fixture.target.ErrorEvent(event));
+  fixture.dispatch("unhandledrejection", event);
+  const records = fixture.records();
+  const text = JSON.stringify(records);
+  for (const secret of [
+    fixture.origin,
+    fixture.directory,
+    "private-user",
+    "private-password",
+    "private-token",
+    "private-header",
+    "private-body",
+    "private-data",
+    "Fetch API cannot load",
+  ])
+    assert.ok(!text.includes(secret), secret);
+  assert.equal(records[1].path, "/api/config");
+  assert.deepEqual(records[1].queryKeys, ["location[directory]", "token"]);
+  assert.equal(records[1].directoryMatches, true);
+  assert.equal(records[3].path, "[non-http]");
+  for (const record of records.slice(-2)) {
+    assert.equal(record.accessControl, true);
+    assert.equal(record.configMentioned, true);
+    assert.equal(record.messagePresent, true);
+  }
+  assert.equal(records.at(-2).javascriptErrorEvent, true);
+  fixture.dispatch("error", {});
+  assert.equal(
+    fixture.records().at(-1).javascriptErrorEvent,
+    false,
+    "resource errors are distinct from JavaScript ErrorEvents",
+  );
+});
+
+test("observer failures and unfamiliar fetch inputs never change application behavior", () => {
+  const result = {};
+  let calls = 0;
+  const input = {
+    toString() {
+      throw Error("must not coerce caller object");
+    },
+  };
+  const fixture = lifecycleFixture(() => {
+    calls++;
+    return result;
+  });
+  assert.equal(fixture.target.fetch(input), result);
+  assert.equal(calls, 1);
+  assert.equal(fixture.records().at(-1).targetUnavailable, true);
+  const throwingLog = lifecycleFixture(() => result, { logThrows: true });
+  assert.equal(throwingLog.target.fetch("/api/config"), result);
+  assert.deepEqual(throwingLog.records(), []);
+  fixture.dispatch("unhandledrejection", {
+    reason: new Proxy(
+      {},
+      {
+        getOwnPropertyDescriptor() {
+          throw Error("uninspectable");
+        },
+      },
+    ),
+  });
+  assert.equal(fixture.records().at(-1).kind, "unhandled-rejection");
+  assert.equal(fixture.records().at(-1).summaryUnavailable, true);
+});
+
+test("observer record budget truncates explicitly without preventing later fetches", () => {
+  let calls = 0;
+  const fixture = lifecycleFixture(() => {
+    calls++;
+    return calls;
+  });
+  for (let i = 0; i < 300; i++)
+    assert.equal(fixture.target.fetch("/api/config"), i + 1);
+  const records = fixture.records();
+  assert.equal(records.length, 257);
+  assert.equal(records.at(-1).kind, "overflow");
+  assert.equal(
+    records.filter((record) => record.kind === "overflow").length,
+    1,
+  );
+});
 
 test("browser diagnostics omit query and credential values but correlate exact request URLs", () => {
   const origin = "http://127.0.0.1:4097";
@@ -197,6 +435,10 @@ test("browser gate remains fatal for all page errors and runs after native DB ga
     "utf8",
   );
   assert.match(browser, /if \(diagnostics\.pageErrors\.length\)\s*throw Error/);
+  assert.ok(
+    browser.indexOf("await context.addInitScript(") <
+      browser.indexOf("await context.newPage()"),
+  );
   assert.doesNotMatch(
     browser,
     /waitUntil: ["']networkidle["']|extraHTTPHeaders/,

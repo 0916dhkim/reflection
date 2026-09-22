@@ -1,5 +1,5 @@
 import { chromium, webkit } from "playwright";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { assertLoopbackUrl, sessionRoute } from "./guards.mjs";
 import { MARKER, PROMPT, TITLE } from "./fixture.mjs";
 
@@ -92,6 +92,153 @@ export function isReloadCancellation(request, navigation) {
   );
 }
 
+// Self-contained for addInitScript and VM-only tests. Nothing observes fetch's
+// promise settlement: even adding a catch would change unhandledrejection.
+export function installBrowserLifecycleObserver({
+  origin,
+  directory,
+  channel,
+}) {
+  const target = window;
+  if (target !== target.top || target.location.origin !== origin) return;
+  const originalFetch = target.fetch;
+  const log = target.console.debug.bind(target.console);
+  const documentTag = [...target.crypto.getRandomValues(new Uint32Array(4))]
+    .map((value) => value.toString(16).padStart(8, "0"))
+    .join("");
+  const urlHref = Object.getOwnPropertyDescriptor(URL.prototype, "href").get;
+  const requestURL = Object.getOwnPropertyDescriptor(
+    Request.prototype,
+    "url",
+  ).get;
+  let afterPagehide = false;
+  let sequence = 0;
+  const emit = (kind, fields = {}) => {
+    try {
+      if (sequence > 256) return;
+      if (sequence === 256) {
+        kind = "overflow";
+        fields = {};
+      }
+      log(
+        channel +
+          JSON.stringify({
+            kind,
+            documentTag,
+            sequence: ++sequence,
+            at: target.performance.now(),
+            timeOrigin: target.performance.timeOrigin,
+            afterPagehide,
+            ...fields,
+          }),
+      );
+    } catch {
+      /* Observation must never change application control flow. */
+    }
+  };
+  const errorFields = (reason, message) => {
+    // Do not stringify arbitrary rejection objects, invoke their getters, or
+    // emit error text/stacks (which can embed credentials or response bodies).
+    const own =
+      reason != null &&
+      (typeof reason === "object" || typeof reason === "function")
+        ? Object.getOwnPropertyDescriptor(reason, "message")?.value
+        : undefined;
+    const text =
+      typeof message === "string"
+        ? message
+        : typeof reason === "string"
+          ? reason
+          : typeof own === "string"
+            ? own
+            : "";
+    return {
+      reasonType: typeof reason,
+      messagePresent: text.length > 0,
+      accessControl: /due to access control checks/i.test(text),
+      configMentioned: /\/api\/config(?:[?\s]|$)/.test(text),
+    };
+  };
+  target.addEventListener(
+    "pagehide",
+    (event) => {
+      afterPagehide = true;
+      emit("pagehide", { persisted: event.persisted === true });
+    },
+    { capture: true },
+  );
+  target.addEventListener(
+    "pageshow",
+    (event) => {
+      afterPagehide = false;
+      emit("pageshow", { persisted: event.persisted === true });
+    },
+    { capture: true },
+  );
+  target.addEventListener(
+    "error",
+    (event) => {
+      try {
+        emit("window-error", {
+          ...errorFields(event.error, event.message),
+          javascriptErrorEvent: event instanceof target.ErrorEvent,
+        });
+      } catch {
+        emit("window-error", { summaryUnavailable: true });
+      }
+    },
+    { capture: true },
+  );
+  target.addEventListener(
+    "unhandledrejection",
+    (event) => {
+      try {
+        emit("unhandled-rejection", errorFields(event.reason));
+      } catch {
+        emit("unhandled-rejection", { summaryUnavailable: true });
+      }
+    },
+    { capture: true },
+  );
+  target.fetch = function (...args) {
+    try {
+      const input = args[0];
+      // Only native URL/Request accessors or primitive strings; never coerce a
+      // caller's object twice, construct a Request, or inspect init/body/headers.
+      const value =
+        typeof input === "string"
+          ? input
+          : input instanceof URL
+            ? Reflect.apply(urlHref, input, [])
+            : input instanceof Request
+              ? Reflect.apply(requestURL, input, [])
+              : null;
+      if (value == null) emit("fetch", { targetUnavailable: true });
+      else {
+        const url = new URL(value, target.location.href);
+        const http = ["http:", "https:"].includes(url.protocol);
+        emit("fetch", {
+          path: http ? url.pathname.slice(0, 256) : "[non-http]",
+          queryKeys: http
+            ? [...new Set(url.searchParams.keys())]
+                .sort()
+                .slice(0, 32)
+                .map((key) => key.slice(0, 64))
+            : [],
+          sameOrigin: url.origin === origin,
+          directoryMatches: url.searchParams.has("location[directory]")
+            ? url.searchParams.get("location[directory]") === directory
+            : null,
+        });
+      }
+    } catch {
+      emit("fetch", { targetUnavailable: true });
+    }
+    return Reflect.apply(originalFetch, this, args);
+  };
+  emit("installed");
+}
+
 export async function api(origin, password, path, body, options = {}) {
   assertLoopbackUrl(origin);
   const response = await fetch(new URL(`/api${path}`, origin), {
@@ -145,6 +292,7 @@ export async function verifyBrowserContract({
         requests: [],
         pageErrors: [],
         networkConsoleErrors: [],
+        lifecycleEvents: [],
         navigations: [],
         overflow: false,
       },
@@ -160,6 +308,7 @@ export async function verifyBrowserContract({
     const tracked = new Map();
     const metadata = new Set();
     const redact = (value) => browserError(value, password);
+    const lifecycleChannel = `__reflection_lifecycle_${randomUUID()}__`;
     // Inspector header collection is best effort and bounded. A null value
     // means unavailable, not proof that the browser omitted authentication.
     const headers = (request, response) => {
@@ -217,6 +366,11 @@ export async function verifyBrowserContract({
       const context = await browser.newContext({
         httpCredentials: { username: "opencode", password, origin },
         serviceWorkers: "block",
+      });
+      await context.addInitScript(installBrowserLifecycleObserver, {
+        origin,
+        directory,
+        channel: lifecycleChannel,
       });
       await context.route("**/*", async (route) => {
         const target = new URL(route.request().url());
@@ -323,6 +477,55 @@ export async function verifyBrowserContract({
         });
       });
       page.on("console", (message) => {
+        if (
+          collecting &&
+          message.type() === "debug" &&
+          message.text().startsWith(lifecycleChannel)
+        ) {
+          if (
+            diagnostics.lifecycleEvents.length >= 768 ||
+            message.text().length > 6000
+          ) {
+            diagnostics.overflow = true;
+            return;
+          }
+          try {
+            const record = JSON.parse(
+              message.text().slice(lifecycleChannel.length),
+            );
+            // Hash the already-sanitized summary, not a URL/error containing
+            // secrets. This is a grouping key, not the network request URL key.
+            const {
+              kind,
+              documentTag,
+              sequence,
+              at,
+              timeOrigin,
+              afterPagehide,
+              ...summary
+            } = record;
+            diagnostics.lifecycleEvents.push({
+              kind,
+              documentTag,
+              sequence,
+              at,
+              timeOrigin,
+              afterPagehide,
+              ...summary,
+              summaryHash: createHash("sha256")
+                .update(JSON.stringify(summary))
+                .digest("hex")
+                .slice(0, 16),
+              receivedAt: now(),
+              observedDocument: document,
+              phase,
+            });
+            if (kind === "overflow") diagnostics.overflow = true;
+          } catch {
+            diagnostics.overflow = true;
+          }
+          return;
+        }
         if (
           !collecting ||
           message.type() !== "error" ||
@@ -441,6 +644,22 @@ export async function verifyBrowserContract({
     } finally {
       // Teardown intentionally cancels SSE; it is outside the assertions.
       collecting = false;
+      diagnostics.lifecycleCoverage = {
+        installedDocuments: [
+          ...new Set(
+            diagnostics.lifecycleEvents
+              .filter((event) => event.kind === "installed")
+              .map((event) => event.documentTag),
+          ),
+        ],
+        pagehideDocuments: [
+          ...new Set(
+            diagnostics.lifecycleEvents
+              .filter((event) => event.kind === "pagehide")
+              .map((event) => event.documentTag),
+          ),
+        ],
+      };
       for (const entry of diagnostics.requests) {
         if (entry.failedAt != null)
           entry.reloadCancellation = diagnostics.navigations.some((nav) =>
