@@ -13,6 +13,66 @@ export const PROMPT =
   "Search Reflection for the synthetic fixture marker, read the returned citation, and return only the marker from the exact source.";
 export const TITLE = "macOS native Reflection fixture";
 
+// /api/event uses EventFeed.frame (7673 server/src/event-feed.ts:29-30).
+// Scope before counting terminals; retain either matching ID so mismatched
+// session/aggregate pairs cannot masquerade as unrelated traffic.
+export function policyGlobalRefusalEvidence(text, sessionID, expected) {
+  const result = {
+    connected: false,
+    overflow: Buffer.byteLength(text) > 256 * 1024,
+    malformed: 0,
+    streamFailure: false,
+    eventCount: 0,
+    ignoredEvents: 0,
+    terminal: policyRefusalEvidence("", sessionID, expected),
+  };
+  if (result.overflow) return result;
+  const frames = text.split(/\r?\n\r?\n/);
+  frames.pop(); // The collector can stop in the middle of a network frame.
+  let scoped = "";
+  for (const frame of frames) {
+    const lines = frame.split(/\r?\n/);
+    const data = lines
+      .filter((line) => line.startsWith("data:"))
+      .map((line) => line.slice(5).replace(/^ /, ""))
+      .join("\n");
+    if (!data) continue;
+    if (++result.eventCount > 128) {
+      result.overflow = true;
+      break;
+    }
+    if (
+      lines.some(
+        (line) =>
+          line.startsWith("event:") &&
+          line.slice(6).trim() === "effect/httpapi/stream/failure",
+      )
+    )
+      result.streamFailure = true;
+    let event;
+    try {
+      event = JSON.parse(data);
+    } catch {
+      result.malformed++;
+      continue;
+    }
+    if (event?.type === "server.connected") result.connected = true;
+    else if (
+      event?.data?.sessionID === sessionID ||
+      event?.durable?.aggregateID === sessionID
+    )
+      scoped += `${frame}\n\n`;
+    else result.ignoredEvents++;
+  }
+  result.terminal = policyRefusalEvidence(scoped, sessionID, expected);
+  result.terminal.matched &&=
+    result.connected &&
+    !result.overflow &&
+    !result.malformed &&
+    !result.streamFailure;
+  return result;
+}
+
 // Pinned 7673: session.log emits SessionEvent.Durable directly as SSE data;
 // execution.ts:51-56 -> to-session-error.ts:64 preserves the thrown message.
 // Unknown shapes/reasons are diagnostics only, never alternate refusal proofs.

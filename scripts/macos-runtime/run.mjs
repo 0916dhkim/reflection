@@ -39,6 +39,7 @@ import {
   POLICY_SEED_TEXT,
   toolContent,
   policyRefusalEvidence,
+  policyGlobalRefusalEvidence,
 } from "./fixture.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -908,26 +909,35 @@ try {
           assert.equal(typeof result.id, "string");
           return result;
         };
-        const messages = async (id) =>
+        const messages = async (id, signal = abort.signal) =>
           (
-            await api(
+            await nativeAPI(
               policyOrigin,
               password,
               `/session/${id}/message?limit=50&order=asc`,
+              undefined,
+              { signal },
             )
           ).data;
-        const prompt = async (id, text = PROMPT) => {
-          await api(policyOrigin, password, `/session/${id}/prompt`, {
-            text,
-            resume: true,
-          });
-          await api(
+        const prompt = async (id, text = PROMPT, signal = abort.signal) => {
+          await nativeAPI(
+            policyOrigin,
+            password,
+            `/session/${id}/prompt`,
+            {
+              text,
+              resume: true,
+            },
+            { signal },
+          );
+          await nativeAPI(
             policyOrigin,
             password,
             `/experimental/session/${id}/wait`,
             {},
+            { signal },
           );
-          return messages(id);
+          return messages(id, signal);
         };
         const policySeed = await newSession();
         await writeFile(join(policyRoot, "seed-session"), policySeed.id);
@@ -1061,39 +1071,115 @@ try {
           // This owned child's buffer is diagnostic-only. Reset it so reason
           // classification cannot accidentally match a prior refusal's output.
           policyServer.output = "";
-          await prompt(id);
-          // Context hooks can fail before an assistant message exists. The durable
-          // execution terminal is the native public failure contract in that case.
-          const response = await request(
-            policyOrigin,
-            `/api/experimental/session/${id}/log?follow=false`,
-            goodAuth(password),
-          );
-          evidence.logStatus = response.status;
+          const controller = new AbortController();
+          const streamSignal = AbortSignal.any([
+            abort.signal,
+            controller.signal,
+            AbortSignal.timeout(12_000),
+          ]);
+          let reader;
+          let globalFailed = false;
+          evidence.globalStream = policyGlobalRefusalEvidence("", id, expected);
+          try {
+            const live = await fetch(`${policyOrigin}/api/event`, {
+              headers: { authorization: goodAuth(password) },
+              redirect: "error",
+              signal: streamSignal,
+            });
+            evidence.globalStatus = live.status;
+            assert.ok(
+              live.ok &&
+                live.headers.get("content-type")?.includes("text/event-stream"),
+              "Global SSE unavailable",
+            );
+            reader = live.body.getReader();
+            let text = "";
+            let bytes = 0;
+            const decoder = new TextDecoder();
+            const until = async (predicate) => {
+              while (!predicate(evidence.globalStream)) {
+                const next = await reader.read();
+                assert.ok(!next.done, "Global SSE ended before refusal proof");
+                bytes += next.value.byteLength;
+                if (bytes > 256 * 1024) {
+                  evidence.globalStream.overflow = true;
+                  throw Error("Global SSE byte budget exceeded");
+                }
+                text += decoder.decode(next.value, { stream: true });
+                evidence.globalStream = policyGlobalRefusalEvidence(
+                  text,
+                  id,
+                  expected,
+                );
+                assert.ok(
+                  !evidence.globalStream.overflow &&
+                    !evidence.globalStream.malformed &&
+                    !evidence.globalStream.streamFailure,
+                  "Invalid global SSE evidence",
+                );
+              }
+            };
+            await until((state) => state.connected);
+            assert.equal(
+              evidence.globalStream.terminal.terminalCount,
+              0,
+              "Unexpected terminal before refusal prompt",
+            );
+            // Begin reading before dispatch; a fast refusal must not be missed.
+            const terminal = until((state) => state.terminal.terminalCount > 0);
+            await Promise.all([terminal, prompt(id, PROMPT, streamSignal)]);
+            streamSignal.throwIfAborted();
+            evidence.promptCompleted = true;
+          } catch {
+            globalFailed = true;
+            evidence.globalStreamFailed = true;
+            evidence.globalStreamAborted = streamSignal.aborted;
+          } finally {
+            controller.abort();
+            await reader?.cancel().catch(() => {});
+          }
+          evidence.nativeOutputExpectedReason =
+            policyServer.output.includes(expected);
+          // Hosted run 35771642468 returned only log.synced here. Preserve this
+          // diagnostic without claiming replay correctness or a vendor defect.
+          try {
+            const response = await request(
+              policyOrigin,
+              `/api/experimental/session/${id}/log?follow=false`,
+              goodAuth(password),
+            );
+            evidence.logStatus = response.status;
+            evidence.experimentalReplay = policyRefusalEvidence(
+              await response.text(),
+              id,
+              expected,
+              policyServer.output,
+            );
+          } catch {
+            evidence.experimentalReplayUnavailable = true;
+          }
           evidence.providerRequestDelta =
             policyFixture.requests.filter(
               (item) => item.path === "/v1/chat/completions",
             ).length - before;
-          evidence.terminal = policyRefusalEvidence(
-            await response.text(),
-            id,
-            expected,
-            policyServer.output,
-          );
           evidence.outcome = "failed";
-          assert.equal(response.status, 200);
           assert.equal(
             evidence.providerRequestDelta,
             0,
             "Refusal dispatched provider request",
           );
           assert.ok(
-            evidence.terminal.matched,
+            !globalFailed &&
+              evidence.promptCompleted &&
+              evidence.globalStream.terminal.matched,
             `Expected explicit policy refusal: ${name}`,
           );
           await ready(policyOrigin, password, policyServer);
           evidence.outcome = "passed";
         };
+        report.limitations.push(
+          "Experimental session log returned only log.synced during refusal probes in hosted run 35771642468. This lane proves refusals through pre-subscribed global SSE; durable replay correctness is not asserted.",
+        );
         await rm(join(policyRoot, "instructions/MEMORY.md"));
         await refuse(
           "missing-instruction",

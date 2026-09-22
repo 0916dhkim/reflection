@@ -19,6 +19,7 @@ import {
   toolResult,
   createReflectionFixture,
   policyRefusalEvidence,
+  policyGlobalRefusalEvidence,
 } from "./fixture.mjs";
 import { readFile } from "node:fs/promises";
 import { runInNewContext } from "node:vm";
@@ -1624,6 +1625,135 @@ test("native refusal evidence requires the direct durable event and the specific
   assert.equal(
     policyRefusalEvidence(sse(failure), sessionID, "").matched,
     false,
+  );
+});
+
+test("global SSE scopes refusal proof to the requested session without accepting wrong terminals", () => {
+  const id = "requested-session";
+  const expected =
+    "Reflection: user policy instructions unavailable; request blocked";
+  const frame = (event) => `data: ${JSON.stringify(event)}\n\n`;
+  const connected = frame({
+    id: "connected-event",
+    type: "server.connected",
+    data: {},
+  });
+  const failure = {
+    id: "failure-event",
+    created: 1,
+    type: "session.execution.failed",
+    durable: { aggregateID: id, version: 1, seq: 5 },
+    data: { sessionID: id, error: { type: "unknown", message: expected } },
+  };
+  const other = structuredClone(failure);
+  other.durable.aggregateID = "unrelated-session";
+  other.data.sessionID = "unrelated-session";
+  other.data.error.message = "unrelated-secret-message";
+  const background =
+    frame(other) + frame({ ...other, type: "session.execution.succeeded" });
+  const text = connected + background + frame(failure) + background;
+  const result = policyGlobalRefusalEvidence(text, id, expected);
+  assert.equal(result.connected, true);
+  assert.equal(result.ignoredEvents, 4);
+  assert.equal(result.terminal.terminalCount, 1);
+  assert.equal(result.terminal.matched, true);
+  assert.doesNotMatch(
+    JSON.stringify(result),
+    /requested-session|unrelated-|Reflection:/,
+  );
+  assert.equal(
+    policyGlobalRefusalEvidence(text.replaceAll("\n", "\r\n"), id, expected)
+      .terminal.matched,
+    true,
+  );
+  assert.equal(
+    policyGlobalRefusalEvidence(
+      connected + frame(failure).slice(0, -1),
+      id,
+      expected,
+    ).terminal.matched,
+    false,
+    "partial frame is not proof",
+  );
+  assert.equal(
+    policyGlobalRefusalEvidence(frame(failure), id, expected).terminal.matched,
+    false,
+    "handshake required",
+  );
+  assert.equal(
+    policyGlobalRefusalEvidence(connected + background, id, expected).terminal
+      .terminalCount,
+    0,
+  );
+  for (const mutate of [
+    (e) => {
+      e.type = "session.execution.succeeded";
+    },
+    (e) => {
+      e.type = "session.execution.interrupted";
+    },
+    (e) => {
+      e.data.error.message = "unrelated reason";
+    },
+    (e) => {
+      e.data.error.type = "provider.auth";
+    },
+    (e) => {
+      e.durable.aggregateID = "wrong";
+    },
+    (e) => {
+      e.data.sessionID = "wrong";
+    },
+    (e) => {
+      e.durable.version = 2;
+    },
+    (e) => {
+      e.durable.seq = "5";
+    },
+  ]) {
+    const changed = structuredClone(failure);
+    mutate(changed);
+    const failed = policyGlobalRefusalEvidence(
+      connected + background + frame(changed),
+      id,
+      expected,
+    );
+    assert.equal(
+      failed.terminal.terminalCount,
+      1,
+      "malformed target terminals must not be ignored",
+    );
+    assert.equal(failed.terminal.matched, false);
+  }
+  for (const extra of [
+    frame(failure),
+    frame({ ...failure, type: "session.execution.succeeded" }),
+    "data: invalid\n\n",
+    "event: effect/httpapi/stream/failure\ndata: {}\n\n",
+  ])
+    assert.equal(
+      policyGlobalRefusalEvidence(
+        connected + frame(failure) + extra,
+        id,
+        expected,
+      ).terminal.matched,
+      false,
+    );
+  const capped = policyGlobalRefusalEvidence(
+    connected + frame(other).repeat(128) + frame(failure),
+    id,
+    expected,
+  );
+  assert.equal(
+    capped.overflow,
+    true,
+    "global event budget includes unrelated sessions",
+  );
+  assert.equal(capped.terminal.matched, false);
+  assert.equal(
+    policyGlobalRefusalEvidence("x".repeat(256 * 1024 + 1), id, expected)
+      .overflow,
+    true,
   );
 });
 
