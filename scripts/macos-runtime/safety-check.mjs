@@ -15,6 +15,9 @@ import {
   SOURCE,
   SEED_TEXT,
   MARKER,
+  POLICY_SEED_TEXT,
+  toolResult,
+  createReflectionFixture,
 } from "./fixture.mjs";
 import { readFile } from "node:fs/promises";
 import { runInNewContext } from "node:vm";
@@ -1403,6 +1406,133 @@ test("OpenAI-compatible chunks have indexes and a separate terminal finish reaso
     completionChunks({ text: MARKER }, 3)[1].choices[0].finish_reason,
     "stop",
   );
+});
+
+test("policy wire requires exactly one encoding layer and byte-exact original JSON text", () => {
+  const raw = JSON.stringify(
+    {
+      claims: [
+        { segments: [{ source_id: SOURCE.id, segment_id: "actual-citation" }] },
+      ],
+    },
+    null,
+    2,
+  );
+  assert.deepEqual(toolResult({ content: raw }), JSON.parse(raw));
+  assert.deepEqual(
+    toolResult({ content: JSON.stringify(raw) }, true, raw),
+    JSON.parse(raw),
+  );
+  for (const content of [
+    raw,
+    JSON.stringify(JSON.stringify(raw)),
+    JSON.stringify(JSON.stringify(JSON.parse(raw))),
+    '"{}"',
+  ])
+    assert.throws(() => toolResult({ content }, true, raw));
+  assert.throws(() => toolResult({ content: JSON.stringify(raw) }, false, raw));
+  assert.throws(() =>
+    toolResult({ content: JSON.stringify(JSON.stringify(raw)) }, true),
+  );
+  assert.throws(() =>
+    toolResult({ content: JSON.stringify({ changed: true }) }, false, raw),
+  );
+});
+
+test("OpenRouter Google roundtrip preserves braces, refs, nested JSON and rejects changed source", () => {
+  const citation = { source_id: SOURCE.id, segment_id: "wire-citation" };
+  const raw = [
+    JSON.stringify({ claims: [{ segments: [citation] }] }),
+    JSON.stringify({
+      source_id: SOURCE.id,
+      messages: [{ text: POLICY_SEED_TEXT }],
+      verification: "deterministic segment ID",
+    }),
+  ];
+  assert.ok(POLICY_SEED_TEXT.includes("PREFIX{}SUFFIX"));
+  assert.ok(POLICY_SEED_TEXT.includes('"$ref"'));
+  const body = {
+    model: "google/fixture-model",
+    stream: true,
+    tools: ["memory_search", "memory_read_segment"].map((name) => ({
+      type: "function",
+      function: { name },
+    })),
+    messages: [],
+  };
+  const options = { policyEnabled: true, originals: raw };
+  assert.equal(completionTurn(body, options).name, "memory_search");
+  body.messages.push({ role: "tool", content: JSON.stringify(raw[0]) });
+  assert.deepEqual(completionTurn(body, options), {
+    name: "memory_read_segment",
+    arguments: citation,
+  });
+  body.messages.push({
+    role: "tool",
+    content: [{ type: "text", text: JSON.stringify(raw[1]) }],
+  });
+  assert.deepEqual(completionTurn(body, options), { text: MARKER });
+  assert.throws(() => completionTurn(body));
+  assert.throws(() =>
+    completionTurn({ ...body, model: "fixture-model" }, options),
+  );
+  assert.throws(() => completionTurn({ ...body, stream: false }, options));
+  assert.throws(() => completionTurn({ ...body, tools: [] }, options));
+  for (const text of [
+    SEED_TEXT,
+    JSON.stringify(POLICY_SEED_TEXT),
+    POLICY_SEED_TEXT.replace("PREFIX{}SUFFIX", "{}"),
+  ]) {
+    const changed = JSON.stringify({
+      source_id: SOURCE.id,
+      messages: [{ text }],
+      verification: "deterministic segment ID",
+    });
+    const changedBody = {
+      ...body,
+      messages: [
+        body.messages[0],
+        { role: "tool", content: JSON.stringify(changed) },
+      ],
+    };
+    assert.throws(
+      () => completionTurn(changedBody, { policyEnabled: true }),
+      /not verified/,
+    );
+    assert.throws(() => completionTurn(changedBody, options), /differs/);
+  }
+  for (const content of [raw[1], JSON.stringify(JSON.stringify(raw[1]))])
+    assert.throws(() =>
+      completionTurn(
+        { ...body, messages: [body.messages[0], { role: "tool", content }] },
+        options,
+      ),
+    );
+  assert.equal(
+    completionChunks({ text: MARKER }, 3, body.model)[0].model,
+    body.model,
+  );
+});
+
+test("source forwarding cannot target remote hosts and policy gate is mandatory before port reuse", async () => {
+  const fixture = createReflectionFixture();
+  assert.throws(() => fixture.setNative("https://example.com", "fixture-only"));
+  await fixture.close();
+  const runner = await readFile(new URL("./run.mjs", import.meta.url), "utf8");
+  const policyPhase = runner.search(/await phase\(\s*"opt-in user policy/);
+  assert.ok(
+    policyPhase >
+      runner.indexOf(
+        '"pluginInitialization and actual native memory toolchain"',
+      ),
+  );
+  assert.ok(
+    policyPhase < runner.indexOf('"independent baseline then port collision'),
+  );
+  assert.match(runner, /policyEnabled: true,\s*readOriginals: originals/);
+  assert.match(runner, /if \(policyServer\) await terminate\(policyServer\)/);
+  assert.match(runner, /await policyFixture\.close\(\)/);
+  assert.match(runner, /baselineProviderRequests: 3/);
 });
 
 test("fixture roots and URLs cannot escape the disposable loopback boundary", () => {

@@ -324,6 +324,30 @@ The SDK does not supply native abort signals to Promise callbacks. Plugin-owned 
 
 ### CP012 OpenCode delivery package
 
+#### Optional native user policy
+
+The v2 plugin accepts an optional absolute `options.userPolicyPath` alongside `options.configPath`. Omitting it preserves the existing plugin behavior. A present but invalid/unreadable profile retains blocking guards rather than enabling native fallback. Use a bundle built from this implementation: older delivery bundles do not implement this option.
+
+```json
+{
+  "version": 1,
+  "instructionFiles": [
+    "/absolute/shared/MEMORY.md",
+    "/absolute/shared/USER.md"
+  ],
+  "modelAllowlists": { "openrouter": ["google/gemini-3.8-flash"] },
+  "geminiOpenRouterToolGuard": true
+}
+```
+
+Explicit local instruction files are reread coherently for each normal context request and appended in array order after native global/project AGENTS. Missing, changing, invalid-UTF8 or oversized required files block that request; fixing the file allows a later request without reloading the profile. Policy settings themselves are loaded at plugin initialization. Native v1.18.29 upstream rereads instruction contents; a frozen per-session content snapshot is not assumed. Auxiliary title/generate requests are not projected by this context policy.
+
+Catalog transforms disable non-allowlisted models for each listed provider, without enabling otherwise disabled models. An all-request-kind dispatch guard also rejects forbidden selections: a later native config override may expose a model in the UI but cannot bypass this guard. Providers absent from the map are unaffected. This filters catalog IDs, not a claim about upstream routing aliases or account authorization.
+
+The tool guard quotes completed textual tool results containing `{` only for OpenRouter `google/` models. Multipart text is joined like the provider lowerer and encoded once, retaining file parts and surrounding metadata. Both this expansion and appended instructions occur before Reflection's planning and final hard-budget checks. Stored history, ingestion identities and source fingerprints are not rewritten. It is not an HTTP-after-budget workaround.
+
+`scripts/src/opencode-v2-config.ts` provides a pure, strict pinned-schema draft converter with field accounting, read-only definition mappings and value-free deferred credential slots. It preserves agent/model/permission/MCP settings rather than substituting deny-all or disabled placeholders. Its output is always non-activatable: bindings must be resolved privately against an unchanged reviewed input, with filesystem containment, credential provisioning and coordinated source/reader activation handled separately. Numeric MCP defaults are preserved, while progress-reset and legacy remote-transport parity remain explicit verification limits. The hosted Mac fixture exercises the opt-in profile separately from the unchanged baseline.
+
 This package is a delivery artifact and documentation only. It does not install a bundle, create a launcher, start or restart OpenCode, migrate a database, register a source, copy history, or adopt v2 in production.
 
 From a clean, tracked checkout, build both actual plugin bundles, independently verify their standalone imports, and publish one new directory outside the repository and outside the user home/config/data/service paths:
@@ -338,7 +362,7 @@ node scripts/package-opencode.mjs --out /absolute/operator-chosen/delivery
 
 The artifact contains only `v1/reflection.js`, native-discovery `v2/index.js`, `examples/`, and `manifest.json`; it does not include this repository, `node_modules`, a live v1 state/database, credentials, or a tar dependency. The manifest records the Git commit/tree, lockfile SHA-256, and byte size/SHA-256 for each delivered file. To independently inspect it, compare the bundle hashes and sizes in `manifest.json` with the two compiled source artifacts from the recorded commit.
 
-The example JSON files deliberately contain invalid placeholders. Preserve the existing real Reflection base URL and API key rather than guessing an API path from these examples. Manually edit absolute paths and credentials before any future operator-approved trial; do not render real keys, source URLs, or passwords through the packager. Each config's own source entry is required. Basic reader credentials are optional, and the operator must verify the authentication policy of the actual v1 `127.0.0.1:4096` endpoint before adding them. The v2 reader uses loopback port `4097` and placeholder basic credentials. Both configs retain stable, source-scoped IDs (`danny-opencode-v1` and `danny-opencode-v2`) while permitting independent URLs. `contextProjection.enabled` is required for the native config.
+The example JSON files deliberately contain invalid placeholders. Preserve the existing real Reflection base URL and API key rather than guessing an API path from these examples. Manually edit absolute paths and credentials before an operator-approved activation; do not render real keys, source URLs, or passwords through the packager. Each config's own source entry is required. The selected final layout is v1 at `127.0.0.1:4097` and v2 at `127.0.0.1:4096`; verify that the coordinated v1 port move actually occurred before using these maps. They do not move the current listener. Basic reader credentials are optional for v1 and require verification of its actual authentication policy; v2 has placeholder Basic credentials. Both configs retain stable IDs (`danny-opencode-v1` and `danny-opencode-v2`). Public hostname changes must not retarget historical local readers. `contextProjection.enabled` is required for the native config.
 
 For a future **internal trial only**, keep every v2 path separate from v1. For example, an operator may choose one private `<v2-root>` and manually set `HOME=<v2-root>/home`, `XDG_CONFIG_HOME=<v2-root>/config`, `XDG_DATA_HOME=<v2-root>/data`, `XDG_STATE_HOME=<v2-root>/state`, `XDG_CACHE_HOME=<v2-root>/cache`, `TMPDIR=<v2-root>/tmp`, and a separate workspace. Set both `OPENCODE_CONFIG=<v2-root>/config/opencode-v2.json` and `OPENCODE_CONFIG_DIR=<v2-root>/config/opencode`; point the native config at an absolute v2 bundle directory and the isolated Reflection v2 config. HOME isolation also hides global Git, SSH, and AGENT settings, so the operator must review that consequence before adoption. Keep `OPENCODE_PASSWORD` in the environment rather than a literal command argument or log. Do not copy/import a source database or automatically import old v1 history.
 

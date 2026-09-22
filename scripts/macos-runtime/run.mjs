@@ -36,6 +36,8 @@ import {
   SEED_TEXT,
   MARKER,
   PROMPT,
+  POLICY_SEED_TEXT,
+  toolContent,
 } from "./fixture.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -218,7 +220,12 @@ async function layout(directory) {
     await mkdir(join(directory, name), { recursive: true, mode: 0o700 });
 }
 
-async function config(directory, fixtureOrigin, password) {
+async function config(
+  directory,
+  fixtureOrigin,
+  password,
+  policyEnabled = false,
+) {
   await copyFile(
     join(repository, "packages/opencode-v2-plugin/dist/reflection-v2.js"),
     join(directory, "plugin/index.js"),
@@ -230,6 +237,34 @@ async function config(directory, fixtureOrigin, password) {
   await writeFile(join(directory, "provider-origin"), fixtureOrigin);
   await writeFile(join(directory, "seed-session"), "not-created");
   await writeFile(
+    join(directory, "seed-text"),
+    policyEnabled ? POLICY_SEED_TEXT : SEED_TEXT,
+  );
+  await writeFile(join(directory, "tool-results.json"), "[]");
+  if (policyEnabled) {
+    // Outside the workspace and native AGENTS roots: only Reflection reads these.
+    await mkdir(join(directory, "instructions"));
+    await writeFile(
+      join(directory, "instructions/MEMORY.md"),
+      "MEMORY_MACOS_INITIAL_SENTINEL\n",
+    );
+    await writeFile(
+      join(directory, "instructions/USER.md"),
+      "USER_MACOS_INSTRUCTION_SENTINEL\n",
+    );
+    await writeFile(
+      join(directory, "user-policy.json"),
+      JSON.stringify({
+        version: 1,
+        instructionFiles: ["MEMORY.md", "USER.md"].map((name) =>
+          join(directory, "instructions", name),
+        ),
+        modelAllowlists: { openrouter: ["google/fixture-model"] },
+        geminiOpenRouterToolGuard: true,
+      }),
+    );
+  }
+  await writeFile(
     join(directory, "opencode-config/AGENTS.md"),
     "GLOBAL_MACOS_INSTRUCTION_SENTINEL\n",
   );
@@ -240,7 +275,9 @@ async function config(directory, fixtureOrigin, password) {
   await writeFile(
     join(directory, "opencode-config/opencode.json"),
     JSON.stringify({
-      model: "fixture/fixture-model",
+      model: policyEnabled
+        ? "openrouter/google/fixture-model"
+        : "fixture/fixture-model",
       default_agent: "probe",
       update: "disable",
       share: "disabled",
@@ -258,7 +295,12 @@ async function config(directory, fixtureOrigin, password) {
       plugins: [
         {
           package: join(directory, "plugin"),
-          options: { configPath: join(directory, "reflection.json") },
+          options: {
+            configPath: join(directory, "reflection.json"),
+            ...(policyEnabled
+              ? { userPolicyPath: join(directory, "user-policy.json") }
+              : {}),
+          },
         },
         {
           package: join(directory, "observer"),
@@ -266,16 +308,39 @@ async function config(directory, fixtureOrigin, password) {
         },
       ],
       providers: {
-        fixture: {
-          package: "@opencode/ai/providers/openai-compatible",
+        [policyEnabled ? "openrouter" : "fixture"]: {
+          ...(policyEnabled
+            ? {}
+            : { package: "@opencode/ai/providers/openai-compatible" }),
           transport: "http",
           settings: { baseURL: `${fixtureOrigin}/v1`, apiKey: "fixture-only" },
           models: {
-            "fixture-model": {
+            [policyEnabled ? "google/fixture-model" : "fixture-model"]: {
               capabilities: { tools: true, input: ["text"], output: ["text"] },
               limit: { context: 32000, input: 28000, output: 2048 },
               transport: "http",
             },
+            ...(policyEnabled
+              ? {
+                  "google/fixture-forbidden": {
+                    capabilities: {
+                      tools: true,
+                      input: ["text"],
+                      output: ["text"],
+                    },
+                  },
+                  "google/fixture-late-override": {
+                    disabled: false,
+                    capabilities: {
+                      tools: true,
+                      input: ["text"],
+                      output: ["text"],
+                    },
+                    limit: { context: 32000, input: 28000, output: 2048 },
+                    transport: "http",
+                  },
+                }
+              : {}),
           },
         },
       },
@@ -442,7 +507,10 @@ try {
       );
     },
   );
-  fixture = createReflectionFixture();
+  fixture = createReflectionFixture({
+    readOriginals: async () =>
+      JSON.parse(await readFile(join(root, "tool-results.json"), "utf8")),
+  });
   const fixtureOrigin = await fixture.listen();
   fixture.setNative(origin, password);
   await config(root, fixtureOrigin, password);
@@ -703,6 +771,15 @@ try {
       assert.deepEqual(fixture.errors, []);
       const instructions = fixture.provider[0].instructions;
       assert.ok(
+        fixture.provider.every(
+          (item) => !item.policyEnabled && item.model === "fixture-model",
+        ),
+      );
+      assert.ok(
+        !instructions.includes("MEMORY_MACOS_") &&
+          !instructions.includes("USER_MACOS_INSTRUCTION_SENTINEL"),
+      );
+      assert.ok(
         instructions.includes("GLOBAL_MACOS_INSTRUCTION_SENTINEL"),
         "Global AGENTS not loaded",
       );
@@ -719,6 +796,336 @@ try {
         globalInstructions: true,
       };
       return session;
+    },
+  );
+  await phase(
+    "opt-in user policy native wire, fresh instructions and hard refusal",
+    async () => {
+      const policyRoot = join(root, "policy");
+      const policyOrigin = "http://127.0.0.1:4098";
+      await layout(policyRoot);
+      const originals = async () =>
+        JSON.parse(
+          await readFile(join(policyRoot, "tool-results.json"), "utf8"),
+        );
+      const policyFixture = createReflectionFixture({
+        policyEnabled: true,
+        readOriginals: originals,
+      });
+      let policyServer;
+      try {
+        const policyFixtureOrigin = await policyFixture.listen();
+        policyFixture.setNative(policyOrigin, password);
+        await config(policyRoot, policyFixtureOrigin, password, true);
+        const policyEnv = {
+          ...childEnvironment({ root: policyRoot, password }),
+          OPENCODE_CONFIG_PROJECT_DISABLE: "0",
+        };
+        const policySandbox = join(policyRoot, "sandbox.sb");
+        await writeFile(
+          policySandbox,
+          sandboxProfile(policyRoot, [
+            4098,
+            Number(new URL(policyFixtureOrigin).port),
+          ]),
+        );
+        await capture(
+          "/usr/bin/sandbox-exec",
+          [
+            "-f",
+            policySandbox,
+            "/usr/bin/git",
+            "init",
+            "--quiet",
+            join(policyRoot, "workspace"),
+          ],
+          {
+            env: policyEnv,
+            cwd: policyRoot,
+          },
+        );
+        policyServer = native(policyEnv, 4098, policySandbox);
+        await ready(policyOrigin, password, policyServer);
+        const location = new URLSearchParams({
+          "location[directory]": join(policyRoot, "workspace"),
+        });
+        await api(policyOrigin, password, `/integration?${location}`);
+        await api(
+          policyOrigin,
+          password,
+          `/integration/openrouter/connect/key?${location}`,
+          { key: "fixture-only", label: "Synthetic policy fixture" },
+        );
+        const catalog = (
+          await api(policyOrigin, password, `/model?${location}`)
+        ).data;
+        assert.ok(
+          catalog.some(
+            (model) =>
+              model.providerID === "openrouter" &&
+              model.id === "google/fixture-model" &&
+              model.enabled,
+          ),
+        );
+        assert.ok(
+          !catalog.some(
+            (model) =>
+              model.providerID === "openrouter" &&
+              model.id === "google/fixture-forbidden" &&
+              model.enabled,
+          ),
+        );
+        assert.ok(
+          catalog.some(
+            (model) =>
+              model.providerID === "openrouter" &&
+              model.id === "google/fixture-late-override" &&
+              model.enabled,
+          ),
+          "Late native override must be selectable to exercise hard refusal",
+        );
+        const newSession = async (id = "google/fixture-model") => {
+          const result = (
+            await api(policyOrigin, password, "/session", {
+              title: "Policy native fixture",
+              location: { directory: join(policyRoot, "workspace") },
+              model: { providerID: "openrouter", id },
+            })
+          ).data;
+          assert.equal(typeof result.id, "string");
+          return result;
+        };
+        const messages = async (id) =>
+          (
+            await api(
+              policyOrigin,
+              password,
+              `/session/${id}/message?limit=50&order=asc`,
+            )
+          ).data;
+        const prompt = async (id, text = PROMPT) => {
+          await api(policyOrigin, password, `/session/${id}/prompt`, {
+            text,
+            resume: true,
+          });
+          await api(
+            policyOrigin,
+            password,
+            `/experimental/session/${id}/wait`,
+            {},
+          );
+          return messages(id);
+        };
+        const policySeed = await newSession();
+        await writeFile(join(policyRoot, "seed-session"), policySeed.id);
+        const seedHistory = await prompt(policySeed.id, POLICY_SEED_TEXT);
+        assert.equal(policyFixture.provider.length, 0);
+        const { canonicalizeNativeHistory, nativeSegmentIdForRequest } =
+          await import(pathToFileURL(join(root, "oracle.mjs")));
+        const seedRecord = canonicalizeNativeHistory(seedHistory).find(
+          (record) => record.source.type === "user",
+        );
+        assert.ok(seedRecord?.complete);
+        assert.equal(seedRecord.source.text, POLICY_SEED_TEXT);
+        const boundary = {
+          source_id: SOURCE.id,
+          session_id: policySeed.id,
+          source_boundary_version: 3,
+          start_source_message_id: seedRecord.source.id,
+          end_source_message_id: seedRecord.source.id,
+        };
+        const segmentID = nativeSegmentIdForRequest(
+          {
+            ...boundary,
+            projection_version: 3,
+            processing_priority: 0,
+            messages: [seedRecord.source],
+          },
+          SOURCE,
+        );
+        const now = new Date().toISOString();
+        policyFixture.setSegment({
+          id: segmentID,
+          ...boundary,
+          summary: "Synthetic marker",
+          claims: [],
+          created_at: now,
+          updated_at: now,
+        });
+        const roundtrip = async (memory) => {
+          policyFixture.beginCase();
+          const before = policyFixture.provider.length;
+          const originalBefore = (await originals()).length;
+          const probe = await newSession();
+          const history = await prompt(probe.id);
+          const assistant = history
+            .filter((item) => item.type === "assistant")
+            .at(-1);
+          assert.ok(assistant && !assistant.error);
+          assert.equal(toolContent(assistant).trim(), MARKER);
+          const wire = policyFixture.provider.slice(before);
+          assert.deepEqual(
+            wire.map((item) => item.turn),
+            ["memory_search", "memory_read_segment", "final"],
+          );
+          for (const item of wire) {
+            const sentinels = [
+              "GLOBAL_MACOS_INSTRUCTION_SENTINEL",
+              "WORKSPACE_MACOS_INSTRUCTION_SENTINEL",
+              memory,
+              "USER_MACOS_INSTRUCTION_SENTINEL",
+            ];
+            let last = -1;
+            for (const sentinel of sentinels) {
+              assert.equal(
+                item.instructions.split(sentinel).length - 1,
+                1,
+                "Instruction must occur exactly once",
+              );
+              assert.ok(
+                item.instructions.indexOf(sentinel) > last,
+                "Instruction order mismatch",
+              );
+              last = item.instructions.indexOf(sentinel);
+            }
+            if (memory !== "MEMORY_MACOS_INITIAL_SENTINEL")
+              assert.ok(
+                !item.instructions.includes("MEMORY_MACOS_INITIAL_SENTINEL"),
+                "Stale instruction survived reread",
+              );
+          }
+          const raw = (await originals()).slice(originalBefore);
+          const stored = history
+            .filter((item) => item.type === "assistant")
+            .flatMap((item) => item.content)
+            .filter(
+              (part) =>
+                part.type === "tool" && part.state.status === "completed",
+            )
+            .map((part) => toolContent(part.state));
+          assert.deepEqual(
+            stored,
+            raw,
+            "Native stored tool history must remain unencoded",
+          );
+          assert.deepEqual(
+            wire.at(-1).toolContents,
+            raw.map((text) => JSON.stringify(text)),
+          );
+          assert.deepEqual(
+            await messages(policySeed.id),
+            seedHistory,
+            "Source native history changed",
+          );
+          assert.deepEqual(
+            canonicalizeNativeHistory(await messages(policySeed.id)),
+            canonicalizeNativeHistory(seedHistory),
+          );
+        };
+        await roundtrip("MEMORY_MACOS_INITIAL_SENTINEL");
+        await writeFile(
+          join(policyRoot, "instructions/MEMORY.md"),
+          "MEMORY_MACOS_CHANGED_SENTINEL\n",
+        );
+        await roundtrip("MEMORY_MACOS_CHANGED_SENTINEL");
+        const refuse = async (id, expected) => {
+          const before = policyFixture.requests.filter(
+            (item) => item.path === "/v1/chat/completions",
+          ).length;
+          await prompt(id);
+          // Context hooks can fail before an assistant message exists. The durable
+          // execution terminal is the native public failure contract in that case.
+          const response = await request(
+            policyOrigin,
+            `/api/experimental/session/${id}/log?follow=false`,
+            goodAuth(password),
+          );
+          assert.equal(response.status, 200);
+          const events = (await response.text())
+            .split(/\r?\n/)
+            .filter((line) => line.startsWith("data:"))
+            .map((line) => JSON.parse(line.slice(5)));
+          assert.ok(
+            events.some(
+              (event) =>
+                event.type === "session.execution.failed" &&
+                event.data.sessionID === id &&
+                event.data.error?.message.includes(expected),
+            ),
+            "Expected explicit policy refusal",
+          );
+          assert.equal(
+            policyFixture.requests.filter(
+              (item) => item.path === "/v1/chat/completions",
+            ).length,
+            before,
+            "Refusal dispatched provider request",
+          );
+          await ready(policyOrigin, password, policyServer);
+        };
+        await rm(join(policyRoot, "instructions/MEMORY.md"));
+        await refuse(
+          (await newSession()).id,
+          "Reflection: user policy instructions unavailable; request blocked",
+        );
+        await writeFile(
+          join(policyRoot, "instructions/MEMORY.md"),
+          "MEMORY_MACOS_CHANGED_SENTINEL\n",
+        );
+        await refuse(
+          (await newSession("google/fixture-late-override")).id,
+          "user policy forbids selected model",
+        );
+        await roundtrip("MEMORY_MACOS_CHANGED_SENTINEL");
+        assert.equal(policyFixture.provider.length, 9);
+        assert.equal(
+          fixture.provider.length,
+          3,
+          "Baseline remains raw and unchanged",
+        );
+        assert.deepEqual(policyFixture.errors, []);
+        assert.ok(
+          policyFixture.sourceRPC.some(
+            (item) =>
+              item.path === `/api/session/${policySeed.id}/message` &&
+              item.status === 200 &&
+              item.rawNativeHistory &&
+              item.exactSeedText,
+          ),
+        );
+        const observer = JSON.parse(
+          await readFile(join(policyRoot, "observer.json"), "utf8"),
+        );
+        assert.deepEqual(observer, {
+          setup: true,
+          onlyMemoryTools: true,
+          search: 3,
+          read: 3,
+          readExact: 3,
+          refused: 0,
+          primaryRequests: 9,
+        });
+        report.metadata.userPolicy = {
+          policyEnabled: true,
+          provider: "openrouter",
+          model: "google/fixture-model",
+          providerRequests: 9,
+          baselineProviderRequests: 3,
+          observer,
+          exactOnceWireEncoding: true,
+          storedHistoryUnchanged: true,
+          orderedInstructions: true,
+          freshInstructions: true,
+          missingFileRefused: true,
+          catalogFiltered: true,
+          lateOverrideRefused: true,
+          recoveryRoundtrip: true,
+        };
+      } finally {
+        if (policyServer) await terminate(policyServer);
+        await policyFixture.close();
+      }
+      await assertUnused(4098);
     },
   );
   await phase("strict loopback native listener", async () => {

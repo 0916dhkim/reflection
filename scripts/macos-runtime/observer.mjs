@@ -3,6 +3,7 @@ import { join } from "node:path";
 
 let root;
 const allowed = new Set(["memory_search", "memory_read_segment"]);
+const toolResults = [];
 const report = {
   setup: false,
   onlyMemoryTools: false,
@@ -50,6 +51,22 @@ export default {
       save();
     });
     await ctx.tool.hook("execute.after", (event) => {
+      if (allowed.has(event.tool) && event.status === "completed") {
+        const content = event.result.content;
+        toolResults.push(
+          typeof content === "string"
+            ? content
+            : content
+                .filter((part) => part.type === "text")
+                .map((part) => part.text)
+                .join(""),
+        );
+        writeFileSync(
+          join(root, "tool-results.json"),
+          JSON.stringify(toolResults),
+          { mode: 0o600 },
+        );
+      }
       if (
         event.tool === "memory_read_segment" &&
         event.status === "completed"
@@ -67,7 +84,7 @@ export default {
           value.source_id === "fixture-mac-v2" &&
           value.messages?.length === 1 &&
           value.messages[0].text ===
-            "The synthetic fixture marker is COBALT-17." &&
+            readFileSync(join(root, "seed-text"), "utf8") &&
           value.verification?.includes("deterministic segment ID")
         )
           report.readExact++;

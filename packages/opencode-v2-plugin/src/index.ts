@@ -1,4 +1,5 @@
-import { readFile } from "node:fs/promises";
+import { constants } from "node:fs";
+import { open, readFile } from "node:fs/promises";
 import { isAbsolute } from "node:path";
 import { Plugin } from "@opencode/plugin";
 import type { SessionContext } from "@opencode/plugin/promise/session";
@@ -30,6 +31,14 @@ import {
 import { Ingestion, warn } from "./ingestion.js";
 import { Operations, bounded } from "./operations.js";
 import {
+  applyModelAllowlist,
+  guardGeminiToolResults,
+  isUserModelAllowed,
+  parseUserPolicy,
+  readUserInstructionParts,
+  type UserPolicy,
+} from "./user-policy.js";
+import {
   WRAPPER_RESERVE,
   checkpoint,
   checkpointSchemaJson,
@@ -46,6 +55,12 @@ export async function setup(ctx: Plugin.Context) {
   const subscriptions = new AbortController();
   let http: Transport | undefined;
   let ingestion: Ingestion | undefined;
+  let userPolicy: UserPolicy | undefined;
+  let modelFilter: Awaited<ReturnType<typeof ctx.model.transform>> | undefined;
+  const instructionBases = new WeakMap<
+    SessionContext["system"],
+    SessionContext["system"]
+  >();
   let startupError =
     "Reflection: initializing mandatory projection; retry when source registry is ready";
   let ready = false;
@@ -77,6 +92,8 @@ export async function setup(ctx: Plugin.Context) {
   const dispatch = await ctx.session.hook("model.request", (event) =>
     operations.run(event.sessionID, async (signal) => {
       const { http } = await requireReady(signal);
+      if (userPolicy && !isUserModelAllowed(userPolicy, event.model))
+        throw new Error("Reflection: user policy forbids selected model");
       if (event.kind === "compaction")
         throw new Error(
           "Reflection owns compaction; native checkpoint forbidden",
@@ -239,6 +256,31 @@ export async function setup(ctx: Plugin.Context) {
   async function project(event: SessionContext, signal: AbortSignal) {
     try {
       const { http, ingestion } = await requireReady(signal);
+      let requestSystem = event.system;
+      let requestMessages: readonly SessionContext["messages"][number][] =
+        event.messages;
+      const baseSystem = instructionBases.get(event.system) ?? event.system;
+      if (userPolicy) {
+        if (!isUserModelAllowed(userPolicy, event.model))
+          throw new Error("Reflection: user policy forbids selected model");
+        try {
+          const parts = await bounded(
+            readUserInstructionParts(userPolicy, signal),
+            signal,
+          );
+          signal.throwIfAborted();
+          requestSystem = [...baseSystem, ...parts];
+          requestMessages = guardGeminiToolResults(
+            event.messages,
+            event.model,
+            userPolicy.geminiOpenRouterToolGuard,
+          );
+        } catch {
+          throw new Error(
+            "Reflection: user policy instructions unavailable; request blocked",
+          );
+        }
+      }
       const source = await http.source(http.config.sourceId, signal);
       const snapshot = await http.snapshot(
         source,
@@ -365,14 +407,14 @@ export async function setup(ctx: Plugin.Context) {
           segments = planNativeSegments(segmentInput);
         }
       } else segments = planNativeSegments(segmentInput);
-      const system = estimationValue(event.system);
+      const system = estimationValue(requestSystem);
       const toolBudget = estimationValue(event.tools);
       const input = {
         source,
         sessionId: event.sessionID,
         records: snapshot.records,
         segments,
-        messages: estimateMessages(event.messages),
+        messages: estimateMessages(requestMessages),
         system: [system, WRAPPER_RESERVE],
         tools: toolBudget,
         contextLimit: model.limit.context,
@@ -432,7 +474,7 @@ export async function setup(ctx: Plugin.Context) {
           manifest,
           manifestUnavailable: !manifestAvailable,
         });
-      const messages = materialize(plan, event.messages);
+      const messages = materialize(plan, requestMessages);
       const usable = Math.min(
         model.limit.input ?? model.limit.context,
         model.limit.context - output,
@@ -452,6 +494,10 @@ export async function setup(ctx: Plugin.Context) {
       } else if (stored !== undefined)
         await bounded(ctx.storage.remove(key(event.sessionID)), signal);
       signal.throwIfAborted();
+      if (userPolicy) {
+        instructionBases.set(requestSystem, baseSystem);
+        event.system = requestSystem;
+      }
       event.messages = messages;
       if (plan.lossy)
         warn(
@@ -474,6 +520,81 @@ export async function setup(ctx: Plugin.Context) {
         throw new Error(
           "Reflection: unsupported OpenCode host version; exactly 2.0.8 is required; native fallback forbidden",
         );
+      if (Object.hasOwn(ctx.options, "userPolicyPath")) {
+        try {
+          const path = ctx.options.userPolicyPath;
+          if (typeof path !== "string" || !isAbsolute(path)) throw new Error();
+          // Bound caller waits, not kernel IO. Late acquisitions still need cleanup.
+          const opening = open(path, constants.O_RDONLY | constants.O_NONBLOCK);
+          let handle: Awaited<typeof opening> | undefined;
+          try {
+            handle = await bounded(opening, signal);
+            signal.throwIfAborted();
+            const before = await bounded(handle.stat({ bigint: true }), signal);
+            // Cap actual reads as well as stat size, including a growing file.
+            const maxBytes = 1024 * 1024;
+            if (!before.isFile() || before.size > BigInt(maxBytes))
+              throw new Error();
+            const bytes = Buffer.alloc(maxBytes + 1);
+            let length = 0;
+            while (length < bytes.length) {
+              signal.throwIfAborted();
+              const { bytesRead } = await bounded(
+                handle.read(bytes, length, bytes.length - length, length),
+                signal,
+              );
+              if (!bytesRead) break;
+              length += bytesRead;
+            }
+            const after = await bounded(handle.stat({ bigint: true }), signal);
+            signal.throwIfAborted();
+            if (
+              length > maxBytes ||
+              BigInt(length) !== before.size ||
+              after.size !== before.size ||
+              after.mtimeNs !== before.mtimeNs ||
+              after.ctimeNs !== before.ctimeNs
+            )
+              throw new Error();
+            userPolicy = parseUserPolicy(
+              JSON.parse(
+                new TextDecoder("utf-8", { fatal: true }).decode(
+                  bytes.subarray(0, length),
+                ),
+              ) as unknown,
+            );
+          } finally {
+            if (handle) await bounded(handle.close(), signal);
+            else void opening.then((late) => late.close()).catch(() => {});
+          }
+          signal.throwIfAborted();
+          const policy = userPolicy;
+          const registration = ctx.model.transform((editor) => {
+            if (signal.aborted || operations.stopped) return;
+            applyModelAllowlist(policy, {
+              list: () =>
+                editor.list().map((model) => ({
+                  id: String(model.id),
+                  providerID: String(model.providerID),
+                })),
+              update: (providerID, modelID, update) =>
+                editor.update(providerID, modelID, update),
+            });
+          });
+          try {
+            modelFilter = await bounded(registration, signal);
+            signal.throwIfAborted();
+          } catch (error) {
+            modelFilter = undefined;
+            void registration.then((late) => late.dispose()).catch(() => {});
+            throw error;
+          }
+        } catch {
+          throw new Error(
+            "Reflection: user policy unavailable or invalid; reload required",
+          );
+        }
+      }
       const configPath = ctx.options.configPath;
       if (typeof configPath !== "string" || !isAbsolute(configPath))
         throw new Error(
@@ -579,12 +700,15 @@ export async function setup(ctx: Plugin.Context) {
     await operations.dispose();
     await initialization;
     await bounded(eventTask, AbortSignal.timeout(5000)).catch(() => {});
+    const filter = modelFilter;
+    modelFilter = undefined;
     await bounded(
       Promise.all([
         context.dispose(),
         compaction.dispose(),
         dispatch.dispose(),
         tools.dispose(),
+        filter?.dispose(),
       ]),
       AbortSignal.timeout(5000),
     );

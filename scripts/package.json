@@ -9,6 +9,8 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@opencode/schema": "2.0.8",
+    "effect": "4.0.0-rc.112",
     "@reflection/shared": "workspace:*"
   },
   "devDependencies": {

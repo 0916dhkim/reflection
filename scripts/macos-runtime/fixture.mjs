@@ -1,4 +1,5 @@
 import { createServer } from "node:http";
+import { assertLoopbackUrl } from "./guards.mjs";
 
 export const SOURCE = {
   id: "fixture-mac-v2",
@@ -7,25 +8,46 @@ export const SOURCE = {
 };
 export const MARKER = "COBALT-17";
 export const SEED_TEXT = `The synthetic fixture marker is ${MARKER}.`;
+export const POLICY_SEED_TEXT = `${SEED_TEXT} PREFIX{}SUFFIX ${JSON.stringify({ $ref: "#/fixture", nested: JSON.stringify({ text: 'escaped "quote" and \\slash' }) })}`;
 export const PROMPT =
   "Search Reflection for the synthetic fixture marker, read the returned citation, and return only the marker from the exact source.";
 export const TITLE = "macOS native Reflection fixture";
 
-function toolResult(message) {
-  const content =
-    typeof message.content === "string"
-      ? message.content
-      : message.content
-          ?.filter((part) => part.type === "text")
-          .map((part) => part.text)
-          .join("");
-  return JSON.parse(content);
+export function toolContent(message) {
+  return typeof message.content === "string"
+    ? message.content
+    : message.content
+        ?.filter((part) => part.type === "text")
+        .map((part) => part.text)
+        .join("");
+}
+
+export function toolResult(message, policyEnabled = false, original) {
+  const content = toolContent(message);
+  const raw = policyEnabled ? JSON.parse(content) : content;
+  if (
+    typeof raw !== "string" ||
+    (policyEnabled && content !== JSON.stringify(raw))
+  )
+    throw Error("Expected exactly one tool text encoding layer");
+  if (original !== undefined && raw !== original)
+    throw Error("Tool text differs from original stored result");
+  const value = JSON.parse(raw);
+  if (!value || typeof value !== "object" || Array.isArray(value))
+    throw Error("Expected raw tool JSON object");
+  return value;
 }
 
 // Each request completes exactly one assistant turn. Tool arguments come from
 // the actual prior tool response, never from out-of-band fixture constants.
-export function completionTurn(body) {
-  if (body.model !== "fixture-model" || body.stream !== true)
+export function completionTurn(
+  body,
+  { policyEnabled = false, originals } = {},
+) {
+  if (
+    body.model !== (policyEnabled ? "google/fixture-model" : "fixture-model") ||
+    body.stream !== true
+  )
     throw Error("Invalid provider request");
   const names = body.tools?.map((tool) => tool.function?.name).sort();
   if (
@@ -34,35 +56,38 @@ export function completionTurn(body) {
   )
     throw Error("Unexpected tool registry");
   const tools = body.messages.filter((message) => message.role === "tool");
+  const results = tools.map((message, index) =>
+    toolResult(message, policyEnabled, originals?.[index]),
+  );
   if (tools.length === 0)
     return {
       name: "memory_search",
       arguments: { query: "synthetic fixture marker" },
     };
   if (tools.length === 1) {
-    const citation = toolResult(tools[0]).claims?.[0]?.segments?.[0];
+    const citation = results[0].claims?.[0]?.segments?.[0];
     if (!citation?.source_id || !citation?.segment_id)
       throw Error("Missing actual search citation");
     return { name: "memory_read_segment", arguments: citation };
   }
   if (tools.length !== 2) throw Error("Unexpected provider step count");
-  const read = toolResult(tools[1]);
+  const read = results[1];
   if (
     read.source_id !== SOURCE.id ||
     read.messages?.length !== 1 ||
-    read.messages[0].text !== SEED_TEXT ||
+    read.messages[0].text !== (policyEnabled ? POLICY_SEED_TEXT : SEED_TEXT) ||
     !read.verification?.includes("deterministic segment ID")
   )
     throw Error("Exact native read not verified");
   return { text: read.messages[0].text.match(/is ([A-Z]+-\d+)\./)[1] };
 }
 
-export function completionChunks(turn, index) {
+export function completionChunks(turn, index, model = "fixture-model") {
   const base = {
     id: `chatcmpl-fixture-${index}`,
     object: "chat.completion.chunk",
     created: 1,
-    model: "fixture-model",
+    model,
   };
   const delta = turn.name
     ? {
@@ -95,13 +120,18 @@ export function completionChunks(turn, index) {
   ];
 }
 
-export function createReflectionFixture() {
+export function createReflectionFixture({
+  policyEnabled = false,
+  readOriginals,
+} = {}) {
   const requests = [];
   const provider = [];
   const errors = [];
   const sourceRPC = [];
   let native;
   let segment;
+  let caseStart = 0;
+  let originalStart = 0;
   const server = createServer(async (request, response) => {
     const send = (status, value) =>
       response
@@ -148,6 +178,13 @@ export function createReflectionFixture() {
                 typeof item.type === "string" &&
                 item.info === undefined,
             ),
+          exactSeedText:
+            url.pathname.endsWith("/message") &&
+            value.data?.some(
+              (item) =>
+                item.type === "user" &&
+                item.text === (policyEnabled ? POLICY_SEED_TEXT : SEED_TEXT),
+            ),
         });
         return send(upstream.status, value);
       }
@@ -158,10 +195,30 @@ export function createReflectionFixture() {
         if (request.headers.authorization !== "Bearer fixture-only")
           return send(403, {});
         const body = JSON.parse(Buffer.concat(chunks).toString());
-        if (provider.length >= 3) throw Error("Provider budget exceeded");
-        const turn = completionTurn(body);
+        if (
+          provider.length >= (policyEnabled ? 9 : 3) ||
+          provider.length - caseStart >= 3
+        )
+          throw Error("Provider budget exceeded");
+        const originals = readOriginals
+          ? (await readOriginals()).slice(originalStart)
+          : undefined;
+        const toolCount = body.messages.filter(
+          (message) => message.role === "tool",
+        ).length;
+        if (
+          toolCount !== provider.length - caseStart ||
+          (originals && originals.length !== toolCount)
+        )
+          throw Error("Provider/tool observation step mismatch");
+        const turn = completionTurn(body, { policyEnabled, originals });
         provider.push({
           turn: turn.name ?? "final",
+          policyEnabled,
+          model: body.model,
+          toolContents: body.messages
+            .filter((message) => message.role === "tool")
+            .map(toolContent),
           instructions: JSON.stringify(
             body.messages.filter(
               (message) =>
@@ -173,7 +230,7 @@ export function createReflectionFixture() {
           "content-type": "text/event-stream",
           "cache-control": "no-cache",
         });
-        for (const chunk of completionChunks(turn, provider.length))
+        for (const chunk of completionChunks(turn, provider.length, body.model))
           response.write(`data: ${JSON.stringify(chunk)}\n\n`);
         return response.end("data: [DONE]\n\n");
       }
@@ -245,7 +302,14 @@ export function createReflectionFixture() {
     provider,
     errors,
     sourceRPC,
+    beginCase() {
+      caseStart = provider.length;
+      originalStart = (provider.length / 3) * 2;
+      if (!Number.isInteger(originalStart))
+        throw Error("Incomplete prior fixture case");
+    },
     setNative(origin, password) {
+      assertLoopbackUrl(origin);
       native = {
         origin,
         authorization: `Basic ${Buffer.from(`opencode:${password}`).toString("base64")}`,
