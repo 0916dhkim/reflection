@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { realpath } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -107,7 +108,8 @@ export async function main(arguments_ = process.argv.slice(2)) {
 
 if (
   process.argv[1] &&
-  resolve(process.argv[1]) === fileURLToPath(import.meta.url)
+  (await realpath(resolve(process.argv[1])).catch(() => undefined)) ===
+    fileURLToPath(import.meta.url)
 ) {
   main().catch((error) => {
     process.stderr.write(

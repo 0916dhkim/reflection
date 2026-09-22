@@ -1,4 +1,6 @@
 import { createHash } from "node:crypto";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import { EventEmitter } from "node:events";
 import * as fs from "node:fs/promises";
 import { appendFileSync, constants } from "node:fs";
@@ -166,6 +168,26 @@ afterEach(async () => {
 });
 
 describe("isolated preparation and mock-only launch", () => {
+  it.each(["prepare", "launch"])(
+    "runs the %s CLI argument guard through a symlink alias",
+    async (name) => {
+      const v = await fixture();
+      const alias = join(v.base, `${name}-alias.mjs`);
+      await fs.symlink(
+        fileURLToPath(new URL(`../instance/${name}.mjs`, import.meta.url)),
+        alias,
+      );
+      // No valid flags: only the Node CLI argument guard runs, never native code.
+      await expect(
+        promisify(execFile)(process.execPath, [alias], { timeout: 5000 }),
+      ).rejects.toMatchObject({
+        code: 1,
+        stdout: "",
+        stderr: `instance-${name === "prepare" ? "prepare" : "launch"}: E_ARGUMENT\n`,
+      });
+      await expect(fs.lstat(v.root)).rejects.toMatchObject({ code: "ENOENT" });
+    },
+  );
   it("uses the fixed public pnpm executable directory and private writable tool state", () => {
     vi.stubEnv("PATH", "/untrusted/bin");
     vi.stubEnv("PNPM_HOME", "/untrusted/pnpm");
