@@ -1,7 +1,9 @@
 import { randomUUID } from "node:crypto";
 import { execFile, execFileSync } from "node:child_process";
 import { promisify } from "node:util";
-import { readFile } from "node:fs/promises";
+import { readFile, mkdtemp, readdir, copyFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import {
@@ -35,6 +37,108 @@ import {
 } from "../src/extraction-validation.js";
 import { createApp } from "../src/app.js";
 import { loadSettings } from "../src/config.js";
+import {
+  nativeSourceFingerprint,
+  nativeProjectionFingerprint,
+  nativeSegmentIdForRequest,
+  parseNativeSegmentCreate,
+  type NativeSegmentCreate,
+} from "@reflection/shared/native";
+import {
+  parseIngestJobResponse,
+  parseIngestSegmentResponse,
+  parseIngestSessionSegmentsResponse,
+} from "@reflection/shared/ingestion";
+import type { PreparedSegment as IngestPreparedSegment } from "../src/ingestion.js";
+
+const NATIVE_SOURCE = {
+  id: "native-source",
+  kind: "opencode-v2",
+  identity_scheme: "source-v1",
+} as const;
+function nativeRequest(): NativeSegmentCreate {
+  return parseNativeSegmentCreate({
+    source_id: NATIVE_SOURCE.id,
+    session_id: "native-session",
+    source_boundary_version: 3,
+    start_source_message_id: "m0",
+    end_source_message_id: "m10",
+    projection_version: 3,
+    processing_priority: 50,
+    messages: [
+      "system",
+      "user",
+      "assistant",
+      "synthetic",
+      "shell",
+      "skill",
+      "compaction",
+      "idle",
+      "agent-switched",
+      "model-switched",
+      "location-switched",
+    ].map((type, index) => ({
+      id: `m${index}`,
+      type,
+      text: `Unicode 😀 é 漢字 : ${index}\n"quoted"`,
+    })),
+  });
+}
+function nativePrepared(
+  claim: ClaimedJob,
+  summary: string,
+): IngestPreparedSegment {
+  if (claim.request.source_boundary_version !== 3)
+    throw new Error("expected native claim");
+  const entityId = randomUUID();
+  return {
+    id: claim.segmentId,
+    sessionId: claim.request.session_id,
+    sourceBoundaryVersion: 3,
+    startSourceMessageId: claim.request.start_source_message_id,
+    endSourceMessageId: claim.request.end_source_message_id,
+    projectionVersion: 3,
+    summary,
+    entities: [
+      {
+        id: entityId,
+        canonicalName: "Native source",
+        normalizedName: "native source",
+        description: "Native source",
+        aliases: [],
+        embedding: EMBEDDING,
+        isNew: true,
+      },
+    ],
+    claims: [
+      {
+        id: randomUUID(),
+        subject: "Native source",
+        subjectEntityId: entityId,
+        predicate: "preserves",
+        confidence: 1,
+        objectEntity: null,
+        objectEntityId: null,
+        objectValue: "machine events",
+        equivalenceKey: equivalenceKey(entityId, "preserves", {
+          objectEntityId: null,
+          objectValue: "machine events",
+        }),
+        embedding: EMBEDDING,
+      },
+    ],
+  };
+}
+async function openNativeDatabase() {
+  const database = new Database(settings());
+  await openDatabase(database);
+  await truncate(database);
+  await database.pool.query(
+    "INSERT INTO reflection_sources VALUES ($1, 'opencode-v2', 'source-v1') ON CONFLICT DO NOTHING",
+    [NATIVE_SOURCE.id],
+  );
+  return database;
+}
 
 type DatabaseSettings = ConstructorParameters<typeof Database>[0];
 
@@ -112,6 +216,8 @@ function updateRequest(
 }
 
 function emptyPrepared(claimed: ClaimedJob, summary: string): PreparedSegment {
+  if (claimed.request.source_boundary_version === 3)
+    throw new Error("expected legacy claim");
   return {
     id: claimed.segmentId,
     sessionId: claimed.request.session_id,
@@ -137,6 +243,8 @@ function preparedSegment(
     entitiesAreNew: boolean;
   },
 ): PreparedSegment {
+  if (claimed.request.source_boundary_version === 3)
+    throw new Error("expected legacy claim");
   return {
     id: claimed.segmentId,
     sessionId: claimed.request.session_id,
@@ -257,6 +365,814 @@ async function within<T>(
 }
 
 describe.sequential("Database PostgreSQL integration", () => {
+  test("009-only operator fixtures remain legacy until native schema expansion and index preparation", async () => {
+    const directory = await mkdtemp(
+      join(tmpdir(), "reflection-cp009-migrations-"),
+    );
+    const database = new Database(settings());
+    const run = (...args: string[]) =>
+      execFileSync(
+        process.execPath,
+        [
+          fileURLToPath(
+            new URL("../../scripts/source-ownership.mjs", import.meta.url),
+          ),
+          ...args,
+        ],
+        {
+          env: {
+            ...process.env,
+            DATABASE_URL: databaseUrl(),
+            MIGRATIONS_DIR: directory,
+          },
+        },
+      );
+    try {
+      await database.pool.query(
+        "DROP SCHEMA public CASCADE; CREATE SCHEMA public",
+      );
+      for (const name of await readdir(MIGRATIONS_DIR)) {
+        if (/^00[1-9]_.*\.sql$/.test(name))
+          await copyFile(join(MIGRATIONS_DIR, name), join(directory, name));
+      }
+      run("expand");
+      expect(
+        (
+          await database.pool.query(
+            "SELECT name FROM reflection_schema_migrations",
+          )
+        ).rows,
+      ).toHaveLength(9);
+      run("install-indexes");
+      expect(
+        (
+          await database.pool.query(
+            "SELECT to_regclass('segments_source_v3_start_key') AS index",
+          )
+        ).rows[0].index,
+      ).toBeNull();
+      run("cutover", "--old-writers-stopped");
+      await expect(database.open()).rejects.toThrow(
+        "source indexes are not ready",
+      );
+      expect(
+        (
+          await database.pool.query(
+            "SELECT name FROM reflection_schema_migrations",
+          )
+        ).rows,
+      ).toHaveLength(10);
+      expect(
+        (
+          await database.pool.query(`SELECT convalidated FROM pg_constraint
+        WHERE conname IN ('segments_source_boundary_check', 'extraction_jobs_source_boundary_check', 'segment_targets_source_boundary_check')`)
+        ).rows,
+      ).toEqual([
+        { convalidated: false },
+        { convalidated: false },
+        { convalidated: false },
+      ]);
+      run("install-indexes");
+      expect(
+        (
+          await database.pool.query(`SELECT convalidated FROM pg_constraint
+        WHERE conname IN ('segments_source_boundary_check', 'extraction_jobs_source_boundary_check', 'segment_targets_source_boundary_check')`)
+        ).rows,
+      ).toEqual([
+        { convalidated: true },
+        { convalidated: true },
+        { convalidated: true },
+      ]);
+      await database.open();
+    } finally {
+      await database.close();
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("boundary validation allows legacy DML and cannot be bypassed by ready indexes", async () => {
+    const database = new Database(settings());
+    await openDatabase(database);
+    const validator = await database.pool.connect();
+    const tables = ["segments", "extraction_jobs", "segment_targets"];
+    try {
+      await truncate(database);
+      for (const table of tables) {
+        const name = `${table}_source_boundary_check`;
+        const definition = (
+          await database.pool.query(
+            "SELECT pg_get_constraintdef(oid) AS definition FROM pg_constraint WHERE conrelid=$1::regclass AND conname=$2",
+            [table, name],
+          )
+        ).rows[0].definition;
+        await database.pool.query(
+          `ALTER TABLE ${table} DROP CONSTRAINT ${name}, ADD CONSTRAINT ${name} ${definition} NOT VALID`,
+        );
+        await expect(database.open()).rejects.toThrow(
+          "source boundary checks are not validated",
+        );
+      }
+      await validator.query(
+        "BEGIN; SET LOCAL lock_timeout='1s'; SET LOCAL statement_timeout='2s'",
+      );
+      for (const table of tables)
+        await validator.query(
+          `ALTER TABLE ${table} VALIDATE CONSTRAINT ${table}_source_boundary_check`,
+        );
+      const locks = (
+        await validator.query(`SELECT mode FROM pg_locks WHERE pid=pg_backend_pid()
+        AND relation IN ('segments'::regclass, 'extraction_jobs'::regclass, 'segment_targets'::regclass)
+        AND locktype='relation' AND granted`)
+      ).rows;
+      expect(locks).toHaveLength(3);
+      expect(
+        locks.every((row) => row.mode === "ShareUpdateExclusiveLock"),
+      ).toBe(true);
+
+      // Hold the validator's actual relation locks until rollback while another
+      // connection writes legacy rows through every affected table.
+      await within(
+        (async () => {
+          const source = {
+            ...request({
+              session_id: "online-validation",
+              start_user_message_id: "start",
+              end_user_message_id: "end",
+              projection_version: 2,
+              messages: [{ role: "user", text: "legacy writes continue" }],
+            }),
+            source_id: SOURCE_ID,
+          };
+          const job = await database.enqueue(source);
+          const claim = required(
+            await withClient(database, (client) =>
+              database.claimOldestJob(client),
+            ),
+          );
+          expect(
+            await completeResolution(
+              database,
+              claim,
+              emptyPrepared(claim, "Legacy summary"),
+            ),
+          ).toBe(true);
+          expect(
+            await database.getSegment(SOURCE_ID, job.segment_id),
+          ).toMatchObject({ summary: "Legacy summary" });
+          await expect(
+            database.pool.query(
+              "UPDATE segments SET source_boundary_version=4 WHERE id=$1",
+              [job.segment_id],
+            ),
+          ).rejects.toMatchObject({ code: "23514" });
+        })(),
+        2000,
+      );
+      await validator.query("ROLLBACK");
+      await expect(database.open()).rejects.toThrow(
+        "source boundary checks are not validated",
+      );
+      execFileSync(
+        process.execPath,
+        [
+          fileURLToPath(
+            new URL("../../scripts/source-ownership.mjs", import.meta.url),
+          ),
+          "install-indexes",
+        ],
+        { env: { ...process.env, DATABASE_URL: databaseUrl() } },
+      );
+      await database.open();
+    } finally {
+      await validator.query("ROLLBACK");
+      validator.release();
+      await database.close();
+    }
+  });
+
+  test("native indexes are explicit startup prerequisites and isolate identical source cursors", async () => {
+    const database = await openNativeDatabase();
+    try {
+      for (const name of [
+        "segments_source_v3_start_key",
+        "extraction_jobs_source_v3_boundary_key",
+      ]) {
+        await database.pool.query(`DROP INDEX ${name}`);
+        await expect(database.open()).rejects.toThrow(
+          "source indexes are not ready",
+        );
+        execFileSync(
+          process.execPath,
+          [
+            fileURLToPath(
+              new URL("../../scripts/source-ownership.mjs", import.meta.url),
+            ),
+            "install-indexes",
+          ],
+          { env: { ...process.env, DATABASE_URL: databaseUrl() } },
+        );
+        await database.open();
+      }
+      const other = { ...NATIVE_SOURCE, id: "native-other" };
+      await database.pool.query(
+        "INSERT INTO reflection_sources VALUES ($1, 'opencode-v2', 'source-v1') ON CONFLICT DO NOTHING",
+        [other.id],
+      );
+      const first = nativeRequest();
+      const second = { ...first, source_id: other.id };
+      const [a, b] = await Promise.all([
+        database.enqueue(first),
+        database.enqueue(second),
+      ]);
+      expect(a.segment_id).not.toBe(b.segment_id);
+      expect(a.source_fingerprint).not.toBe(b.source_fingerprint);
+      expect(await database.getJob(first.source_id, b.id)).toBeNull();
+      expect(await database.getJob(second.source_id, a.id)).toBeNull();
+      expect(
+        (
+          await database.sessionSegmentListing(
+            first.source_id,
+            first.session_id,
+          )
+        )[2].map((t) => t.id),
+      ).toEqual([a.segment_id]);
+      expect(
+        (
+          await database.sessionSegmentListing(
+            second.source_id,
+            second.session_id,
+          )
+        )[2].map((t) => t.id),
+      ).toEqual([b.segment_id]);
+      const claim = required(
+        await withClient(database, (c) =>
+          database.claimOldestJob(c, [
+            { sourceId: first.source_id, sessionId: first.session_id },
+          ]),
+        ),
+      );
+      expect(claim.sourceId).toBe(second.source_id);
+      expect(claim.request).toEqual(second);
+      const extraction = validatedExtractionResult({
+        summary: "Source fenced",
+        claims: [],
+      });
+      await expect(
+        database.publishExtraction(
+          { ...claim, sourceId: first.source_id, request: first },
+          extraction,
+        ),
+      ).rejects.toThrow();
+      expect(await database.publishExtraction(claim, extraction)).toBe(true);
+      expect(
+        await database.segmentSummaries(first.source_id, first.session_id),
+      ).toEqual([]);
+      expect(
+        await database.segmentSummaries(second.source_id, second.session_id),
+      ).toHaveLength(1);
+    } finally {
+      await database.close();
+    }
+  });
+
+  test("native fingerprints match SQL UTF-8 framing, types, order, sources, and projections", async () => {
+    const database = await openNativeDatabase();
+    try {
+      const golden = parseNativeSegmentCreate({
+        source_id: "source-a",
+        session_id: "session😀",
+        source_boundary_version: 3,
+        start_source_message_id: "m😀-1",
+        end_source_message_id: "m2",
+        projection_version: 3,
+        processing_priority: 0,
+        messages: [
+          { id: "m😀-1", type: "user", text: "  hi 😀\n" },
+          { id: "m2", type: "synthetic", text: "" },
+        ],
+      });
+      expect(nativeSourceFingerprint(golden)).toBe(
+        "eaab4957c25565e7a89822598f22b86ea6ae45e2cf82af91b6a57354e1194b4b",
+      );
+      const base = nativeRequest();
+      const variants = [
+        base,
+        golden,
+        { ...base, source_id: "another-source" },
+        { ...base, session_id: "other:session" },
+        {
+          ...base,
+          messages: base.messages.map((m, i) =>
+            i === 3 ? { ...m, type: "user" as const } : m,
+          ),
+        },
+        {
+          ...base,
+          messages: base.messages.map((m, i) =>
+            i === 3 ? { ...m, text: `${m.text}:changed` } : m,
+          ),
+        },
+        {
+          ...base,
+          messages: [
+            base.messages[0]!,
+            base.messages[2]!,
+            base.messages[1]!,
+            ...base.messages.slice(3),
+          ],
+        },
+      ];
+      const fingerprints = new Set<string>();
+      for (const value of variants) {
+        const row = (
+          await database.pool.query(
+            `SELECT reflection_source_fingerprint($1,$2,NULL,NULL,3,$3,$4,$5::jsonb) AS fingerprint`,
+            [
+              value.source_id,
+              value.session_id,
+              value.start_source_message_id,
+              value.end_source_message_id,
+              JSON.stringify(value),
+            ],
+          )
+        ).rows[0];
+        expect(row.fingerprint).toBe(nativeSourceFingerprint(value));
+        fingerprints.add(row.fingerprint);
+      }
+      expect(fingerprints.size).toBe(variants.length);
+      const id = nativeSegmentIdForRequest(base, NATIVE_SOURCE);
+      expect(
+        nativeSegmentIdForRequest(variants[2]!, {
+          ...NATIVE_SOURCE,
+          id: variants[2]!.source_id,
+        }),
+      ).not.toBe(id);
+      for (const summary of [
+        "Summary",
+        "Unicode 😀 漢字 é:2:3",
+        "",
+        "line\nline",
+      ]) {
+        const row = (
+          await database.pool.query(
+            "SELECT reflection_projection_fingerprint($1::uuid,3,NULL,$2,$3,3) AS fingerprint",
+            [id, base.end_source_message_id, summary],
+          )
+        ).rows[0];
+        expect(row.fingerprint).toBe(
+          nativeProjectionFingerprint(
+            id,
+            base.end_source_message_id,
+            summary,
+            3,
+          ),
+        );
+      }
+    } finally {
+      await database.close();
+    }
+  });
+
+  test("native HTTP enqueue, staged manifest, commit, recall, and replacement preserve SQL NULL boundaries", async () => {
+    const database = await openNativeDatabase();
+    const app = createApp({
+      settings: loadSettings({
+        DATABASE_URL: databaseUrl(),
+        REFLECTION_API_KEY: "test-key",
+        OPENROUTER_API_KEY: "synthetic",
+        VOYAGE_API_KEY: "synthetic",
+        MIGRATIONS_DIR,
+      }),
+      dependencies: {
+        database,
+        worker: { start() {}, stop: async () => {}, wake() {} },
+        searchService: { search: async () => ({ claims: [] }) },
+      },
+      logger: false,
+    });
+    const headers = { "x-api-key": "test-key" };
+    try {
+      const source = nativeRequest();
+      const manifestUrl = `/v1/sessions/${source.session_id}/segments?source_id=${source.source_id}`;
+      const emptyNative = await app.inject({ url: manifestUrl, headers });
+      expect(emptyNative.statusCode).toBe(200);
+      expect(
+        parseIngestSessionSegmentsResponse(
+          emptyNative.json(),
+          source.source_id,
+        ),
+      ).toEqual({
+        source_id: source.source_id,
+        session_id: source.session_id,
+        manifest_version: 3,
+        segments: [],
+        boundaries: [],
+        targets: [],
+      });
+      const emptyLegacy = await app.inject({
+        url: `/v1/sessions/${source.session_id}/segments?source_id=${SOURCE_ID}`,
+        headers,
+      });
+      expect(emptyLegacy.statusCode).toBe(200);
+      expect(
+        parseIngestSessionSegmentsResponse(emptyLegacy.json(), SOURCE_ID)
+          .manifest_version,
+      ).toBe(2);
+      expect(
+        (
+          await app.inject({
+            url: `/v1/sessions/${source.session_id}/segments?source_id=unknown`,
+            headers,
+          })
+        ).statusCode,
+      ).toBe(422);
+      for (const extra of [
+        { start_user_message_id: null },
+        { end_user_message_id: null },
+        { start_user_message_id: "fake" },
+      ]) {
+        expect(
+          (
+            await app.inject({
+              method: "POST",
+              url: "/v1/segments",
+              headers,
+              payload: { ...source, ...extra },
+            })
+          ).statusCode,
+        ).toBe(422);
+      }
+      const response = await app.inject({
+        method: "POST",
+        url: "/v1/segments",
+        headers,
+        payload: source,
+      });
+      expect(response.statusCode).toBe(202);
+      const job = parseIngestJobResponse(response.json(), source.source_id);
+      expect(job).not.toHaveProperty("start_user_message_id");
+      expect(job).not.toHaveProperty("end_user_message_id");
+      const stored = (
+        await database.pool.query(
+          "SELECT start_user_message_id, end_user_message_id, payload FROM extraction_jobs WHERE id=$1",
+          [job.id],
+        )
+      ).rows[0];
+      expect(stored).toEqual({
+        start_user_message_id: null,
+        end_user_message_id: null,
+        payload: source,
+      });
+      const claim = required(
+        await withClient(database, (c) => database.claimOldestJob(c)),
+      );
+      expect(claim.request).toEqual(source);
+      const prepared = nativePrepared(claim, "Native summary");
+      const extraction = validatedExtractionResult({
+        summary: prepared.summary,
+        claims: [],
+      });
+      expect(await database.publishExtraction(claim, extraction)).toBe(true);
+      const staged = parseIngestSessionSegmentsResponse(
+        (await app.inject({ url: manifestUrl, headers })).json(),
+        source.source_id,
+      );
+      expect(staged.manifest_version).toBe(3);
+      expect(staged.segments).toHaveLength(1);
+      expect(staged.targets).toHaveLength(1);
+      expect(staged.segments[0]).not.toHaveProperty("start_user_message_id");
+      expect(await database.commitResolution(claim, extraction, prepared)).toBe(
+        true,
+      );
+      expect(
+        (await database.directClaims(EMBEDDING)).map((c) => c.segmentId),
+      ).toEqual([job.segment_id]);
+      expect(
+        (
+          await database.pool.query(
+            "SELECT start_user_message_id, end_user_message_id FROM segments WHERE id=$1",
+            [job.segment_id],
+          )
+        ).rows[0],
+      ).toEqual({ start_user_message_id: null, end_user_message_id: null });
+      expect(
+        (
+          await database.pool.query(
+            "SELECT payload FROM extraction_jobs WHERE id=$1",
+            [job.id],
+          )
+        ).rows[0].payload,
+      ).toBeNull();
+      const segment = parseIngestSegmentResponse(
+        (
+          await app.inject({
+            url: `/v1/segments/${job.segment_id}?source_id=${source.source_id}`,
+            headers,
+          })
+        ).json(),
+        source.source_id,
+      );
+      expect(segment.source_boundary_version).toBe(3);
+      expect(segment).not.toHaveProperty("end_user_message_id");
+      const manifest = parseIngestSessionSegmentsResponse(
+        (await app.inject({ url: manifestUrl, headers })).json(),
+      );
+      expect(manifest.manifest_version).toBe(3);
+      expect(manifest.targets).toEqual([]);
+      expect(manifest.boundaries[0]).toMatchObject({
+        source_boundary_version: 3,
+        source_eligible: true,
+      });
+      expect(
+        await database.sessionSegmentListing(SOURCE_ID, source.session_id),
+      ).toEqual([[], [], []]);
+      expect((await database.enqueue(source)).status).toBe("succeeded");
+      const changed = {
+        ...source,
+        messages: source.messages.map((m, i) =>
+          i === 1 ? { ...m, text: "changed text" } : m,
+        ),
+      };
+      expect((await database.enqueue(changed)).id).toBe(job.id);
+      expect(
+        await database.segmentSummaries(source.source_id, source.session_id),
+      ).toEqual([]);
+      expect(await database.directClaims(EMBEDDING)).toEqual([]);
+      const replacement = required(
+        await withClient(database, (c) => database.claimOldestJob(c)),
+      );
+      expect(replacement.extractionResult).toBeNull();
+      expect(replacement.sourceGeneration).toBeGreaterThan(
+        claim.sourceGeneration,
+      );
+      expect(await database.publishExtraction(claim, extraction)).toBe(false);
+      const legacy = {
+        ...request({
+          session_id: "legacy-under-v2-registry",
+          start_user_message_id: "turn",
+          end_user_message_id: "turn",
+          source_boundary_version: 2,
+          start_source_message_id: "legacy-start",
+          end_source_message_id: "legacy-end",
+          projection_version: 2,
+          messages: [{ role: "user", text: "legacy source" }],
+        }),
+        source_id: source.source_id,
+      };
+      await database.enqueue(legacy);
+      const legacyResponse = await app.inject({
+        url: `/v1/sessions/${legacy.session_id}/segments?source_id=${source.source_id}`,
+        headers,
+      });
+      expect(legacyResponse.statusCode).toBe(200);
+      const legacyManifest = parseIngestSessionSegmentsResponse(
+        legacyResponse.json(),
+        source.source_id,
+      );
+      expect(legacyManifest.manifest_version).toBe(2);
+      expect(legacyManifest.targets[0]?.source_boundary_version).toBe(2);
+      await database.enqueue({ ...legacy, session_id: source.session_id });
+      const mixed = await app.inject({ url: manifestUrl, headers });
+      expect(mixed.statusCode).toBe(409);
+      expect(mixed.json()).toEqual({
+        detail: "source manifest mixes legacy and native boundaries",
+      });
+    } finally {
+      await app.close();
+    }
+  });
+
+  test("native retries, restart, recovery, concurrent replacement, lease and source fencing", async () => {
+    const database = await openNativeDatabase();
+    try {
+      const source = nativeRequest();
+      await expect(
+        database.enqueue({ ...source, source_id: SOURCE_ID }),
+      ).rejects.toThrow("opencode-v2 source-v1");
+      const job = await database.enqueue(source);
+      let claim = required(
+        await withClient(database, (c) => database.claimOldestJob(c)),
+      );
+      const first = claim;
+      const extraction = validatedExtractionResult({
+        summary: "Reusable stage",
+        claims: [],
+      });
+      await expect(
+        database.publishExtraction(
+          { ...claim, sourceId: SOURCE_ID },
+          extraction,
+        ),
+      ).rejects.toThrow();
+      await expect(
+        database.publishExtraction(
+          { ...claim, sourceFingerprint: "0".repeat(64) },
+          extraction,
+        ),
+      ).rejects.toThrow("identity mismatch");
+      expect(
+        await database.publishExtraction(
+          { ...claim, leaseId: randomUUID() },
+          extraction,
+        ),
+      ).toBe(false);
+      expect(await database.publishExtraction(claim, extraction)).toBe(true);
+      expect(
+        await database.finishFailedAttempt(claim, "retry later", {
+          retryAfterSeconds: 0,
+        }),
+      ).toBe(true);
+      claim = required(
+        await withClient(database, (c) => database.claimOldestJob(c)),
+      );
+      expect(claim.extractionResult).toEqual(extraction);
+      expect(claim.request).toEqual(source);
+      expect(
+        await database.finishFailedAttempt(claim, "terminal", {
+          retryAfterSeconds: null,
+        }),
+      ).toBe(true);
+      await database.pool.query(
+        "UPDATE extraction_jobs SET payload=NULL WHERE id=$1",
+        [job.id],
+      );
+      expect(await database.retryFailedJob(SOURCE_ID, job.id)).toBeNull();
+      expect(
+        (await database.retryFailedJob(source.source_id, job.id))?.status,
+      ).toBe("pending");
+      claim = required(
+        await withClient(database, (c) => database.claimOldestJob(c)),
+      );
+      expect(claim.extractionResult).toEqual(extraction);
+      await database.finishFailedAttempt(claim, "restart", {
+        retryAfterSeconds: null,
+      });
+      await database.retryFailedJob(source.source_id, job.id, {
+        restartExtraction: true,
+      });
+      claim = required(
+        await withClient(database, (c) => database.claimOldestJob(c)),
+      );
+      expect(claim.extractionResult).toBeNull();
+      expect(
+        await withClient(database, (c) => database.recoverRunningJobs(c)),
+      ).toBe(1);
+      expect(await database.publishExtraction(claim, extraction)).toBe(false);
+      claim = required(
+        await withClient(database, (c) => database.claimOldestJob(c)),
+      );
+      expect(claim.request).toEqual(source);
+      const changed = {
+        ...source,
+        messages: source.messages.map((m, i) =>
+          i === 1 ? { ...m, text: "new snapshot" } : m,
+        ),
+      };
+      await Promise.all([database.enqueue(changed), database.enqueue(changed)]);
+      expect(await database.publishExtraction(claim, extraction)).toBe(false);
+      claim = required(
+        await withClient(database, (c) => database.claimOldestJob(c)),
+      );
+      expect(claim.request).toEqual(changed);
+      const extended = {
+        ...changed,
+        end_source_message_id: "m11",
+        messages: [
+          ...changed.messages,
+          { id: "m11", type: "synthetic" as const, text: "machine event" },
+        ],
+      };
+      const newer = await database.enqueue(extended);
+      expect(newer.id).not.toBe(job.id);
+      expect(newer.segment_id).toBe(job.segment_id);
+      expect(
+        await withClient(database, (c) => database.recoverRunningJobs(c)),
+      ).toBe(1);
+      expect((await database.getJob(source.source_id, job.id))?.status).toBe(
+        "superseded",
+      );
+      claim = required(
+        await withClient(database, (c) => database.claimOldestJob(c)),
+      );
+      expect(claim.request).toEqual(extended);
+      await expect(
+        database.commitResolution(
+          first,
+          extraction,
+          nativePrepared(first, extraction.summary),
+        ),
+      ).rejects.toThrow("lease changed");
+      await database.finishFailedAttempt(claim, "terminal", {
+        retryAfterSeconds: null,
+      });
+      expect(
+        (await database.supersedeFailedJob(source.source_id, newer.id))?.status,
+      ).toBe("superseded");
+      expect(
+        await database.sessionSegmentListing(
+          source.source_id,
+          source.session_id,
+        ),
+      ).toEqual([[], [], []]);
+    } finally {
+      await database.close();
+    }
+  });
+
+  test("native SQL constraints reject user fields, malformed payloads, and nonexhaustive boundaries", async () => {
+    const database = await openNativeDatabase();
+    try {
+      const source = nativeRequest();
+      const job = await database.enqueue(source);
+      for (const table of ["extraction_jobs", "segment_targets"]) {
+        for (const payload of [
+          { ...source, start_user_message_id: null },
+          { ...source, end_user_message_id: "fake" },
+          { ...source, source_id: "different" },
+          { ...source, source_id: null },
+          { ...source, messages: [] },
+          {
+            ...source,
+            messages: [{ id: "m0", type: "tool", text: "bad type" }],
+          },
+          {
+            ...source,
+            messages: source.messages.map((m, i) =>
+              i === 0 ? { ...m, id: "bad-start" } : m,
+            ),
+          },
+          {
+            ...source,
+            messages: source.messages.map((m, i) =>
+              i === 1 ? { ...m, text: null } : m,
+            ),
+          },
+          {
+            ...source,
+            messages: source.messages.map((m, i) =>
+              i === 1 ? { ...m, id: "m0" } : m,
+            ),
+          },
+          { ...source, projection_version: 2 },
+          { ...source, source_boundary_version: "3" },
+          { ...source, processing_priority: 0.5 },
+        ])
+          await expect(
+            database.pool.query(`UPDATE ${table} SET payload=$1::jsonb`, [
+              JSON.stringify(payload),
+            ]),
+          ).rejects.toMatchObject({ code: "23514" });
+        for (const set of [
+          "end_user_message_id='fake'",
+          "source_boundary_version=4",
+          "source_boundary_version=1",
+          "source_boundary_version=2",
+          "start_source_message_id=NULL",
+          "source_id=NULL",
+        ]) {
+          await expect(
+            database.pool.query(`UPDATE ${table} SET ${set}`),
+          ).rejects.toMatchObject({ code: "23514" });
+        }
+      }
+      await expect(
+        database.pool.query(
+          "UPDATE extraction_jobs SET payload=NULL WHERE id=$1",
+          [job.id],
+        ),
+      ).rejects.toMatchObject({ code: "23514" });
+      const claim = required(
+        await withClient(database, (c) => database.claimOldestJob(c)),
+      );
+      const extraction = validatedExtractionResult({
+        summary: "Native",
+        claims: [],
+      });
+      await database.publishExtraction(claim, extraction);
+      await database.commitResolution(
+        claim,
+        extraction,
+        nativePrepared(claim, extraction.summary),
+      );
+      for (const set of [
+        "start_user_message_id='fake'",
+        "end_user_message_id='fake'",
+        "source_boundary_version=4",
+        "source_boundary_version=1",
+        "source_boundary_version=2",
+        "start_source_message_id=NULL",
+        "source_id=NULL",
+        "projection_version=2",
+      ]) {
+        await expect(
+          database.pool.query(`UPDATE segments SET ${set}`),
+        ).rejects.toMatchObject({ code: "23514" });
+      }
+    } finally {
+      await database.close();
+    }
+  });
+
   test.skipIf(!DATABASE_URL)(
     "expands a fresh database through the operator without starting or preparing the application",
     async () => {
@@ -293,7 +1209,7 @@ describe.sequential("Database PostgreSQL integration", () => {
             "SELECT * FROM reflection_schema_migrations ORDER BY name",
           )
         ).rows;
-        expect(ledger).toHaveLength(9);
+        expect(ledger).toHaveLength(10);
         expect(ledger[8]).toMatchObject({
           name: "009_source_ownership_expansion.sql",
           checksum: expect.stringMatching(/^[a-f0-9]{64}$/),
@@ -586,6 +1502,151 @@ describe.sequential("Database PostgreSQL integration", () => {
             ),
           ).id,
         ).toBe(good.id);
+      } finally {
+        await database.close();
+      }
+    },
+  );
+
+  test.each(["claim", "recovery"])(
+    "quarantines native payloads in legacy boundary rows during %s without starving healthy work",
+    async (operation) => {
+      const database = new Database(settings());
+      await openDatabase(database);
+      try {
+        await truncate(database);
+        const source = {
+          ...request({
+            session_id: "mixed-boundary-bad",
+            start_user_message_id: "turn",
+            end_user_message_id: "turn",
+            source_boundary_version: 2,
+            start_source_message_id: "m0",
+            end_source_message_id: "m10",
+            projection_version: 2,
+            processing_priority: 100,
+            messages: [{ role: "user", text: "legacy source" }],
+          }),
+          source_id: SOURCE_ID,
+        };
+        const bad = await database.enqueue(source);
+        const badClaim = required(
+          await withClient(database, (client) =>
+            database.claimOldestJob(client),
+          ),
+        );
+        const extraction = validatedExtractionResult({
+          summary: "Retained legacy stage",
+          claims: [],
+        });
+        await database.publishExtraction(badClaim, extraction);
+        if (operation === "claim") {
+          await database.finishFailedAttempt(badClaim, "retry", {
+            retryAfterSeconds: 0,
+          });
+        }
+        const good = await database.enqueue({
+          ...source,
+          session_id: "mixed-boundary-good",
+          processing_priority: 0,
+        });
+        if (operation === "recovery") {
+          expect(
+            required(
+              await withClient(database, (client) =>
+                database.claimOldestJob(client),
+              ),
+            ).id,
+          ).toBe(good.id);
+        }
+        const payload = parseNativeSegmentCreate({
+          ...nativeRequest(),
+          source_id: SOURCE_ID,
+          session_id: source.session_id,
+        });
+        await database.pool.query(
+          "UPDATE extraction_jobs SET payload=$1::jsonb WHERE id=$2",
+          [JSON.stringify(payload), bad.id],
+        );
+        const snapshot = async () => ({
+          jobs: (
+            await database.pool.query(
+              "SELECT * FROM extraction_jobs ORDER BY id",
+            )
+          ).rows,
+          targets: (
+            await database.pool.query(
+              "SELECT * FROM segment_targets ORDER BY segment_id",
+            )
+          ).rows,
+        });
+        const before = await snapshot();
+        expect(
+          before.jobs.find((row) => Number(row.id) === bad.id),
+        ).toMatchObject({ source_boundary_version: 2, payload });
+
+        const forged = { ...badClaim, leaseId: randomUUID() };
+        for (const mutate of [
+          () => database.publishExtraction(forged, extraction),
+          () =>
+            database.finishFailedAttempt(forged, "forged", {
+              retryAfterSeconds: null,
+            }),
+          () =>
+            database.commitResolution(
+              forged,
+              extraction,
+              emptyPrepared(forged, extraction.summary),
+            ),
+        ]) {
+          await expect(mutate()).rejects.toMatchObject({
+            name: "OwnershipValidationError",
+            message: "persisted payload has mismatched source boundary version",
+          });
+          expect(await snapshot()).toEqual(before);
+        }
+
+        if (operation === "claim") {
+          expect(
+            await withClient(database, (client) =>
+              database.claimOldestJob(client),
+            ),
+          ).toBeNull();
+        } else {
+          expect(
+            await withClient(database, (client) =>
+              database.recoverRunningJobs(client),
+            ),
+          ).toBe(1);
+        }
+        const quarantined = await snapshot();
+        const badRow = quarantined.jobs.find(
+          (row) => Number(row.id) === bad.id,
+        );
+        expect(badRow).toMatchObject({
+          status: "failed",
+          lease_id: null,
+          payload,
+          error:
+            "OwnershipValidationError: persisted segment group quarantined",
+          finished_at: expect.any(String),
+        });
+        expect(quarantined.targets).toEqual(before.targets);
+        expect(
+          required(
+            await withClient(database, (client) =>
+              database.claimOldestJob(client),
+            ),
+          ).id,
+        ).toBe(good.id);
+        expect(
+          await withClient(database, (client) =>
+            database.claimOldestJob(client),
+          ),
+        ).toBeNull();
+        expect(
+          (await snapshot()).jobs.find((row) => Number(row.id) === bad.id),
+        ).toEqual(badRow);
       } finally {
         await database.close();
       }
@@ -1778,7 +2839,7 @@ describe.sequential("Database PostgreSQL integration", () => {
           "session",
         );
 
-        expect(segment.end_user_message_id).toBe("end-2");
+        expect(segment).toHaveProperty("end_user_message_id", "end-2");
         expect(segment.summary).toBe("Latest tail snapshot");
         expect(
           new Set(segment.claims.map((claim) => claim.object_value)),
@@ -1802,7 +2863,10 @@ describe.sequential("Database PostgreSQL integration", () => {
         expect(segmentSummaries.map((item) => item.id)).toEqual([
           first.segment_id,
         ]);
-        expect(required(segmentSummaries[0]).end_user_message_id).toBe("end-2");
+        expect(required(segmentSummaries[0])).toHaveProperty(
+          "end_user_message_id",
+          "end-2",
+        );
         expect(required(segmentSummaries[0]).summary).toBe(
           "Latest tail snapshot",
         );
@@ -1904,7 +2968,7 @@ describe.sequential("Database PostgreSQL integration", () => {
           await database.getSegment(SOURCE_ID, safeJob.segment_id),
         );
         expect(preserved.summary).toBe("Projection-safe summary");
-        expect(preserved.end_user_message_id).toBe("legacy-end");
+        expect(preserved).toHaveProperty("end_user_message_id", "legacy-end");
 
         const forwardJob = await database.enqueue({
           ...updateRequest(legacyRequest, {
@@ -1946,7 +3010,7 @@ describe.sequential("Database PostgreSQL integration", () => {
           await database.getSegment(SOURCE_ID, safeJob.segment_id),
         );
         expect(rewound.summary).toBe("Projection-safe rewind snapshot");
-        expect(rewound.end_user_message_id).toBe("legacy-end");
+        expect(rewound).toHaveProperty("end_user_message_id", "legacy-end");
 
         const pendingFuture = await database.enqueue({
           ...updateRequest(legacyRequest, {
@@ -2544,7 +3608,7 @@ describe.sequential("Database PostgreSQL integration", () => {
         const staleResult = required(
           await database.getSegment(SOURCE_ID, firstJob.segment_id),
         );
-        expect(staleResult.end_user_message_id).toBe("A");
+        expect(staleResult).toHaveProperty("end_user_message_id", "A");
         expect(staleResult.summary).toBe("A");
 
         const replayClaim = required(
@@ -2561,7 +3625,7 @@ describe.sequential("Database PostgreSQL integration", () => {
         const rewound = required(
           await database.getSegment(SOURCE_ID, firstJob.segment_id),
         );
-        expect(rewound.end_user_message_id).toBe("A");
+        expect(rewound).toHaveProperty("end_user_message_id", "A");
         expect(rewound.summary).toBe("A after stale B");
 
         const failingJob = await database.enqueue({
@@ -2774,9 +3838,13 @@ describe.sequential("Database PostgreSQL integration", () => {
             ]),
           ),
         ).toEqual({ [firstSegmentId]: true, [secondSegmentId]: false });
-        expect(targets.map((target) => target.end_user_message_id)).toEqual([
-          "second-end",
-        ]);
+        expect(
+          targets.map((target) =>
+            target.source_boundary_version === 3
+              ? null
+              : target.end_user_message_id,
+          ),
+        ).toEqual(["second-end"]);
 
         const futureSecond = updateRequest(secondRequest, {
           end_user_message_id: "second-future-end",
@@ -2793,11 +3861,18 @@ describe.sequential("Database PostgreSQL integration", () => {
         const secondBoundary = required(
           boundaries.find((boundary) => boundary.id === secondSegmentId),
         );
-        expect(secondBoundary.end_user_message_id).toBe("second-end");
+        expect(secondBoundary).toHaveProperty(
+          "end_user_message_id",
+          "second-end",
+        );
         expect(secondBoundary.source_eligible).toBe(false);
-        expect(targets.map((target) => target.end_user_message_id)).toEqual([
-          "second-future-end",
-        ]);
+        expect(
+          targets.map((target) =>
+            target.source_boundary_version === 3
+              ? null
+              : target.end_user_message_id,
+          ),
+        ).toEqual(["second-future-end"]);
 
         await database.enqueue({ ...secondRequest, source_id: SOURCE_ID });
         const stagedSecond = required(
@@ -3096,7 +4171,7 @@ describe.sequential("Database PostgreSQL integration", () => {
           source_id: SOURCE_ID,
         });
         expect(lowJob.segment_id).not.toBe(foregroundJob.segment_id);
-        expect(lowJob.start_user_message_id).toBe("turn");
+        expect(lowJob).toHaveProperty("start_user_message_id", "turn");
         expect(foregroundJob).toMatchObject({
           source_boundary_version: 2,
           start_source_message_id: "source-c",
@@ -3466,6 +4541,7 @@ describe.sequential("Database PostgreSQL integration", () => {
           "007_superseded_job_status.sql",
           "008_extraction_validation.sql",
           "009_source_ownership_expansion.sql",
+          "010_native_source_spans.sql",
         ]);
         expect(
           ledger.every((row) => /^[0-9a-f]{64}$/u.test(row.checksum)),
@@ -4417,7 +5493,8 @@ describe.sequential("Database PostgreSQL integration", () => {
           DELETE FROM reflection_schema_migrations
           WHERE name IN (
               '005_mutable_source_snapshots.sql',
-              '006_canonical_source_spans.sql'
+              '006_canonical_source_spans.sql',
+              '010_native_source_spans.sql'
           )
         `);
 

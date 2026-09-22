@@ -3,6 +3,7 @@ import {
   type ExtractionResult,
   type SourceMessage,
 } from "@reflection/shared/contracts";
+import type { NativeSourceMessage } from "@reflection/shared/native";
 import {
   canonicalToolFallbackFrames,
   MAX_COMPLETE_TOOL_SOURCE_CHARS,
@@ -100,7 +101,9 @@ function traverseToolState(
 
 export function normalizeExtractedPaths(
   result: { summary: string; claims: readonly ExtractedClaim[] },
-  messages: ReadonlyArray<SourceMessage | { role: string; text: string }>,
+  messages: ReadonlyArray<
+    SourceMessage | NativeSourceMessage | { role: string; text: string }
+  >,
 ): NormalizedExtractedPaths {
   const candidatePaths = new Set<string>();
   const candidateBasenames = new Set<string>();
@@ -142,7 +145,7 @@ export function normalizeExtractedPaths(
   let toolBudgetExhausted = false;
 
   for (const message of messages) {
-    if (message.role !== "assistant") {
+    if (("role" in message ? message.role : message.type) !== "assistant") {
       scanText(
         message.text,
         candidatePaths,

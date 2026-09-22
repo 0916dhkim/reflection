@@ -1,0 +1,28 @@
+{
+  "name": "@reflection/opencode-v2-plugin",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./dist/reflection-v2.js"
+  },
+  "files": [
+    "dist/reflection-v2.js"
+  ],
+  "engines": {
+    "node": ">=24 <25"
+  },
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "verify:bundle": "node scripts/verify.mjs",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@reflection/shared": "workspace:*",
+    "@reflection/opencode-v2-core": "workspace:*",
+    "@opencode/plugin": "2.0.8",
+    "@opencode/ai": "2.0.8",
+    "zod": "4.1.8"
+  }
+}

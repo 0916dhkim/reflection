@@ -1,7 +1,5 @@
-import type {
-  SourceInfo,
-  SourceSegmentResponse,
-} from "@reflection/shared/sources";
+import type { SourceInfo } from "@reflection/shared/sources";
+import type { IngestSegmentResponse } from "@reflection/shared/ingestion";
 import type { OpenCodeMessage } from "@reflection/shared/segmentation";
 
 import { requestSignal } from "./http.js";
@@ -433,8 +431,19 @@ async function readPages(
 
 export function assertReadableBoundary(
   source: SourceInfo,
-  _segment: SourceSegmentResponse,
+  segment: IngestSegmentResponse,
 ): void {
+  if (segment.source_boundary_version === 3) {
+    if (
+      source.kind !== "opencode-v2" ||
+      source.identity_scheme !== "source-v1"
+    ) {
+      throw new Error(
+        "native hydration requires an opencode-v2 source-v1 registry entry",
+      );
+    }
+    return;
+  }
   if (source.kind === "opencode-v2") {
     throw new Error(
       "cannot hydrate legacy turn boundaries from an opencode-v2 source",

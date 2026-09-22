@@ -13,17 +13,16 @@ import {
   type ExtractionResult,
   type ExtractionWireResult,
   type ResolutionResult,
-  type SegmentCreate,
 } from "@reflection/shared/contracts";
 import {
   ExtractionValidationError,
   TerminalExtractionValidationError,
-  segmentIdForRequest,
   validateResolutionResult,
   type MentionContext,
   type ValidatedResolutionPlan,
 } from "@reflection/shared/domain";
 import type { Settings } from "./config.js";
+import type { ExtractionSource } from "./ingestion.js";
 import { normalizeExtractedPaths } from "./extraction-normalization.js";
 import {
   MAX_REPORT_SUBJECT_CLAIMS,
@@ -32,6 +31,8 @@ import {
 } from "./extraction-validation.js";
 
 export const MAX_EMBEDDING_INPUT_BYTES = 30_000;
+const NATIVE_EVENT_INSTRUCTION =
+  " Native source messages preserve their original id, type, and text. Synthetic, system, tool, shell, skill, compaction, idle, and switch events are machine events, NOT user assertions or user approval. Do not attribute their text to the user. Only type user is a user message; assistant text is assistant-authored.";
 export const MAX_EMBEDDING_BATCH_BYTES = 100_000;
 export const MAX_EMBEDDING_BATCH_ITEMS = 128;
 export const MAX_RESOLUTION_CANDIDATE_PAYLOAD_BYTES = 1_000_000;
@@ -454,14 +455,19 @@ async function responseBody(
   }
 }
 
-function sourceContext(
-  request: SegmentCreate,
-): Record<string, string | number | null> {
+function sourceContext({
+  segmentId,
+  request,
+}: ExtractionSource): Record<string, string | number | null> {
   return {
-    segment_id: segmentIdForRequest(request),
+    segment_id: segmentId,
     session_id: request.session_id,
-    start_user_message_id: request.start_user_message_id,
-    end_user_message_id: request.end_user_message_id,
+    ...(request.source_boundary_version === 3
+      ? { source_id: request.source_id }
+      : {
+          start_user_message_id: request.start_user_message_id,
+          end_user_message_id: request.end_user_message_id,
+        }),
     source_boundary_version: request.source_boundary_version,
     start_source_message_id: request.start_source_message_id,
     end_source_message_id: request.end_source_message_id,
@@ -616,22 +622,28 @@ export class ModelClient {
   }
 
   async extract(
-    request: SegmentCreate,
+    source: ExtractionSource,
     priorSummaries: readonly string[],
   ): Promise<ValidatedExtractionResult> {
+    const { request } = source;
     const wireResult = await this.#structuredCall<ExtractionWireResult>({
       model: this.#settings.extractionModel,
       provider: this.#settings.extractionProvider,
       reasoningEffort: this.#settings.extractionReasoningEffort,
       nativeSchema: this.#settings.extractionNativeSchema,
-      system: EXTRACTION_SYSTEM_PROMPT,
+      system:
+        EXTRACTION_SYSTEM_PROMPT +
+        (request.source_boundary_version === 3 ? NATIVE_EVENT_INSTRUCTION : ""),
       user: {
-        source_context: sourceContext(request),
+        source_context: sourceContext(source),
         prior_session_segment_summaries: [...priorSummaries],
-        source_messages: request.messages.map(({ role, text }) => ({
-          role,
-          text,
-        })),
+        source_messages:
+          request.source_boundary_version === 3
+            ? request.messages
+            : request.messages.map(({ role, text }) => ({
+                role,
+                text,
+              })),
       },
       responseSchema: ExtractionWireResultSchema,
       parseResponse: parseExtractionWireResult,
@@ -683,23 +695,29 @@ export class ModelClient {
   }
 
   async resolve(
-    request: SegmentCreate,
+    source: ExtractionSource,
     summary: string,
     claims: readonly ExtractedClaim[],
     mentions: readonly MentionContext[],
   ): Promise<ValidatedResolutionPlan> {
+    const { request } = source;
     const rawResult = await this.#structuredCall<ResolutionResult>({
       model: this.#settings.resolutionModel,
       provider: this.#settings.resolutionProvider,
       reasoningEffort: this.#settings.resolutionReasoningEffort,
       nativeSchema: this.#settings.resolutionNativeSchema,
-      system: RESOLUTION_SYSTEM_PROMPT,
+      system:
+        RESOLUTION_SYSTEM_PROMPT +
+        (request.source_boundary_version === 3 ? NATIVE_EVENT_INSTRUCTION : ""),
       user: {
-        source_context: sourceContext(request),
-        source_messages: request.messages.map(({ role, text }) => ({
-          role,
-          text,
-        })),
+        source_context: sourceContext(source),
+        source_messages:
+          request.source_boundary_version === 3
+            ? request.messages
+            : request.messages.map(({ role, text }) => ({
+                role,
+                text,
+              })),
         segment_summary: summary,
         proposed_claims: claims.map((claim, index) => ({
           claim_id: `c${index}`,

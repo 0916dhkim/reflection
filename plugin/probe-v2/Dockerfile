@@ -10,6 +10,8 @@ RUN node -e 'const crypto=require("node:crypto");const fs=require("node:fs");con
 COPY workspace/ /workspace/
 COPY harness.mjs /harness/harness.mjs
 COPY .generated/history-reader.mjs /harness/history-reader.mjs
+COPY .generated/reflection-v2.js /harness/reflection-v2.js
+COPY .generated/native-harness.mjs /harness/native-harness.mjs
 RUN chown -R node:node /workspace /harness
 
 WORKDIR /workspace

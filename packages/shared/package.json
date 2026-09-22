@@ -6,6 +6,8 @@
   "exports": {
     "./contracts": "./src/contracts.ts",
     "./domain": "./src/domain.ts",
+    "./ingestion": "./src/ingestion.ts",
+    "./native": "./src/native.ts",
     "./segmentation": "./src/segmentation.ts",
     "./sources": "./src/sources.ts",
     "./tool-source": "./src/tool-source.ts"

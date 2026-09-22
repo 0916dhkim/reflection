@@ -606,15 +606,24 @@ try {
           .rows[0].registry === null,
     );
     await operate(["expand"]);
+    const expectedMigrations = Object.keys(
+      report.provenance.builds.new.migrations,
+    ).sort();
     const expandedLedger = (
       await db.query(
         "SELECT name FROM reflection_schema_migrations ORDER BY name",
       )
     ).rows;
     check(
-      "explicit expand applies migration 009",
-      expandedLedger.length === 9 &&
-        expandedLedger[8].name === "009_source_ownership_expansion.sql",
+      "explicit expand applies exactly the new snapshot migration ledger",
+      expandedLedger.length === expectedMigrations.length &&
+        expandedLedger.every(
+          (row, index) => row.name === expectedMigrations[index],
+        ),
+      {
+        expected: expectedMigrations,
+        actual: expandedLedger.map((row) => row.name),
+      },
     );
     check(
       "expand does not register sources",
@@ -628,8 +637,8 @@ try {
     await stop(old);
     old = await ready(backend("old"));
     await http(old, `/v1/segments/${baselineJob.segment_id}`);
-    await write(old, "old-restart-after-009");
-    check("old migration directory restarts after 009 ledger", true);
+    await write(old, "old-restart-after-expansion");
+    check("old migration directory restarts after expanded ledger", true);
     for (const [id, scheme] of [
       [legacy, "legacy"],
       [secondary, "source-v1"],
@@ -644,6 +653,11 @@ try {
         scheme,
       ]);
     await write(old, "before-indexes");
+    const interruptedIndexName = expectedMigrations.includes(
+      "010_native_source_spans.sql",
+    )
+      ? "segments_source_v3_start_key"
+      : "segments_source_v1_start_key";
     const indexBlocker = await connect();
     await indexBlocker.query("BEGIN");
     await indexBlocker.query(
@@ -667,7 +681,8 @@ try {
           );
         return (
           await db.query(
-            "SELECT p.pid, p.phase, i.indexrelid::text AS oid, i.indisvalid FROM pg_stat_progress_create_index p JOIN pg_index i ON i.indexrelid = p.index_relid WHERE p.command = 'CREATE INDEX CONCURRENTLY' AND i.indexrelid = to_regclass('segments_source_v1_start_key') AND NOT i.indisvalid AND p.phase LIKE 'waiting for writers%' ",
+            "SELECT p.pid, p.phase, i.indexrelid::text AS oid, i.indisvalid FROM pg_stat_progress_create_index p JOIN pg_index i ON i.indexrelid = p.index_relid WHERE p.command = 'CREATE INDEX CONCURRENTLY' AND i.indexrelid = to_regclass($1) AND NOT i.indisvalid AND p.phase LIKE 'waiting for writers%' ",
+            [interruptedIndexName],
           )
         ).rows[0];
       },
@@ -691,7 +706,8 @@ try {
     );
     const invalid = (
       await db.query(
-        "SELECT indexrelid::text AS oid, indisvalid FROM pg_index WHERE indexrelid = to_regclass('segments_source_v1_start_key')",
+        "SELECT indexrelid::text AS oid, indisvalid FROM pg_index WHERE indexrelid = to_regclass($1)",
+        [interruptedIndexName],
       )
     ).rows[0];
     check(
@@ -707,25 +723,53 @@ try {
     await operate(["install-indexes"]);
     const repaired = (
       await db.query(
-        "SELECT indexrelid::text AS oid, indisvalid FROM pg_index WHERE indexrelid = to_regclass('segments_source_v1_start_key')",
+        "SELECT indexrelid::text AS oid, indisvalid FROM pg_index WHERE indexrelid = to_regclass($1)",
+        [interruptedIndexName],
       )
     ).rows[0];
     check(
       "installer replaces invalid index with valid index",
       repaired?.indisvalid === true && repaired.oid !== invalid.oid,
     );
+    const requiredIndexes = [
+      "segments_source_v1_start_key",
+      "segments_source_v2_start_key",
+      "extraction_jobs_source_v1_boundary_key",
+      "extraction_jobs_source_v2_boundary_key",
+      "extraction_jobs_source_job_segment_key",
+      ...(expectedMigrations.includes("010_native_source_spans.sql")
+        ? [
+            "segments_source_v3_start_key",
+            "extraction_jobs_source_v3_boundary_key",
+          ]
+        : []),
+    ].sort();
+    const indexQuery = {
+      text: "SELECT c.relname AS name, i.indexrelid::text AS oid, i.indisvalid FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'public' AND c.relname = ANY($1::text[]) ORDER BY c.relname",
+      values: [requiredIndexes],
+    };
+    const installedIndexes = (await db.query(indexQuery)).rows;
+    check(
+      "installer creates every required valid index",
+      installedIndexes.length === requiredIndexes.length &&
+        installedIndexes.every(
+          (row, index) => row.name === requiredIndexes[index] && row.indisvalid,
+        ),
+      installedIndexes,
+    );
     await operate(["install-indexes"]);
-    const validIndexes = (
-      await db.query(
-        "SELECT indexrelid::regclass::text AS name, indexrelid::text AS oid, indisvalid FROM pg_index WHERE indexrelid IN (to_regclass('segments_source_v1_start_key'), to_regclass('segments_source_v2_start_key'), to_regclass('extraction_jobs_source_v1_boundary_key'), to_regclass('extraction_jobs_source_v2_boundary_key'), to_regclass('extraction_jobs_source_job_segment_key'))",
-      )
-    ).rows;
+    const validIndexes = (await db.query(indexQuery)).rows;
     check(
       "installer preserves valid indexes on rerun",
-      validIndexes.length === 5 &&
-        validIndexes.every((row) => row.indisvalid) &&
-        validIndexes.find((row) => row.name === "segments_source_v1_start_key")
-          ?.oid === repaired.oid,
+      validIndexes.length === requiredIndexes.length &&
+        validIndexes.every(
+          (row, index) =>
+            row.name === requiredIndexes[index] &&
+            row.indisvalid &&
+            row.oid === installedIndexes[index].oid,
+        ) &&
+        validIndexes.find((row) => row.name === interruptedIndexName)?.oid ===
+          repaired.oid,
     );
     await http(old, `/v1/segments/${baselineJob.segment_id}`);
     await write(old, "after-indexes");

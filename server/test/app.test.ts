@@ -563,6 +563,11 @@ describe("segment API", () => {
       if (withoutSource === undefined || withSource === undefined) {
         throw new Error("missing enqueue payload");
       }
+      if (
+        withoutSource.source_boundary_version === 3 ||
+        withSource.source_boundary_version === 3
+      )
+        throw new Error("expected legacy requests");
       expect(sourceFingerprint(withSource)).toBe(
         sourceFingerprint(withoutSource),
       );
@@ -1091,6 +1096,49 @@ describe("jobs and committed segments", () => {
       ],
       targets: [],
     });
+  });
+
+  test.each([
+    ["opencode-v1", 2],
+    ["opencode-v2", 3],
+  ] as const)(
+    "uses the registered %s kind for empty manifests",
+    async (kind, manifestVersion) => {
+      const { app } = appWith(
+        dependencies({
+          database: {
+            listSources: vi.fn(async () => [
+              { id: SOURCE_ID, kind, identity_scheme: "source-v1" as const },
+            ]),
+          },
+        }),
+      );
+      const response = await app.inject({
+        url: `/v1/sessions/empty/segments?source_id=${SOURCE_ID}`,
+        headers: API_HEADERS,
+      });
+      expect(response.statusCode).toBe(200);
+      expect(response.json()).toEqual({
+        source_id: SOURCE_ID,
+        session_id: "empty",
+        manifest_version: manifestVersion,
+        segments: [],
+        boundaries: [],
+        targets: [],
+      });
+    },
+  );
+
+  test("does not guess an empty manifest version for a missing registry entry", async () => {
+    const { app } = appWith(
+      dependencies({ database: { listSources: vi.fn(async () => []) } }),
+    );
+    const response = await app.inject({
+      url: `/v1/sessions/empty/segments?source_id=${SOURCE_ID}`,
+      headers: API_HEADERS,
+    });
+    expect(response.statusCode).toBe(422);
+    expect(response.json()).toEqual({ detail: `unknown source: ${SOURCE_ID}` });
   });
 });
 

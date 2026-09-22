@@ -17,7 +17,7 @@ import { SEGMENT_NAMESPACE, segmentIdForRequest } from "./domain.js";
 
 const UUID_PATTERN =
   "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$";
-const SourceIdSchema = Type.String({
+export const SourceIdSchema = Type.String({
   minLength: 1,
   maxLength: 500,
   pattern: ".*\\S.*",
@@ -59,7 +59,7 @@ function hasOwn(value: Record<string, unknown>, property: string): boolean {
   return Object.prototype.hasOwnProperty.call(value, property);
 }
 
-function parseSourceId(value: unknown, name: string): string {
+export function parseSourceId(value: unknown, name: string): string {
   const normalized = typeof value === "string" ? value.trim() : value;
   return parse(name, SourceIdSchema, normalized);
 }

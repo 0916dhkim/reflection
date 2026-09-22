@@ -8,6 +8,8 @@ RUN corepack enable && corepack prepare pnpm@10.33.0 --activate
 WORKDIR /app
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml tsconfig.base.json ./
 COPY packages/shared/package.json packages/shared/package.json
+COPY packages/opencode-v2-core/package.json packages/opencode-v2-core/package.json
+COPY packages/opencode-v2-plugin/package.json packages/opencode-v2-plugin/package.json
 COPY plugin/package.json plugin/package.json
 COPY scripts/package.json scripts/package.json
 COPY server/package.json server/package.json
