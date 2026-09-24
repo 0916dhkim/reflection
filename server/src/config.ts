@@ -211,10 +211,10 @@ export function loadSettings(env: NodeJS.ProcessEnv = process.env): Settings {
   if (env === process.env) loadLocalEnvFile();
   env = caseInsensitiveEnv(env);
 
-  const extractionModel = env.EXTRACTION_MODEL ?? "openai/gpt-5.6-luna";
+  const extractionModel = env.EXTRACTION_MODEL ?? "openai/gpt-6-luna";
   const extractionProvider = env.EXTRACTION_PROVIDER ?? "openai";
   const extractionNativeSchema = boolean(env, "EXTRACTION_NATIVE_SCHEMA", true);
-  const resolutionModel = env.RESOLUTION_MODEL ?? "openai/gpt-5.6-luna";
+  const resolutionModel = env.RESOLUTION_MODEL ?? "openai/gpt-6-luna";
   const resolutionProvider = env.RESOLUTION_PROVIDER ?? "openai";
   const resolutionNativeSchema = boolean(env, "RESOLUTION_NATIVE_SCHEMA", true);
   const embeddingDimensions = integer(env, "EMBEDDING_DIMENSIONS", 1024);
