@@ -174,6 +174,8 @@ describe("private runtime dependency (fixtures only)", () => {
       expect(() => parseArguments(args)).toThrow("E_ARGUMENT");
   });
 
+  // The first real Python/plistlib invocation can cold-start slowly on hosted macOS.
+  // Keep its existing 15s subprocess bound; do not let Vitest's default 5s win first.
   it("inspects without writes, even when source is inferred from the public plist", async () => {
     const v = await fixture();
     expect(
@@ -199,7 +201,7 @@ describe("private runtime dependency (fixtures only)", () => {
         ),
       ),
     ).toBe(true);
-  });
+  }, 20_000);
 
   it("publishes a complete exclusive copy before changing only plist argument zero", async () => {
     const v = await fixture();
