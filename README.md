@@ -324,6 +324,72 @@ The SDK does not supply native abort signals to Promise callbacks. Plugin-owned 
 
 ### CP012 OpenCode delivery package
 
+#### Inactive coexistence installation
+
+`scripts/instance/prepare.mjs` is a separate, explicitly invoked preparation tool. It verifies the pinned Darwin ARM64 2.0.8 binary and policy-capable Reflection bundle, then exclusively creates a new private root with those assets, a Node launcher/helper and a blocked manifest. It never runs the binary (including `--version`), creates active configuration/credentials/activation approval, imports a database, registers a source, installs a LaunchAgent or changes v1.
+
+```sh
+node /absolute/checkout/scripts/instance/prepare.mjs \
+  --root /absolute/new-coexistence-root \
+  --user-home /absolute/current-os-user-home \
+  --binary /absolute/verified-native-binary \
+  --bundle /absolute/policy-delivery/v2/index.js
+node /absolute/new-coexistence-root/bin/launch.mjs --check
+```
+
+Only `--check` is appropriate at preparation. It validates assets, critical paths, private modes and v1-state separation without starting any process or creating a database. `--serve` remains blocked without separately bound native/Reflection/policy configuration, a matching private web password and an `activation.json` receipt. The receipt is an explicit owner attestation of coordinated v1 port/reader/source/access checks, tied to manifest/config hashes—not a cryptographic signature or independent proof those external actions happened. Future binding must use the full native schema decoder; the standalone launcher verifies critical runtime bindings only.
+
+The launcher uses the private native binary directly, loopback4096, a new environment with isolated HOME/XDG/DB/temp/PTY/pnpm state, and an exclusive owned lock. Public Node/pnpm executable directories may be shared, not v1 state. It does not inherit shell profiles, credential variables or `NODE_OPTIONS`. Child output is discarded rather than appended unfiltered by the launcher; native-owned application logs are private, not guaranteed redacted. No stale lock is automatically removed and no recorded PID is signalled. SIGKILL can require operator lock recovery. Node lacks atomic `openat`/compare-and-unlink, so checked filesystem isolation is not an OS sandbox against another process with the same UID.
+
+This root is **temporary coexistence isolation**. Internal assets use root-relative paths, but moving it does not rewrite bound config references, session locations, project identities or plugin storage. Conventional v2 defaults are config `~/.config/opencode`, data/DB/logs `~/.local/share/opencode`, cache `~/.cache/opencode`, and state `~/.local/state/opencode`. Moving there requires explicit v1 retirement, backups/archive, reviewed config rebinding and validation before cleanup; never merge the databases. Workspace relocation is a separate decision because sessions store absolute locations. No automatic conventional-layout mode exists in this launcher.
+
+#### Pinning the launcher's Node dependency (disk only)
+
+An absolute Node path inside a package-manager directory may disappear during package cleanup. `scripts/instance/runtime-dependency.mjs` can copy an explicitly reviewed, signed Darwin ARM64 Node executable into an existing coexistence root's private `runtime/node` directory and change only argument zero in the v2 LaunchAgent plist. This separate `runtime/` directory is not the manifest's transient `paths.runtime` (`run/`).
+
+Inspection is the default. Applying requires explicit absolute root/source/plist paths, the reviewed Node and old-plist SHA-256 values, and the helper revision:
+
+```sh
+node /absolute/checkout/scripts/instance/runtime-dependency.mjs --apply \
+  --root /absolute/coexistence-root \
+  --source /absolute/reviewed/node \
+  --plist /absolute/user-home/Library/LaunchAgents/com.opencode.v2.serve.plist \
+  --expected-node-sha256 <reviewed-node-sha256> \
+  --expected-plist-sha256 <reviewed-old-plist-sha256> \
+  --expected-version 24.21.0 \
+  --helper-revision <reviewed-commit>
+```
+
+The helper performs bounded file/hash checks, static signature/architecture/system-library verification, and a version probe **only on the verified private copy**, never on the public source pathname. It publishes a complete independent executable before replacing the plist. The runtime directory/executable are `0700`; the plist backup and provenance receipt are `0600`. It refuses existing runtime destinations, source/plist drift, unsafe paths and unexpected plist content. Partial failures are retained for inspection, not automatically retried or rolled back; a `staged` receipt does not prove that the plist pointer is unchanged. Check the actual plist hash and any `failure.json`.
+
+This changes files on disk only: it never invokes launchd or OpenCode, reads a credential/database, or modifies the four-asset manifest, activation receipt, installed launcher, or application configuration. The separate runtime receipt is operational provenance, **not per-start integrity enforcement by the launcher**. Package-manager executables used by MCP tools remain package-manager-dependent; the child PATH is otherwise unchanged. Node security upgrades require a separately reviewed replacement, and a future instance-root relocation must explicitly carry this dependency and update the plist.
+
+The loaded launchd job keeps its previous interpreter until the **user** reloads the plist at an idle boundary. A `kickstart` alone does not load the changed plist. Do not remove the old package-manager runtime before that reload and verification. No source-history, credential or database migration is part of this operation.
+
+#### Optional native user policy
+
+The v2 plugin accepts an optional absolute `options.userPolicyPath` alongside `options.configPath`. Omitting it preserves the existing plugin behavior. A present but invalid/unreadable profile retains blocking guards rather than enabling native fallback. Use a bundle built from this implementation: older delivery bundles do not implement this option.
+
+```json
+{
+  "version": 1,
+  "instructionFiles": [
+    "/absolute/shared/MEMORY.md",
+    "/absolute/shared/USER.md"
+  ],
+  "modelAllowlists": { "openrouter": ["google/gemini-3.8-flash"] },
+  "geminiOpenRouterToolGuard": true
+}
+```
+
+Explicit local instruction files are reread coherently for each normal context request and appended in array order after native global/project AGENTS. Missing, changing, invalid-UTF8 or oversized required files block that request; fixing the file allows a later request without reloading the profile. Policy settings themselves are loaded at plugin initialization. Native v1.18.29 upstream rereads instruction contents; a frozen per-session content snapshot is not assumed. Auxiliary title/generate requests are not projected by this context policy.
+
+Catalog transforms disable non-allowlisted models for each listed provider, without enabling otherwise disabled models. An all-request-kind dispatch guard also rejects forbidden selections: a later native config override may expose a model in the UI but cannot bypass this guard. Providers absent from the map are unaffected. This filters catalog IDs, not a claim about upstream routing aliases or account authorization.
+
+The tool guard quotes completed textual tool results containing `{` only for OpenRouter `google/` models. Multipart text is joined like the provider lowerer and encoded once, retaining file parts and surrounding metadata. Both this expansion and appended instructions occur before Reflection's planning and final hard-budget checks. Stored history, ingestion identities and source fingerprints are not rewritten. It is not an HTTP-after-budget workaround.
+
+`scripts/src/opencode-v2-config.ts` provides a pure, strict pinned-schema draft converter with field accounting, read-only definition mappings and value-free deferred credential slots. It preserves agent/model/permission/MCP settings rather than substituting deny-all or disabled placeholders. Its output is always non-activatable: bindings must be resolved privately against an unchanged reviewed input, with filesystem containment, credential provisioning and coordinated source/reader activation handled separately. Numeric MCP defaults are preserved, while progress-reset and legacy remote-transport parity remain explicit verification limits. The hosted Mac fixture exercises the opt-in profile separately from the unchanged baseline.
+
 This package is a delivery artifact and documentation only. It does not install a bundle, create a launcher, start or restart OpenCode, migrate a database, register a source, copy history, or adopt v2 in production.
 
 From a clean, tracked checkout, build both actual plugin bundles, independently verify their standalone imports, and publish one new directory outside the repository and outside the user home/config/data/service paths:
@@ -338,7 +404,7 @@ node scripts/package-opencode.mjs --out /absolute/operator-chosen/delivery
 
 The artifact contains only `v1/reflection.js`, native-discovery `v2/index.js`, `examples/`, and `manifest.json`; it does not include this repository, `node_modules`, a live v1 state/database, credentials, or a tar dependency. The manifest records the Git commit/tree, lockfile SHA-256, and byte size/SHA-256 for each delivered file. To independently inspect it, compare the bundle hashes and sizes in `manifest.json` with the two compiled source artifacts from the recorded commit.
 
-The example JSON files deliberately contain invalid placeholders. Preserve the existing real Reflection base URL and API key rather than guessing an API path from these examples. Manually edit absolute paths and credentials before any future operator-approved trial; do not render real keys, source URLs, or passwords through the packager. Each config's own source entry is required. Basic reader credentials are optional, and the operator must verify the authentication policy of the actual v1 `127.0.0.1:4096` endpoint before adding them. The v2 reader uses loopback port `4097` and placeholder basic credentials. Both configs retain stable, source-scoped IDs (`danny-opencode-v1` and `danny-opencode-v2`) while permitting independent URLs. `contextProjection.enabled` is required for the native config.
+The example JSON files deliberately contain invalid placeholders. Preserve the existing real Reflection base URL and API key rather than guessing an API path from these examples. Manually edit absolute paths and credentials before an operator-approved activation; do not render real keys, source URLs, or passwords through the packager. Each config's own source entry is required. The selected final layout is v1 at `127.0.0.1:4097` and v2 at `127.0.0.1:4096`; verify that the coordinated v1 port move actually occurred before using these maps. They do not move the current listener. Basic reader credentials are optional for v1 and require verification of its actual authentication policy; v2 has placeholder Basic credentials. Both configs retain stable IDs (`danny-opencode-v1` and `danny-opencode-v2`). Public hostname changes must not retarget historical local readers. `contextProjection.enabled` is required for the native config.
 
 For a future **internal trial only**, keep every v2 path separate from v1. For example, an operator may choose one private `<v2-root>` and manually set `HOME=<v2-root>/home`, `XDG_CONFIG_HOME=<v2-root>/config`, `XDG_DATA_HOME=<v2-root>/data`, `XDG_STATE_HOME=<v2-root>/state`, `XDG_CACHE_HOME=<v2-root>/cache`, `TMPDIR=<v2-root>/tmp`, and a separate workspace. Set both `OPENCODE_CONFIG=<v2-root>/config/opencode-v2.json` and `OPENCODE_CONFIG_DIR=<v2-root>/config/opencode`; point the native config at an absolute v2 bundle directory and the isolated Reflection v2 config. HOME isolation also hides global Git, SSH, and AGENT settings, so the operator must review that consequence before adoption. Keep `OPENCODE_PASSWORD` in the environment rather than a literal command argument or log. Do not copy/import a source database or automatically import old v1 history.
 
