@@ -343,6 +343,29 @@ The launcher uses the private native binary directly, loopback4096, a new enviro
 
 This root is **temporary coexistence isolation**. Internal assets use root-relative paths, but moving it does not rewrite bound config references, session locations, project identities or plugin storage. Conventional v2 defaults are config `~/.config/opencode`, data/DB/logs `~/.local/share/opencode`, cache `~/.cache/opencode`, and state `~/.local/state/opencode`. Moving there requires explicit v1 retirement, backups/archive, reviewed config rebinding and validation before cleanup; never merge the databases. Workspace relocation is a separate decision because sessions store absolute locations. No automatic conventional-layout mode exists in this launcher.
 
+#### Pinning the launcher's Node dependency (disk only)
+
+An absolute Node path inside a package-manager directory may disappear during package cleanup. `scripts/instance/runtime-dependency.mjs` can copy an explicitly reviewed, signed Darwin ARM64 Node executable into an existing coexistence root's private `runtime/node` directory and change only argument zero in the v2 LaunchAgent plist. This separate `runtime/` directory is not the manifest's transient `paths.runtime` (`run/`).
+
+Inspection is the default. Applying requires explicit absolute root/source/plist paths, the reviewed Node and old-plist SHA-256 values, and the helper revision:
+
+```sh
+node /absolute/checkout/scripts/instance/runtime-dependency.mjs --apply \
+  --root /absolute/coexistence-root \
+  --source /absolute/reviewed/node \
+  --plist /absolute/user-home/Library/LaunchAgents/com.opencode.v2.serve.plist \
+  --expected-node-sha256 <reviewed-node-sha256> \
+  --expected-plist-sha256 <reviewed-old-plist-sha256> \
+  --expected-version 24.21.0 \
+  --helper-revision <reviewed-commit>
+```
+
+The helper performs bounded file/hash checks, static signature/architecture/system-library verification, and a version probe **only on the verified private copy**, never on the public source pathname. It publishes a complete independent executable before replacing the plist. The runtime directory/executable are `0700`; the plist backup and provenance receipt are `0600`. It refuses existing runtime destinations, source/plist drift, unsafe paths and unexpected plist content. Partial failures are retained for inspection, not automatically retried or rolled back; a `staged` receipt does not prove that the plist pointer is unchanged. Check the actual plist hash and any `failure.json`.
+
+This changes files on disk only: it never invokes launchd or OpenCode, reads a credential/database, or modifies the four-asset manifest, activation receipt, installed launcher, or application configuration. The separate runtime receipt is operational provenance, **not per-start integrity enforcement by the launcher**. Package-manager executables used by MCP tools remain package-manager-dependent; the child PATH is otherwise unchanged. Node security upgrades require a separately reviewed replacement, and a future instance-root relocation must explicitly carry this dependency and update the plist.
+
+The loaded launchd job keeps its previous interpreter until the **user** reloads the plist at an idle boundary. A `kickstart` alone does not load the changed plist. Do not remove the old package-manager runtime before that reload and verification. No source-history, credential or database migration is part of this operation.
+
 #### Optional native user policy
 
 The v2 plugin accepts an optional absolute `options.userPolicyPath` alongside `options.configPath`. Omitting it preserves the existing plugin behavior. A present but invalid/unreadable profile retains blocking guards rather than enabling native fallback. Use a bundle built from this implementation: older delivery bundles do not implement this option.
