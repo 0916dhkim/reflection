@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
+  AvailabilityError,
+  RequestRejectedError,
   Transport,
   automaticCompaction,
   configSchema,
@@ -193,6 +195,128 @@ describe("source-owned transport", () => {
     await expect(http.snapshot(registry, "s", signal(), false)).rejects.toThrow(
       "revision/status changed",
     );
+  });
+  it("retries a transient revision change while paging, then succeeds", async () => {
+    let revision = 1;
+    let pages = 0;
+    const http = new Transport(config, async (url) => {
+      const path = new URL(String(url)).pathname;
+      if (path.endsWith("/active"))
+        return Response.json({ data: { s: { type: "busy" } } });
+      if (path.endsWith("/message")) {
+        // Only the first page read races with a concurrent write.
+        if (++pages === 1) revision++;
+        return Response.json({ data: [], cursor: {} });
+      }
+      return Response.json({
+        data: {
+          id: "s",
+          time: { updated: revision },
+          location: { directory: "/work" },
+        },
+      });
+    });
+    const snapshot = await http.snapshot(registry, "s", signal(), false);
+    expect(snapshot.info).toHaveProperty("time.updated", 2);
+    expect(pages).toBe(2);
+  });
+  it("stops retrying a racing snapshot when the caller aborts", async () => {
+    const controller = new AbortController();
+    let revision = 1;
+    const http = new Transport(config, async (url) => {
+      const path = new URL(String(url)).pathname;
+      if (path.endsWith("/active"))
+        return Response.json({ data: { s: { type: "busy" } } });
+      if (path.endsWith("/message")) {
+        revision++;
+        controller.abort(new Error("cancelled by caller"));
+        return Response.json({ data: [], cursor: {} });
+      }
+      return Response.json({
+        data: {
+          id: "s",
+          time: { updated: revision },
+          location: { directory: "/work" },
+        },
+      });
+    });
+    await expect(
+      http.snapshot(registry, "s", controller.signal, false),
+    ).rejects.toThrow();
+    expect(revision).toBe(2);
+  });
+  it("treats backend 4xx without the application envelope as availability, not rejection", async () => {
+    const respond = (response: () => Response) =>
+      new Transport(config, async () => response());
+    const failure = (response: () => Response) =>
+      respond(response)
+        .request("/v1/sessions/s/segments", signal())
+        .then(
+          () => undefined,
+          (error: unknown) => error,
+        );
+    const gateway = await failure(
+      () =>
+        new Response("404 page not found", {
+          status: 404,
+          headers: { "content-type": "text/plain; charset=utf-8" },
+        }),
+    );
+    expect(gateway).toBeInstanceOf(AvailabilityError);
+    expect(gateway).toHaveProperty("status", 404);
+    expect(gateway).toHaveProperty(
+      "message",
+      "Reflection: endpoint temporarily unavailable (HTTP 404)",
+    );
+    for (const response of [
+      () =>
+        new Response("<html>blocked</html>", {
+          status: 403,
+          headers: { "content-type": "text/html" },
+        }),
+      () => Response.json({ error: "no envelope" }, { status: 400 }),
+      () => Response.json(["detail"], { status: 400 }),
+      () =>
+        new Response("{broken", {
+          status: 404,
+          headers: { "content-type": "application/json" },
+        }),
+      () => Response.json({ detail: "x".repeat(70 * 1024) }, { status: 400 }),
+    ])
+      expect(await failure(response)).toBeInstanceOf(AvailabilityError);
+    for (const response of [
+      () => Response.json({ detail: "Not Found" }, { status: 404 }),
+      () => Response.json({ detail: "invalid API key" }, { status: 401 }),
+      () =>
+        Response.json(
+          { detail: [{ type: "value_error", loc: ["body"], msg: "bad" }] },
+          { status: 422 },
+        ),
+    ]) {
+      const rejected = await failure(response);
+      expect(rejected).toBeInstanceOf(RequestRejectedError);
+      expect(String((rejected as Error).message)).toMatch(
+        /^Reflection: endpoint rejected request \(HTTP 4\d\d\)$/,
+      );
+    }
+  });
+  it("keeps history-source 4xx as rejections and never echoes response bodies", async () => {
+    const http = new Transport(
+      config,
+      async () =>
+        new Response("secret body reader-secret", {
+          status: 400,
+          headers: { "content-type": "text/plain" },
+        }),
+    );
+    const error = await http
+      .request("/api/session/s", signal(), config.sources.native)
+      .then(
+        () => undefined,
+        (error: unknown) => error,
+      );
+    expect(error).toBeInstanceOf(RequestRejectedError);
+    expect(String((error as Error).message)).not.toContain("secret");
   });
   it("prepends v1 before pages and validates chronological boundaries", async () => {
     let call = 0;

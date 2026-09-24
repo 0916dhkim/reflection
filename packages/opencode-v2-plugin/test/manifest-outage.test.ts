@@ -45,7 +45,9 @@ async function fixture(
     | "malformed"
     | "json"
     | "retry-503"
-    | "verified",
+    | "verified"
+    | "gateway-404"
+    | "app-404",
   large = false,
   output = 4000,
 ) {
@@ -205,6 +207,14 @@ async function fixture(
     }
     if (mode === "503")
       return new Response("secret server body", { status: 503 });
+    // Traefik answers with a plain-text 404 while the API container is replaced.
+    if (mode === "gateway-404")
+      return new Response("404 page not found", {
+        status: 404,
+        headers: { "content-type": "text/plain; charset=utf-8" },
+      });
+    if (mode === "app-404")
+      return Response.json({ detail: "Not Found" }, { status: 404 });
     if (mode === "timeout") {
       await new Promise<void>((_resolve, reject) =>
         init.signal!.addEventListener(
@@ -721,6 +731,19 @@ it("503 does not block tiny source-validated context or send a native checkpoint
   expect(
     fetch.mock.calls.filter(([url]) => String(url).includes("/v1/sources/")),
   ).toHaveLength(1);
+});
+it("a reverse-proxy 404 during a deploy degrades like an outage instead of blocking", async () => {
+  const { context, event } = await fixture("gateway-404", true);
+  const originals = [...event.messages];
+  await context(event);
+  expect(JSON.stringify(event.messages)).toContain("missing-or-stale-summary");
+  expect(event.messages.at(-1)).toBe(originals.at(-1));
+});
+it("an application 404 envelope still fails closed with its HTTP status", async () => {
+  const { context, event } = await fixture("app-404");
+  await expect(context(event)).rejects.toThrow(
+    "Reflection: endpoint rejected request (HTTP 404)",
+  );
 });
 it("unavailable retry delivery remains explicit omissions rather than a hard projection failure", async () => {
   const { context, event, fetch } = await fixture("retry-503", true);
