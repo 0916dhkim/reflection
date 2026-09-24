@@ -67,15 +67,75 @@ export function page(value: unknown): { data: unknown[]; next?: string } {
 }
 
 // Errors never contain URL, credentials, backend response bodies, or raw SDK errors.
+const httpStatus = (status?: number) =>
+  status === undefined ? "" : ` (HTTP ${status})`;
 export class AvailabilityError extends Error {
   constructor(readonly status?: number) {
-    super("Reflection: endpoint temporarily unavailable");
+    super(`Reflection: endpoint temporarily unavailable${httpStatus(status)}`);
   }
 }
 export class RequestRejectedError extends Error {
   constructor(readonly status: number) {
-    super("Reflection: endpoint rejected request");
+    super(`Reflection: endpoint rejected request${httpStatus(status)}`);
   }
+}
+const MAX_ERROR_BODY_BYTES = 64 * 1024;
+const SNAPSHOT_RETRY_DELAYS_MS = [100, 300] as const;
+// The Reflection API answers every 4xx with a JSON `{ detail }` envelope. A 4xx
+// without it never reached the application, for example a reverse proxy's
+// plain-text 404 while the API container is replaced during a deploy.
+async function isApplicationError(response: Response): Promise<boolean> {
+  const type = response.headers.get("content-type") ?? "";
+  if (type.split(";")[0]?.trim().toLowerCase() !== "application/json") {
+    await response.body?.cancel();
+    return false;
+  }
+  const reader = response.body?.getReader();
+  if (!reader) return false;
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      size += value.byteLength;
+      if (size > MAX_ERROR_BODY_BYTES) {
+        await reader.cancel();
+        return false;
+      }
+      chunks.push(value);
+    }
+  } catch {
+    return false;
+  }
+  try {
+    const body: unknown = JSON.parse(
+      new TextDecoder("utf-8", { fatal: true }).decode(Buffer.concat(chunks)),
+    );
+    return (
+      body != null &&
+      typeof body === "object" &&
+      !Array.isArray(body) &&
+      "detail" in body &&
+      (typeof body.detail === "string" || Array.isArray(body.detail))
+    );
+  } catch {
+    return false;
+  }
+}
+function pause(ms: number, signal: AbortSignal): Promise<void> {
+  signal.throwIfAborted();
+  return new Promise((resolve, reject) => {
+    const abort = () => {
+      clearTimeout(timer);
+      reject(signal.reason);
+    };
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", abort);
+      resolve();
+    }, ms);
+    signal.addEventListener("abort", abort, { once: true });
+  });
 }
 export class RegistryUnavailableError extends AvailabilityError {
   constructor(status?: number) {
@@ -122,13 +182,21 @@ export class Transport {
       throw new AvailabilityError();
     }
     if (!response.ok) {
-      await response.body?.cancel();
       if (
         response.status >= 500 ||
         response.status === 408 ||
         response.status === 429
-      )
+      ) {
+        await response.body?.cancel();
         throw new AvailabilityError(response.status);
+      }
+      if (source) {
+        await response.body?.cancel();
+        throw new RequestRejectedError(response.status);
+      }
+      const application = await isApplicationError(response);
+      if (signal.aborted) throw new Error("Reflection: operation cancelled");
+      if (!application) throw new AvailabilityError(response.status);
       throw new RequestRejectedError(response.status);
     }
     try {
@@ -277,23 +345,30 @@ export class Transport {
     inactive: boolean,
   ) {
     const reader = this.reader(source);
-    const before = await this.session(reader, id, signal);
-    const status = await this.active(reader, id, signal);
-    if (inactive && status !== "inactive")
-      throw new Error("Reflection: session is active");
-    const records = canonicalizeNativeHistory(
-      await this.history(source, id, signal),
-    );
-    const after = await this.session(reader, id, signal);
-    const finalStatus = await this.active(reader, id, signal);
-    if (
-      JSON.stringify(before) !== JSON.stringify(after) ||
-      status !== finalStatus
-    )
-      throw new Error(
-        "Reflection: history revision/status changed while paging",
+    // A concurrent write (for example the host's restart notice) can land while
+    // paging. Retry a stable read a bounded number of times, then fail closed.
+    for (let attempt = 0; ; attempt++) {
+      const before = await this.session(reader, id, signal);
+      const status = await this.active(reader, id, signal);
+      if (inactive && status !== "inactive")
+        throw new Error("Reflection: session is active");
+      const records = canonicalizeNativeHistory(
+        await this.history(source, id, signal),
       );
-    return { info: after, records };
+      const after = await this.session(reader, id, signal);
+      const finalStatus = await this.active(reader, id, signal);
+      if (
+        JSON.stringify(before) === JSON.stringify(after) &&
+        status === finalStatus
+      )
+        return { info: after, records };
+      const delay = SNAPSHOT_RETRY_DELAYS_MS[attempt];
+      if (delay === undefined)
+        throw new Error(
+          "Reflection: history revision/status changed while paging",
+        );
+      await pause(delay, signal);
+    }
   }
 }
 
