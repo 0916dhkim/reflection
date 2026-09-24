@@ -47,7 +47,7 @@ A staged summary can therefore appear in the session manifest while its job is s
 
 Interrupted workers recover running jobs. Every attempt has a lease UUID, and staged extraction plus final resolution must still match the lease, generation, source fingerprint, projection version, exact v1/v2 boundary, and current deterministic-validation version. Staged output from an older validation policy is re-extracted instead of reused or projected. Stale work cannot commit after a target changes. Retryable model, network, schema, and resolution failures use the configured attempt budget. Deterministically invalid persisted input and oversized embedding input fail terminally.
 
-Extraction and source-aware resolution currently use GPT-5.6 Luna through OpenRouter's OpenAI route with native strict JSON Schema. Voyage `voyage-4-large` supplies 1,024-dimensional embeddings. Source payloads remain only while a target is pending, running, or failed; successful or superseded completion clears duplicated transcript payloads. API responses never return stored source messages.
+Extraction and source-aware resolution currently use GPT-6 Luna through OpenRouter's OpenAI route with native strict JSON Schema. Voyage `voyage-4-large` supplies 1,024-dimensional embeddings. Source payloads remain only while a target is pending, running, or failed; successful or superseded completion clears duplicated transcript payloads. API responses never return stored source messages.
 
 ## Manifest and API
 
