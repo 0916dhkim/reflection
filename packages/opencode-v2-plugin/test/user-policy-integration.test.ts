@@ -4,14 +4,16 @@ import { Message, ReasoningPart, SystemPart } from "@opencode/ai";
 import { mkdtemp, writeFile, rm } from "node:fs/promises";
 import * as fs from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { afterEach, expect, it, vi } from "vitest";
 import { canonicalizeNativeHistory } from "@reflection/opencode-v2-core/history";
+import { estimateNativeTokens } from "@reflection/opencode-v2-core/projection";
 import { planNativeSegments } from "@reflection/opencode-v2-core/segmentation";
 import { setup } from "../src/index.js";
 import type { NativeModelEditor } from "../src/user-policy.js";
 import * as userPolicy from "../src/user-policy.js";
 import { materializedTokens } from "../src/projection.js";
+import { UsageTracker } from "../src/usage.js";
 
 vi.mock("node:fs/promises", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:fs/promises")>();
@@ -260,6 +262,149 @@ it("appends fresh ordered instructions, avoids duplicate append, and retries mis
   await writeFile(f.policyPath, "invalid");
   await f.context(event);
   expect(event.system[3]!.text).toContain("RECOVERED");
+});
+
+it("retains provider usage after policy MEMORY.md and USER.md edits while rendering fresh instructions", async () => {
+  const f = await fixture();
+  const prepare = vi.spyOn(UsageTracker.prototype, "prepare");
+  await f.start();
+  const event = f.event();
+  await f.context(event);
+  const answer = Message.make({
+    id: "answer",
+    role: "assistant",
+    content: "reply",
+  });
+  f.history.push({
+    id: "answer",
+    type: "assistant",
+    agent: "build",
+    model: selected,
+    content: [{ type: "text", text: "reply" }],
+    time: { created: 2, completed: 3 },
+    tokens: {
+      input: 100,
+      output: 20,
+      reasoning: 10,
+      cache: { read: 30, write: 40 },
+    },
+  });
+  event.messages.push(answer);
+  const providerTotal = 200;
+  await f.context(event);
+  expect(prepare.mock.results.at(-1)!.value.estimate(event.messages)).toBe(
+    providerTotal,
+  );
+  for (const [path, text, index] of [
+    [f.memory, "UPDATED MEMORY", 2],
+    [f.user, "UPDATED USER", 3],
+  ] as const) {
+    await writeFile(path, text);
+    await f.context(event);
+    expect(event.system[index]!.text).toBe(
+      `Instructions from: ${path}\n${text}`,
+    );
+    expect(prepare.mock.results.at(-1)!.value.estimate(event.messages)).toBe(
+      providerTotal,
+    );
+  }
+  const next = Message.make({ id: "next", role: "user", content: "continue" });
+  f.history.push({
+    id: "next",
+    type: "user",
+    text: "continue",
+    time: { created: 4 },
+  });
+  event.messages.push(next);
+  await f.context(event);
+  expect(prepare.mock.results.at(-1)!.value.estimate(event.messages)).toBe(
+    providerTotal +
+      8 +
+      estimateNativeTokens({ role: next.role, content: next.content }),
+  );
+  await f.dispatch(event);
+});
+
+it("invalidates provider usage for nonexempt instructions or changed base system, tools, and options", async () => {
+  const f = await fixture();
+  const extra = join(dirname(f.memory), "OTHER.md");
+  f.policy.instructionFiles.push(extra);
+  await Promise.all([
+    writeFile(extra, "original"),
+    writeFile(f.policyPath, JSON.stringify(f.policy)),
+  ]);
+  const prepare = vi.spyOn(UsageTracker.prototype, "prepare");
+  await f.start();
+  const event = f.event();
+  await f.context(event);
+  event.messages.push(
+    Message.make({ id: "answer", role: "assistant", content: "reply" }),
+  );
+  f.history.push({
+    id: "answer",
+    type: "assistant",
+    agent: "build",
+    model: selected,
+    content: [{ type: "text", text: "reply" }],
+    time: { created: 2, completed: 3 },
+    tokens: {
+      input: 100,
+      output: 20,
+      reasoning: 10,
+      cache: { read: 30, write: 40 },
+    },
+  });
+  await f.context(event);
+  expect(prepare.mock.results.at(-1)!.value.estimate(event.messages)).toBe(200);
+  await writeFile(extra, "changed");
+  await f.context(event);
+  expect(
+    prepare.mock.results.at(-1)!.value.estimate(event.messages),
+  ).toBeUndefined();
+  // Re-establish a proven anchor after each fallback so every negative check
+  // tests its own configuration change rather than an already absent anchor.
+  const changed = [
+    () => {
+      event.system = [SystemPart.make("NEW BASE")];
+    },
+    () => {
+      event.tools = {
+        changed: { description: "different", input: { type: "object" } },
+      };
+    },
+    () => {
+      event.options = { temperature: 0.9 };
+    },
+  ];
+  for (const [index, mutate] of changed.entries()) {
+    const id = `answer-${index}`;
+    event.messages.push(
+      Message.make({ id, role: "assistant", content: "reply" }),
+    );
+    f.history.push({
+      id,
+      type: "assistant",
+      agent: "build",
+      model: selected,
+      content: [{ type: "text", text: "reply" }],
+      time: { created: 4 + index * 2, completed: 5 + index * 2 },
+      tokens: {
+        input: 100,
+        output: 20,
+        reasoning: 10,
+        cache: { read: 30, write: 40 },
+      },
+    });
+    await f.context(event);
+    expect(prepare.mock.results.at(-1)!.value.estimate(event.messages)).toBe(
+      200,
+    );
+    mutate();
+    await f.context(event);
+    expect(
+      prepare.mock.results.at(-1)!.value.estimate(event.messages),
+    ).toBeUndefined();
+  }
 });
 
 it("replays filtering for new catalog models and blocks late overrides for every dispatch kind", async () => {

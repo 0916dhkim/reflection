@@ -1,6 +1,6 @@
 import { constants, type BigIntStats } from "node:fs";
 import { open, stat } from "node:fs/promises";
-import { isAbsolute, resolve } from "node:path";
+import { basename, isAbsolute, resolve } from "node:path";
 import {
   SystemPart,
   type Message,
@@ -339,6 +339,27 @@ export async function readUserInstructionParts(
   } catch {
     return instructionError();
   }
+}
+
+/** Usage continuity is keyed by configured file provenance, not by text that
+ * merely resembles an instruction. Only these two policy-loaded files may
+ * change contents without invalidating the previous provider usage. */
+export function instructionUsageIdentity(
+  policy: UserPolicy,
+  parts: readonly SystemPartValue[],
+): readonly SystemPartValue[] {
+  // If the read result cannot be paired with the configured paths, retain the
+  // entire real payload in the identity rather than exempting unknown content.
+  if (parts.length !== policy.instructionFiles.length) return parts;
+  return parts.map((part, index) => {
+    const path = policy.instructionFiles[index]!;
+    const name = basename(path);
+    return name === "MEMORY.md" || name === "USER.md"
+      ? SystemPart.make(
+          `Instructions from: ${path}\n[usage identity: policy file contents]`,
+        )
+      : part;
+  });
 }
 
 const guardedToolResults = new WeakSet<object>();
