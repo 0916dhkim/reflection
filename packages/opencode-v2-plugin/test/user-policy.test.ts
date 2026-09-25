@@ -170,6 +170,30 @@ it("rereads explicit instruction files for every request and rejects unsafe read
   }
 });
 
+it("reads once without blocking on concurrent edits", async () => {
+  const directory = await fixture();
+  const file = join(directory, "MEMORY.md");
+  const versions = ["a".repeat(4096), "b".repeat(8192)];
+  await writeFile(file, versions[0]!, "utf8");
+  const configured = policy([file]);
+  let writing = true;
+  const writer = (async () => {
+    for (let index = 0; writing; index++)
+      await writeFile(file, versions[index % 2]!, "utf8");
+  })();
+  try {
+    for (let read = 0; read < 300; read++) {
+      const [part] = await readUserInstructionParts(configured);
+      const text = (part as { text: string }).text.split("\n")[1]!;
+      // A racing write may be observed partially, never rejected.
+      expect(versions.some((version) => version.startsWith(text))).toBe(true);
+    }
+  } finally {
+    writing = false;
+    await writer;
+  }
+});
+
 it("keys usage on ordered configured policy paths, exempting only MEMORY.md and USER.md file contents", () => {
   const files = ["/one/MEMORY.md", "/two/OTHER.md", "/three/USER.md"];
   const configured = policy(files);
