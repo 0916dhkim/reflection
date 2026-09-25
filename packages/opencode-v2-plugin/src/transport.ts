@@ -1,7 +1,10 @@
 import { isAbsolute } from "node:path";
 import { z } from "zod";
 import { parseSourceInfo, type SourceInfo } from "@reflection/shared/sources";
-import { canonicalizeNativeHistory } from "@reflection/opencode-v2-core/history";
+import {
+  canonicalizeNativeHistory,
+  type NativeCanonicalRecord,
+} from "@reflection/opencode-v2-core/history";
 import type { OpenCodeMessage } from "@reflection/shared/segmentation";
 
 const endpoint = z.string().refine((value) => {
@@ -81,6 +84,32 @@ export class RequestRejectedError extends Error {
 }
 const MAX_ERROR_BODY_BYTES = 64 * 1024;
 const SNAPSHOT_RETRY_DELAYS_MS = [100, 300] as const;
+export const HISTORY_CACHE_SESSIONS = 8;
+
+// OpenCode 2.0.8, the only accepted host, encodes message cursors as base64url
+// JSON {id, order, direction} and anchors them on the message's sequence
+// (server/src/handlers/message.ts, core/src/session/store.ts).
+export function nativeCursorAfter(id: string): string {
+  return Buffer.from(
+    JSON.stringify({ id, order: "asc", direction: "next" }),
+  ).toString("base64url");
+}
+
+/**
+ * Settled native history prefix from the last stable context snapshot.
+ *
+ * In 2.0.8 rows are appended with increasing sequences and updates keep the
+ * sequence. The only deletion is a committed revert, which removes a suffix.
+ * Updates target incomplete records, and a step retry can revive the latest
+ * assistant. So the prefix before the latest assistant and before the first
+ * incomplete record does not change while its last message still exists
+ * unchanged.
+ */
+interface HistoryCache {
+  records: NativeCanonicalRecord[];
+  ids: Set<string>;
+  last: string;
+}
 // The Reflection API answers every 4xx with a JSON `{ detail }` envelope. A 4xx
 // without it never reached the application, for example a reverse proxy's
 // plain-text 404 while the API container is replaced during a deploy.
@@ -146,6 +175,7 @@ export class RegistryUnavailableError extends AvailabilityError {
 }
 export class Transport {
   readonly registry = new Map<string, SourceInfo>();
+  readonly histories = new Map<string, HistoryCache>();
   constructor(
     readonly config: Config,
     readonly fetchImpl: typeof fetch = fetch,
@@ -253,16 +283,22 @@ export class Transport {
       throw new Error("Reflection: source endpoint/kind mismatch");
     return reader;
   }
+  /** `after` resumes an opencode-v2 read after that message ID (exclusive). */
   async history(
     source: SourceInfo,
     id: string,
     signal: AbortSignal,
+    after?: string,
   ): Promise<unknown[]> {
     const reader = this.reader(source);
+    if (after !== undefined && source.kind !== "opencode-v2")
+      throw new Error(
+        "Reflection: resumed history requires an opencode-v2 source",
+      );
     const messages: unknown[] = [];
     const cursors = new Set<string>();
     const ids = new Set<string>();
-    let cursor: string | undefined;
+    let cursor = after === undefined ? undefined : nativeCursorAfter(after);
     do {
       const query = new URLSearchParams();
       if (source.kind === "opencode-v2") {
@@ -338,13 +374,20 @@ export class Transport {
     const entry = object(data)[id];
     return entry === undefined ? "inactive" : JSON.stringify(entry);
   }
+  /**
+   * `incremental` reuses this session's settled prefix from the previous stable
+   * snapshot and reads only the tail after it. Any doubt falls back to a full
+   * read. Only opencode-v2 sources are cached.
+   */
   async snapshot(
     source: SourceInfo,
     id: string,
     signal: AbortSignal,
     inactive: boolean,
+    incremental = false,
   ) {
     const reader = this.reader(source);
+    const cacheable = incremental && source.kind === "opencode-v2";
     // A concurrent write (for example the host's restart notice) can land while
     // paging. Retry a stable read a bounded number of times, then fail closed.
     for (let attempt = 0; ; attempt++) {
@@ -352,16 +395,18 @@ export class Transport {
       const status = await this.active(reader, id, signal);
       if (inactive && status !== "inactive")
         throw new Error("Reflection: session is active");
-      const records = canonicalizeNativeHistory(
-        await this.history(source, id, signal),
-      );
+      const records = cacheable
+        ? await this.cachedRecords(source, id, signal)
+        : canonicalizeNativeHistory(await this.history(source, id, signal));
       const after = await this.session(reader, id, signal);
       const finalStatus = await this.active(reader, id, signal);
       if (
         JSON.stringify(before) === JSON.stringify(after) &&
         status === finalStatus
-      )
+      ) {
+        if (cacheable) this.remember(source.id, id, records);
         return { info: after, records };
+      }
       const delay = SNAPSHOT_RETRY_DELAYS_MS[attempt];
       if (delay === undefined)
         throw new Error(
@@ -370,7 +415,70 @@ export class Transport {
       await pause(delay, signal);
     }
   }
+  forget(sourceId: string, id: string): void {
+    this.histories.delete(historyKey(sourceId, id));
+  }
+  private async cachedRecords(
+    source: SourceInfo,
+    id: string,
+    signal: AbortSignal,
+  ): Promise<NativeCanonicalRecord[]> {
+    const key = historyKey(source.id, id);
+    const cached = this.histories.get(key);
+    if (cached) {
+      // Re-read the last cached message as an overlap. A missing anchor
+      // returns [], so an empty or different first item means a revert
+      // reached the prefix or the message changed.
+      let tail: unknown[] | undefined;
+      try {
+        tail = await this.history(
+          source,
+          id,
+          signal,
+          cached.records.at(-2)!.source.id,
+        );
+      } catch (error) {
+        if (!(error instanceof RequestRejectedError)) throw error;
+      }
+      if (tail !== undefined && JSON.stringify(tail[0]) === cached.last) {
+        const fresh = canonicalizeNativeHistory(tail.slice(1));
+        if (fresh.every((record) => !cached.ids.has(record.source.id)))
+          return [...cached.records, ...fresh];
+      }
+      this.histories.delete(key);
+    }
+    return canonicalizeNativeHistory(await this.history(source, id, signal));
+  }
+  private remember(
+    sourceId: string,
+    id: string,
+    records: NativeCanonicalRecord[],
+  ): void {
+    const key = historyKey(sourceId, id);
+    this.histories.delete(key);
+    let end = records.findIndex((record) => !record.complete);
+    if (end < 0) end = records.length;
+    const latestAssistant = records.findLastIndex(
+      (record) => record.raw.type === "assistant",
+    );
+    if (latestAssistant >= 0) end = Math.min(end, latestAssistant);
+    // The overlap anchors on the second-to-last cached message.
+    if (end < 2) return;
+    const settled = records.slice(0, end);
+    this.histories.set(key, {
+      records: settled,
+      ids: new Set(settled.map((record) => record.source.id)),
+      last: JSON.stringify(settled.at(-1)!.raw),
+    });
+    for (const oldest of this.histories.keys()) {
+      if (this.histories.size <= HISTORY_CACHE_SESSIONS) break;
+      this.histories.delete(oldest);
+    }
+  }
 }
+
+const historyKey = (sourceId: string, id: string) =>
+  JSON.stringify([sourceId, id]);
 
 export function legacyHistory(history: unknown[]): OpenCodeMessage[] {
   let previous = -Infinity;

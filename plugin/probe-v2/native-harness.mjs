@@ -48,6 +48,8 @@ const legacyMessages = [
 ];
 let legacyReads = 0;
 const auth = `Basic ${Buffer.from("opencode:cp002-fixture-only").toString("base64")}`;
+// The plugin's own source reader goes through this recording proxy.
+const sourceReads = [];
 const assertions = [],
   requests = [],
   wire = [],
@@ -133,6 +135,57 @@ async function session(
 async function prompt(id, value) {
   await api(`/session/${id}/prompt`, { text: value, resume: true });
   await api(`/experimental/session/${id}/wait`, {});
+}
+async function sourceProxy(req, res) {
+  const url = new URL(req.url, "http://127.0.0.1:4400");
+  let response;
+  try {
+    response = await fetch(`http://127.0.0.1:4096${req.url}`, {
+      headers: { authorization: req.headers.authorization ?? "" },
+      signal: AbortSignal.timeout(15000),
+    });
+  } catch (error) {
+    // Surface an upstream failure to the plugin as a connection failure.
+    (diagnostics.proxyFailures ??= []).push({
+      path: url.pathname,
+      phase,
+      error: String(error),
+      cause: String(error.cause),
+    });
+    req.socket.destroy();
+    return;
+  }
+  const body = Buffer.from(await response.arrayBuffer());
+  const match = url.pathname.match(/^\/api\/session\/([^/]+)\/message$/);
+  if (match) {
+    const cursor = url.searchParams.get("cursor");
+    const data = response.ok ? JSON.parse(body.toString()).data : [];
+    sourceReads.push({
+      session: decodeURIComponent(match[1]),
+      after: cursor
+        ? JSON.parse(Buffer.from(cursor, "base64url").toString("utf8")).id
+        : undefined,
+      last: data.at(-1)?.id,
+      requests: requests.length,
+      index: sourceReads.length,
+    });
+  }
+  res
+    .writeHead(response.status, {
+      "content-type":
+        response.headers.get("content-type") ?? "application/json",
+    })
+    .end(body);
+}
+// A read starts a paging sequence unless it continues from the previous page.
+function sequenceStarts(id) {
+  let previous;
+  return sourceReads.filter((read) => {
+    if (read.session !== id) return false;
+    const start = read.after === undefined || read.after !== previous?.last;
+    previous = read;
+    return start;
+  });
 }
 async function listen(port, handler) {
   const server = createServer(async (req, res) => {
@@ -423,7 +476,7 @@ async function main() {
       sources: {
         [source.id]: {
           kind: source.kind,
-          url: "http://127.0.0.1:4096",
+          url: "http://127.0.0.1:4400",
           username: "opencode",
           password: "cp002-fixture-only",
         },
@@ -482,6 +535,7 @@ async function main() {
   await writeFile("/state/native-config.json", text(config));
   await listen(4200, reflection);
   await listen(4100, provider);
+  await listen(4400, sourceProxy);
   await listen(4300, (req, res) => {
     if (
       req.headers.authorization !==
@@ -610,6 +664,65 @@ async function main() {
   requireCheck(
     "actual plugin ingests native source segments",
     posts.length > 0,
+  );
+  // Once a turn has settled (from the third turn on), each step reuses the
+  // cached prefix: its paging includes a tail read after an anchor.
+  const pressureRequests = requests
+    .map((item, index) => ({ item, index }))
+    .filter(({ item }) => item.phase === "pressure");
+  const tailSteps = pressureRequests
+    .slice(1)
+    .filter(({ index }) =>
+      sequenceStarts(pressure).some(
+        (read) => read.requests === index && read.after !== undefined,
+      ),
+    ).length;
+  check(
+    "context steps read only the tail after a settled prefix",
+    tailSteps >= pressureRequests.length - 4,
+    { tailSteps, steps: pressureRequests.length },
+  );
+
+  phase = "revert";
+  const reverted = await session("revert");
+  for (let i = 0; i < 4; i++) await prompt(reverted, `NATIVE_REVERT_${i}_`);
+  const boundary = (await history(reverted)).find(
+    (item) => item.type === "user" && text(item).includes("NATIVE_REVERT_2_"),
+  );
+  requireCheck("revert boundary exists", boundary !== undefined);
+  await api(`/session/${reverted}/revert/stage`, {
+    messageID: boundary.id,
+    files: false,
+  });
+  await api(`/session/${reverted}/revert/commit`, {});
+  const revertRequests = requests.length;
+  const revertReads = sourceReads.length;
+  await prompt(reverted, "NATIVE_REVERT_4_");
+  const afterRevert = requests.slice(revertRequests);
+  check(
+    "context after a committed revert drops reverted turns",
+    afterRevert.length > 0 &&
+      afterRevert.every((item) => {
+        const value = text(item.body.messages);
+        return (
+          value.includes("NATIVE_REVERT_1_") &&
+          value.includes("NATIVE_REVERT_4_") &&
+          !value.includes("NATIVE_REVERT_2_") &&
+          !value.includes("NATIVE_REVERT_3_")
+        );
+      }),
+  );
+  // The step before the first post-revert request tries the tail, rejects it,
+  // and reads the full history.
+  const revertStarts = sequenceStarts(reverted).filter(
+    (read) => read.index >= revertReads && read.requests === revertRequests,
+  );
+  check(
+    "a revert into the cached prefix falls back to a full read",
+    revertStarts.findIndex((read) => read.after !== undefined) >= 0 &&
+      revertStarts.findIndex((read) => read.after === undefined) >
+        revertStarts.findIndex((read) => read.after !== undefined),
+    { revertStarts },
   );
   check(
     "native requests preserve typed arrays",
