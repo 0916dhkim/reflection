@@ -289,9 +289,20 @@ export interface ValidatedMentionResolution {
   selectedCandidate: EntityCandidate | null;
 }
 
+// A selected candidate ID outside the mention's own list. The model saw every
+// candidate list in the request, so an ID copied from another mention's list
+// names a real, described entity and is accepted. Any other ID was never
+// supplied and is replaced by a new entity rather than failing the segment.
+export interface CandidateSubstitution {
+  mentionId: string;
+  candidateEntityId: string;
+  outcome: "other_mention_candidate" | "new_entity";
+}
+
 export interface ValidatedResolutionPlan {
   keptClaims: readonly ValidatedClaimDecision[];
   mentions: readonly ValidatedMentionResolution[];
+  substitutions: readonly CandidateSubstitution[];
 }
 
 function validateClaimDecisions(
@@ -356,25 +367,47 @@ export function validateResolutionResult(
       "entity resolution must return every mention exactly once",
     );
   }
-  const mentions: ValidatedMentionResolution[] = [];
-  for (const context of keptContexts) {
-    const resolution = actual.get(context.mentionId)!;
-    const selectedCandidate =
-      resolution.candidate_entity_id === null
-        ? null
-        : (context.candidates.find(
-            (candidate) => candidate.id === resolution.candidate_entity_id,
-          ) ?? null);
-    if (resolution.candidate_entity_id !== null && selectedCandidate === null) {
-      throw new ExtractionValidationError(
-        `entity resolution selected an unknown candidate for ${context.mentionId}`,
-      );
+  const requestCandidates = new Map<string, EntityCandidate>();
+  for (const context of contexts) {
+    for (const candidate of context.candidates) {
+      if (!requestCandidates.has(candidate.id)) {
+        requestCandidates.set(candidate.id, candidate);
+      }
     }
+  }
+  const mentions: ValidatedMentionResolution[] = [];
+  const substitutions: CandidateSubstitution[] = [];
+  for (const context of keptContexts) {
+    let resolution = actual.get(context.mentionId)!;
+    let selectedCandidate: EntityCandidate | null = null;
+    const candidateEntityId = resolution.candidate_entity_id;
+    if (candidateEntityId !== null) {
+      selectedCandidate =
+        context.candidates.find(
+          (candidate) => candidate.id === candidateEntityId,
+        ) ?? null;
+      if (selectedCandidate === null) {
+        selectedCandidate = requestCandidates.get(candidateEntityId) ?? null;
+        substitutions.push({
+          mentionId: context.mentionId,
+          candidateEntityId,
+          outcome:
+            selectedCandidate === null
+              ? "new_entity"
+              : "other_mention_candidate",
+        });
+        if (selectedCandidate === null) {
+          resolution = { ...resolution, candidate_entity_id: null };
+        }
+      }
+    }
+    // Group checks deliberately read the model's original resolutions, so a
+    // substituted mention still cannot join or anchor a new-entity group.
     if (resolution.same_new_entity_as !== null) {
       const groupedContext = expected.get(resolution.same_new_entity_as);
       const groupedResolution = actual.get(resolution.same_new_entity_as);
       if (
-        resolution.candidate_entity_id !== null ||
+        candidateEntityId !== null ||
         groupedContext === undefined ||
         groupedResolution === undefined ||
         groupedResolution.candidate_entity_id !== null ||
@@ -390,7 +423,7 @@ export function validateResolutionResult(
     }
     mentions.push({ context, resolution, selectedCandidate });
   }
-  return { keptClaims, mentions };
+  return { keptClaims, mentions, substitutions };
 }
 
 function clamp(value: number): number {

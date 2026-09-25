@@ -1256,6 +1256,84 @@ describe("ModelClient", () => {
     expect(fetcher).not.toHaveBeenCalled();
   });
 
+  test("logs candidates selected outside the mention's own list", async () => {
+    const supplied = randomUUID();
+    const invented = randomUUID();
+    const fetcher: FetchLike = async () =>
+      modelResponse({
+        claims: [
+          { claim_id: "c0", action: "keep", reason: "supported" },
+          { claim_id: "c1", action: "keep", reason: "supported" },
+        ],
+        resolutions: [
+          { mention_id: "c0.subject", candidate_entity_id: supplied },
+          { mention_id: "c1.subject", candidate_entity_id: invented },
+        ],
+      });
+    const logger: ClientLogger = { info: vi.fn(), warn: vi.fn() };
+    const claims: ExtractedClaim[] = ["Feature", "Other"].map((subject) => ({
+      subject,
+      predicate: "exists",
+      confidence: 0.9,
+      object_entity: null,
+      object_value: "true",
+    }));
+    const source = extractionSource(segmentRequest("Feature and Other exist."));
+
+    const plan = await new ModelClient(settings(), fetcher, logger).resolve(
+      source,
+      "Feature and Other exist.",
+      claims,
+      [
+        {
+          mentionId: "c0.subject",
+          role: "subject",
+          text: "Feature",
+          supportingClaim: "Feature | exists | true",
+          candidates: [],
+        },
+        {
+          mentionId: "c1.subject",
+          role: "subject",
+          text: "Other",
+          supportingClaim: "Other | exists | true",
+          candidates: [
+            {
+              id: supplied,
+              canonicalName: "Feature",
+              description: "A feature.",
+              aliases: [],
+            },
+          ],
+        },
+      ],
+    );
+
+    expect(
+      plan.mentions.map((mention) => mention.selectedCandidate?.id),
+    ).toEqual([supplied, undefined]);
+    expect(logger.warn).toHaveBeenCalledWith(
+      "substituted candidate outside mention list",
+      {
+        model: "openai/gpt-5.6-luna",
+        segmentId: source.segmentId,
+        mentionId: "c0.subject",
+        candidateEntityId: supplied,
+        outcome: "other_mention_candidate",
+      },
+    );
+    expect(logger.warn).toHaveBeenCalledWith(
+      "substituted candidate outside mention list",
+      {
+        model: "openai/gpt-5.6-luna",
+        segmentId: source.segmentId,
+        mentionId: "c1.subject",
+        candidateEntityId: invented,
+        outcome: "new_entity",
+      },
+    );
+  });
+
   test.each([
     ["unknown mention IDs", ["unknown"]],
     ["duplicate mention IDs", ["c0.subject", "c0.subject"]],
@@ -1319,7 +1397,7 @@ describe("ModelClient", () => {
     );
   });
 
-  test("rejects a candidate ID that was not offered for the mention", async () => {
+  test("replaces a candidate ID that was never offered with a new entity", async () => {
     const fetcher: FetchLike = async () =>
       modelResponse({
         claims: [{ claim_id: "c0", action: "keep", reason: "supported" }],
@@ -1353,7 +1431,15 @@ describe("ModelClient", () => {
           },
         ],
       ),
-    ).rejects.toBeInstanceOf(UpstreamValidationError);
+    ).resolves.toMatchObject({
+      mentions: [
+        {
+          resolution: { mention_id: "c0.subject", candidate_entity_id: null },
+          selectedCandidate: null,
+        },
+      ],
+      substitutions: [{ mentionId: "c0.subject", outcome: "new_entity" }],
+    });
   });
 
   test("accepts a direct group between equivalent new mentions", async () => {
