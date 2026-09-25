@@ -353,7 +353,7 @@ async function reflection(req, res, body) {
   wire.push({ response: value });
   res.writeHead(200, { "content-type": "application/json" }).end(text(value));
 }
-function complete(res, content, tool) {
+function complete(res, content, tool, promptTokens) {
   const delta = tool
     ? {
         tool_calls: [
@@ -376,6 +376,10 @@ function complete(res, content, tool) {
       `data: ${text({ id: "native-fixture", object: "chat.completion.chunk", created: 0, model: "mock", choices: [{ index: 0, delta: data, finish_reason: finish }] })}\n\n`,
     );
   }
+  if (promptTokens !== undefined)
+    res.write(
+      `data: ${text({ id: "native-fixture", object: "chat.completion.chunk", created: 0, model: "mock", choices: [], usage: { prompt_tokens: promptTokens, completion_tokens: 100, total_tokens: promptTokens + 100, prompt_tokens_details: { cached_tokens: 3000 } } })}\n\n`,
+    );
   res.end("data: [DONE]\n\n");
 }
 async function provider(req, res, body) {
@@ -385,6 +389,19 @@ async function provider(req, res, body) {
   const all = text(body.messages),
     count = loops.get(phase) ?? 0;
   loops.set(phase, count + 1);
+  if (phase === "usage-low")
+    return complete(res, `NATIVE_USAGE_REPLY_${count}`, undefined, 4000);
+  if (phase === "usage-tool-pressure")
+    return count === 0
+      ? complete(res, null, { name: "fixture_usage_result", input: {} }, 8000)
+      : complete(res, "NATIVE_USAGE_TOOL_DONE", undefined, 4000);
+  if (phase === "usage-reported-pressure")
+    return complete(
+      res,
+      `NATIVE_USAGE_PRESSURE_REPLY_${count}`,
+      undefined,
+      count === 0 ? 19000 : 4000,
+    );
   if (
     phase === "partial-interrupt" &&
     all.includes("NATIVE_PARTIAL_INTERRUPT")
@@ -464,6 +481,7 @@ async function main() {
     } })().catch(error => { if (!stop.signal.aborted) appendFileSync("/state/native-events.jsonl", JSON.stringify({kind:"observer-error", error:String(error)}) + "\\n"); });
     await ctx.session.hook("title", event => { event.result = "Native fixture"; });
     await ctx.tool.transform(editor => editor.add({ name: "fixture_step", description: "Return deterministic fixture output", options: { codemode: false }, input: { type: "object", properties: {}, additionalProperties: false }, execute: async () => ({ content: "NATIVE_STEP_" + "s".repeat(8000) }) }));
+    await ctx.tool.transform(editor => editor.add({ name: "fixture_usage_result", description: "Return a large new result for the usage-budget fixture", options: { codemode: false }, input: { type: "object", properties: {}, additionalProperties: false }, execute: async () => ({ content: "NATIVE_USAGE_NEW_RESULT_" + "t".repeat(28000) }) }));
     return async () => { stop.abort(); await observe; };
   } };`,
   );
@@ -681,6 +699,129 @@ async function main() {
     "context steps read only the tail after a settled prefix",
     tailSteps >= pressureRequests.length - 4,
     { tailSteps, steps: pressureRequests.length },
+  );
+
+  // Report real provider usage through the native adapter, never through plugin
+  // internals. Repetitive prompt text deliberately exaggerates byte/3 estimates.
+  // Each new suffix fits, but the accumulated history exceeds the static budget.
+  phase = "usage-low";
+  const usageSession = await session("provider usage append-only continuation");
+  const usagePrompts = [];
+  for (let i = 0; i < 7; i++) {
+    const value = `NATIVE_USAGE_USER_${i}_` + "u".repeat(10000);
+    usagePrompts.push(value);
+    await prompt(usageSession, value);
+  }
+  const usageRequests = requests.filter((item) => item.phase === "usage-low");
+  const usageHistory = await history(usageSession);
+  diagnostics.usage = {
+    assistants: usageHistory
+      .filter((item) => item.type === "assistant")
+      .map((item) => ({ id: item.id, tokens: item.tokens })),
+    requestCharacters: usageRequests.map(
+      (item) => text(item.body.messages).length,
+    ),
+  };
+  check(
+    "low reported usage completes seven oversized-history turns",
+    usageRequests.length === 7 &&
+      text(usageHistory).includes("NATIVE_USAGE_REPLY_6"),
+    diagnostics.usage,
+  );
+  check(
+    "native adapter normalizes provider usage including cached input",
+    diagnostics.usage.assistants.length === 7 &&
+      diagnostics.usage.assistants.every(
+        ({ tokens }) =>
+          tokens?.input === 1000 &&
+          tokens.output === 100 &&
+          tokens.reasoning === 0 &&
+          tokens.cache?.read === 3000 &&
+          tokens.cache.write === 0,
+      ),
+  );
+  check(
+    "low usage preserves exact materialized request prefixes without projection",
+    usageRequests.length === 7 &&
+      usageRequests.every((item, index) => {
+        const messages = item.body.messages;
+        const prior = usageRequests[index - 1]?.body.messages;
+        return (
+          !text(messages).includes("[System-generated Reflection context") &&
+          usagePrompts
+            .slice(0, index + 1)
+            .every((value) => text(messages).includes(value)) &&
+          (!prior || text(messages.slice(0, prior.length)) === text(prior))
+        );
+      }),
+  );
+
+  phase = "usage-tool-pressure";
+  await prompt(usageSession, "NATIVE_USAGE_TOOL_REQUEST");
+  const usageToolRequests = requests.filter((item) => item.phase === phase);
+  const usageToolHistory = await history(usageSession);
+  diagnostics.usage.toolRequests = usageToolRequests.map((item) => ({
+    projected: text(item.body.messages).includes(
+      "[System-generated Reflection context",
+    ),
+    resultCharacters: item.body.messages
+      .filter((message) => message.role === "tool")
+      .map((message) => text(message.content).length),
+    hasFullResult: text(item.body.messages).includes(
+      "NATIVE_USAGE_NEW_RESULT_" + "t".repeat(28000),
+    ),
+  }));
+  check(
+    "usage anchor retains previous tail before the new tool executes",
+    usageToolRequests.length === 2 &&
+      usagePrompts.every((value) =>
+        text(usageToolRequests[0].body.messages).includes(value),
+      ) &&
+      !text(usageToolRequests[0].body.messages).includes(
+        "[System-generated Reflection context",
+      ),
+  );
+  check(
+    "new unaccounted tool result triggers projection despite low reported usage",
+    usageToolRequests.length === 2 &&
+      !text(usageToolRequests[0].body.messages).includes(
+        "[System-generated Reflection context",
+      ) &&
+      text(usageToolRequests[1].body.messages).includes(
+        "[System-generated Reflection context",
+      ) &&
+      text(usageToolHistory).includes(
+        "NATIVE_USAGE_NEW_RESULT_" + "t".repeat(28000),
+      ) &&
+      text(usageToolHistory).includes("NATIVE_USAGE_TOOL_DONE") &&
+      !usageToolHistory.some((item) => item.type === "compaction"),
+  );
+
+  // This transcript is below the static soft budget. Only the provider's high
+  // normalized usage should trigger projection on the following small prompt.
+  phase = "usage-reported-pressure";
+  const usagePressure = await session("genuine provider usage pressure");
+  await prompt(
+    usagePressure,
+    "NATIVE_USAGE_PRESSURE_SEED_" + "p".repeat(20000),
+  );
+  await prompt(usagePressure, "NATIVE_USAGE_PRESSURE_CONTINUE");
+  const usagePressureRequests = requests.filter((item) => item.phase === phase);
+  check(
+    "genuine reported usage pressure projects an otherwise small transcript",
+    usagePressureRequests.length === 2 &&
+      !text(usagePressureRequests[0].body.messages).includes(
+        "[System-generated Reflection context",
+      ) &&
+      text(usagePressureRequests[1].body.messages).includes(
+        "[System-generated Reflection context",
+      ) &&
+      text(usagePressureRequests[1].body.messages).includes(
+        "NATIVE_USAGE_PRESSURE_CONTINUE",
+      ) &&
+      text(await history(usagePressure)).includes(
+        "NATIVE_USAGE_PRESSURE_REPLY_1",
+      ),
   );
 
   phase = "revert";
@@ -1638,6 +1779,8 @@ console.log(
         "held stream, terminal source completion, and resumed segmentation asserted",
       imageInput:
         "ordinary native media dispatch and byte preservation asserted; image archive restoration not tested",
+      usageAnchoring:
+        "provider SSE usage, oversized accounted prompt prefixes, new tool-result pressure, and high reported usage asserted; encrypted reasoning transport not tested",
     },
     ...(failed
       ? {

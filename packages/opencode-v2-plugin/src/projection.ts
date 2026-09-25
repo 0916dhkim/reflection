@@ -4,7 +4,7 @@ import { z } from "zod";
 import {
   estimateNativeTokens,
   type NativeProjectionCheckpoint,
-  type NativeProjectionResult,
+  type NativeProjectionShape,
 } from "@reflection/opencode-v2-core/projection";
 
 const hash = z.string().regex(/^[a-f0-9]{64}$/);
@@ -244,7 +244,7 @@ export function estimateMessages(messages: readonly Message[]) {
   });
 }
 export function materialize(
-  plan: NativeProjectionResult,
+  plan: NativeProjectionShape,
   messages: readonly Message[],
 ): Message[] {
   if (!plan.notice) return [...messages];

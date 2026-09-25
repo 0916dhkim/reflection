@@ -5,6 +5,7 @@ import { afterEach, expect, it, vi } from "vitest";
 import { setup } from "../src/index.js";
 import { canonicalizeNativeHistory } from "@reflection/opencode-v2-core/history";
 import { planNativeSegments } from "@reflection/opencode-v2-core/segmentation";
+import { Message } from "@opencode/ai";
 
 const state = vi.hoisted(() => ({ config: "{}" }));
 vi.mock("node:fs/promises", () => ({
@@ -158,6 +159,139 @@ function event() {
     tools: {},
   } as unknown as SessionContext;
 }
+it("uses normalized usage to retain materialized context and pass the final hard guard despite encrypted assistant metadata", async () => {
+  state.config = JSON.stringify(config);
+  const fake = sdk();
+  const source = {
+    id: "native",
+    kind: "opencode-v2" as const,
+    identity_scheme: "source-v1" as const,
+  };
+  const initial = [
+    { id: "u", type: "user", text: "ask", time: { created: 1 } },
+    {
+      id: "old",
+      type: "assistant",
+      agent: "build",
+      model: { id: "small", providerID: "test" },
+      time: { created: 2, completed: 3 },
+      content: [{ type: "text", text: "x".repeat(50_000) }],
+    },
+    { id: "new-user", type: "user", text: "continue", time: { created: 4 } },
+  ];
+  const reasoningState = {
+    itemId: "rs_1",
+    reasoningEncryptedContent: "x".repeat(50_000),
+  };
+  const assistant = {
+    id: "a",
+    type: "assistant",
+    agent: "build",
+    model: { id: "small", providerID: "test" },
+    time: { created: 5, completed: 6 },
+    content: [
+      { type: "reasoning", text: "", state: reasoningState },
+      { type: "text", text: "answer" },
+    ],
+    tokens: {
+      input: 8000,
+      output: 1000,
+      reasoning: 200,
+      cache: { read: 300, write: 100 },
+    },
+  };
+  let history: unknown[] = initial;
+  const segments = planNativeSegments({
+    source,
+    sessionId: "s",
+    records: canonicalizeNativeHistory(initial),
+    softLimitChars: 1000,
+  });
+  const manifest = {
+    source_id: "native",
+    session_id: "s",
+    manifest_version: 3,
+    targets: [],
+    boundaries: segments.map((segment) => ({
+      id: segment.id,
+      projection_version: 3,
+      source_boundary_version: 3,
+      start_source_message_id: segment.request.start_source_message_id,
+      end_source_message_id: segment.request.end_source_message_id,
+      source_fingerprint: segment.fingerprint,
+      source_eligible: true,
+    })),
+    segments: segments.map((segment) => ({
+      id: segment.id,
+      projection_version: 3,
+      source_boundary_version: 3,
+      start_source_message_id: segment.request.start_source_message_id,
+      end_source_message_id: segment.request.end_source_message_id,
+      summary: "Verified work.",
+    })),
+  };
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (input: URL) => {
+      const path = new URL(String(input)).pathname;
+      if (path === "/v1/sources/native") return Response.json(source);
+      if (path === "/api/session/s")
+        return Response.json({
+          data: {
+            id: "s",
+            time: { updated: history.length },
+            location: { directory: "/work" },
+          },
+        });
+      if (path === "/api/session/active")
+        return Response.json({ data: { s: { type: "busy" } } });
+      if (path.endsWith("/message"))
+        return Response.json({ data: history, cursor: {} });
+      if (path === "/api/config")
+        return Response.json([
+          { type: "document", info: { compaction: { auto: false } } },
+        ]);
+      if (path === "/v1/sessions/s/segments") return Response.json(manifest);
+      throw new Error(`unexpected ${path}`);
+    }),
+  );
+  cleanups.push(await setup(fake.ctx));
+  const first = event();
+  first.messages = [
+    Message.make({ id: "u", role: "user", content: "ask" }),
+    Message.make({ id: "old", role: "assistant", content: "x".repeat(50_000) }),
+    Message.make({ id: "new-user", role: "user", content: "continue" }),
+  ];
+  await fake.hooks.get("context")!(first);
+  expect(first.messages[0]?.id).toMatch(/^reflection-native-/);
+  expect([...fake.storage.values()][0]).toBeDefined();
+  const previousCheckpoint = [...fake.storage.values()][0];
+  history = [...initial, assistant];
+  const next = event();
+  next.messages = [
+    Message.make({ id: "u", role: "user", content: "ask" }),
+    Message.make({ id: "old", role: "assistant", content: "x".repeat(50_000) }),
+    Message.make({ id: "new-user", role: "user", content: "continue" }),
+    Message.make({
+      id: "a",
+      role: "assistant",
+      content: [
+        {
+          type: "reasoning",
+          text: "",
+          providerMetadata: { test: reasoningState },
+        },
+        { type: "text", text: "answer" },
+      ],
+    }),
+  ];
+  await fake.hooks.get("context")!(next);
+  expect(next.messages[0]?.id).toBe(first.messages[0]?.id);
+  expect(next.messages.at(-1)?.id).toBe("a");
+  // The real host supplies native history again, not our last materialization.
+  // Reconstructing the same notice must reuse its checkpoint and usage anchor.
+  expect([...fake.storage.values()][0]).toEqual(previousCheckpoint);
+});
 it.each(["2.0.7", "2.0.9", "v2.0.8", "2.0.8-dev", "unknown", ""])(
   "unsupported host %s retains guards and refuses all model/source IO",
   async (version) => {

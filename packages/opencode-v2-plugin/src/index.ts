@@ -30,6 +30,7 @@ import {
   object,
 } from "./transport.js";
 import { Ingestion, warn } from "./ingestion.js";
+import { UsageTracker } from "./usage.js";
 import { Operations, bounded } from "./operations.js";
 import {
   applyModelAllowlist,
@@ -53,6 +54,7 @@ export default Plugin.define({ id: "reflection-v2", setup });
 
 export async function setup(ctx: Plugin.Context) {
   const operations = new Operations();
+  const usage = new UsageTracker();
   const subscriptions = new AbortController();
   let http: Transport | undefined;
   let ingestion: Ingestion | undefined;
@@ -417,12 +419,23 @@ export async function setup(ctx: Plugin.Context) {
       } else segments = planNativeSegments(segmentInput);
       const system = estimationValue(requestSystem);
       const toolBudget = estimationValue(event.tools);
+      const estimatedMessages = estimateMessages(requestMessages);
+      const tracker = usage.prepare(
+        event.sessionID,
+        snapshot.records,
+        event.model,
+        system,
+        toolBudget,
+        estimationValue(event.options),
+      );
+      const estimateInput = (shape: Parameters<typeof materialize>[0]) =>
+        tracker.estimate(materialize(shape, requestMessages));
       const input = {
         source,
         sessionId: event.sessionID,
         records: snapshot.records,
         segments,
-        messages: estimateMessages(requestMessages),
+        messages: estimatedMessages,
         system: [system, WRAPPER_RESERVE],
         tools: toolBudget,
         contextLimit: model.limit.context,
@@ -431,6 +444,7 @@ export async function setup(ctx: Plugin.Context) {
         previous,
         allowLossy: true as const,
         memo: segmentMemo,
+        estimateInput,
       };
       let plan: NativeProjectionResult | undefined;
       try {
@@ -488,9 +502,9 @@ export async function setup(ctx: Plugin.Context) {
         model.limit.input ?? model.limit.context,
         model.limit.context - output,
       );
+      const conservative = materializedTokens(messages, system, toolBudget);
       if (
-        materializedTokens(messages, system, toolBudget) >
-        Math.floor(usable * 0.9)
+        (tracker.estimate(messages) ?? conservative) > Math.floor(usable * 0.9)
       )
         throw new Error(
           "Reflection: materialized context exceeds hard input budget",
@@ -508,6 +522,7 @@ export async function setup(ctx: Plugin.Context) {
         event.system = requestSystem;
       }
       event.messages = messages;
+      tracker.remember(messages);
       if (plan.lossy)
         warn(
           `Projection contains ${plan.omissions.length} explicitly marked omitted ranges`,
@@ -678,6 +693,7 @@ export async function setup(ctx: Plugin.Context) {
       const id = data.sessionID;
       if (typeof id !== "string") continue;
       if (event.type === "session.deleted") {
+        usage.delete(id);
         ingestion?.clear(id);
         http?.forget(http.config.sourceId, id);
         void operations
@@ -707,6 +723,7 @@ export async function setup(ctx: Plugin.Context) {
     registryRetryAllowed = false;
     startupError = "Reflection: plugin disposed; native fallback forbidden";
     subscriptions.abort();
+    usage.clear();
     await operations.dispose();
     await initialization;
     await bounded(eventTask, AbortSignal.timeout(5000)).catch(() => {});
