@@ -7,6 +7,7 @@ import {
 } from "@reflection/shared/native";
 import type { SourceInfo } from "@reflection/shared/sources";
 import type { NativeCanonicalRecord, NativeSourceOmission } from "./history.js";
+import type { NativePrefixLink, NativeSegmentMemo } from "./memo.js";
 import type { NativePlannedSegment } from "./segmentation.js";
 
 export interface ModelMessageLike {
@@ -88,6 +89,8 @@ export interface NativeProjectionOptions {
   outputLimit: number;
   previous?: NativeProjectionCheckpoint;
   allowLossy?: true;
+  /** Reuses per-segment validation and prefix hashing for unchanged records. */
+  memo?: NativeSegmentMemo;
 }
 
 export class NativeProjectionError extends Error {
@@ -101,6 +104,16 @@ function object(value: unknown): Record<string, unknown> | undefined {
   return value !== null && typeof value === "object" && !Array.isArray(value)
     ? (value as Record<string, unknown>)
     : undefined;
+}
+
+function sameIds(
+  ids: readonly string[],
+  records: readonly NativeCanonicalRecord[],
+): boolean {
+  return (
+    ids.length === records.length &&
+    ids.every((id, index) => id === records[index]!.source.id)
+  );
 }
 
 function digest(value: unknown): string {
@@ -341,7 +354,11 @@ export function projectNativeContext(
   >[] = [];
   // Preserve the v1 JSON-array framing exactly, without serializing each raw
   // prefix again for every candidate. Each completed raw record is read once.
-  const sourceHash = createHash("sha256").update("[");
+  let sourceHash = createHash("sha256").update("[");
+  const memo = options.memo;
+  // The prefix link of the previous segment (null before the first), or
+  // undefined once the chain of memoized links from the first record breaks.
+  let predecessor: NativePrefixLink | null | undefined = null;
   let cursor = 0;
   for (const segment of segments) {
     const start = positions.get(segment.request.start_source_message_id);
@@ -354,21 +371,31 @@ export function projectNativeContext(
     )
       break;
     const slice = records.slice(cursor, end + 1);
-    const request = {
-      ...segment.request,
-      messages: slice.map((record) => record.source),
-    };
+    // A segment planned from these exact record objects through the memo was
+    // already hashed and identified; its request object proves it.
+    const entry = memo?.lookup(source, sessionId, slice);
+    const known =
+      entry !== undefined &&
+      entry.request === segment.request &&
+      entry.id === segment.id &&
+      entry.fingerprint === segment.fingerprint;
+    const request = known
+      ? segment.request
+      : {
+          ...segment.request,
+          messages: slice.map((record) => record.source),
+        };
     if (
       request.source_id !== source.id ||
       request.session_id !== sessionId ||
       request.projection_version !== 3 ||
       request.source_boundary_version !== 3 ||
       slice.some((record) => !record.complete) ||
-      digest(segment.sourceMessageIds) !==
-        digest(slice.map((record) => record.source.id)) ||
-      nativeSourceFingerprint(request) !== segment.fingerprint ||
-      nativeSourceFingerprint(segment.request) !== segment.fingerprint ||
-      nativeSegmentIdForRequest(request, source) !== segment.id
+      !sameIds(segment.sourceMessageIds, slice) ||
+      (!known &&
+        (nativeSourceFingerprint(request) !== segment.fingerprint ||
+          nativeSourceFingerprint(segment.request) !== segment.fingerprint ||
+          nativeSegmentIdForRequest(request, source) !== segment.id))
     )
       break;
     const exact = (entry: {
@@ -412,16 +439,40 @@ export function projectNativeContext(
     const warnings = [
       ...new Set(slice.flatMap((record) => record.omissions ?? [])),
     ];
-    for (let index = cursor; index <= end; index++) {
-      if (index > 0) sourceHash.update(",");
-      sourceHash.update(JSON.stringify(records[index]!.raw));
+    // The raw prefix hash through this segment depends on every earlier
+    // record, so resume it only when this link was built on the exact link
+    // used for the previous segment in this pass (checked transitively).
+    // Entries are created only by planning from canonical requests; prefix
+    // links depend on record identity alone, so any entry for this exact
+    // slice may carry one.
+    let link = entry?.prefix;
+    let sourcePrefixFingerprint: string;
+    if (link && predecessor !== undefined && link.previous === predecessor) {
+      sourceHash = link.hash.copy();
+      sourcePrefixFingerprint = link.fingerprint;
+    } else {
+      for (let index = cursor; index <= end; index++) {
+        if (index > 0) sourceHash.update(",");
+        sourceHash.update(JSON.stringify(records[index]!.raw));
+      }
+      sourcePrefixFingerprint = sourceHash.copy().update("]").digest("hex");
+      link = undefined;
+      if (entry && predecessor !== undefined) {
+        link = {
+          previous: predecessor,
+          hash: sourceHash.copy(),
+          fingerprint: sourcePrefixFingerprint,
+        };
+        entry.prefix = link;
+      }
     }
+    predecessor = link;
     validatedRanges.push({
       end,
       summary,
       archived,
       warnings,
-      sourcePrefixFingerprint: sourceHash.copy().update("]").digest("hex"),
+      sourcePrefixFingerprint,
     });
     cursor = end + 1;
   }
