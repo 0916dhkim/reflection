@@ -8,7 +8,7 @@ export const NATIVE_VERSION = "2.0.8";
 export const NATIVE_SHA256 =
   "80fb8f312afa53182fbddc1230fe7937ba4b8ec2c5bf1de97510092919662196";
 export const REFLECTION_V2_SHA256 =
-  "d1e3824a592a5955df1c34e2a382a423dd237919ac872798acd80d5d880282da";
+  "d30f9ad67900599a9a699107cc65bc2c3180dd6f6d27de6c7662a4f36b9aacf1";
 // Conventional paths require an explicit later migration, including persisted
 // workspace/session paths. Relocatable assets alone do not migrate an instance.
 export const PURPOSE = "temporary-coexistence";

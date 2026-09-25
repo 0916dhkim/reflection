@@ -194,6 +194,7 @@ export async function setup(ctx: Plugin.Context) {
               segment.session_id,
               signal,
               false,
+              true,
             );
             const messages = hydrateNativeRange(snapshot.records, segment);
             const request = {
