@@ -73,6 +73,11 @@ export interface NativeProjectionResult {
   deferredReason?: string;
 }
 
+export type NativeProjectionShape = Pick<
+  NativeProjectionResult,
+  "tailStartIndex" | "preservedPrefixIndices" | "notice"
+>;
+
 export interface NativeProjectionOptions {
   source: SourceInfo;
   sessionId: string;
@@ -91,6 +96,8 @@ export interface NativeProjectionOptions {
   allowLossy?: true;
   /** Reuses per-segment validation and prefix hashing for unchanged records. */
   memo?: NativeSegmentMemo;
+  /** Provider usage plus new materialized content, when a caller proves continuity. */
+  estimateInput?: (shape: NativeProjectionShape) => number | undefined;
 }
 
 export class NativeProjectionError extends Error {
@@ -228,7 +235,15 @@ export function projectNativeContext(
   const costPrefix = [0];
   for (const cost of costs) costPrefix.push(costPrefix.at(-1)! + cost);
   const tailCost = (index: number) => costPrefix.at(-1)! - costPrefix[index]!;
-  const rawTokens = fixedTokens + tailCost(0);
+  const usageEstimate = (shape: NativeProjectionShape) => {
+    const value = options.estimateInput?.(shape);
+    return typeof value === "number" && Number.isFinite(value) && value >= 0
+      ? value
+      : undefined;
+  };
+  const rawTokens =
+    usageEstimate({ tailStartIndex: 0, preservedPrefixIndices: [] }) ??
+    fixedTokens + tailCost(0);
   const raw = (reason?: string): NativeProjectionResult => ({
     tailStartIndex: 0,
     preservedPrefixIndices: [],
@@ -632,7 +647,10 @@ export function projectNativeContext(
     });
   }
 
-  function candidate(count: number): NativeProjectionResult | undefined {
+  function candidate(
+    count: number,
+    forcedSummaries?: Set<number>,
+  ): NativeProjectionResult | undefined {
     if (ambiguousToolMapping) return;
     const last = ranges[count - 1]!;
     const end = last.end;
@@ -653,138 +671,179 @@ export function projectNativeContext(
       pinnedCostPrefix[tailStartIndex]! +
       tailCost(tailStartIndex) +
       (anchorMessageIndex === undefined ? 0 : costs[anchorMessageIndex]!);
-    const noticeBudget = Math.min(summaryBudget, hard - baseTokens);
-    if (headerTokens > noticeBudget) return;
-    let text: string;
-    let keptSummaries: Set<number> | undefined;
-    if (headerTokens + last.detailedTokens <= noticeBudget) {
-      text =
-        header +
-        ranges
-          .slice(0, count)
-          .map((range) => range.detailedText)
-          .join("\n\n");
-    } else {
-      // Only first/last references fit a bounded aggregate. Exact intermediate
-      // metadata stays in the operator's plan, not in a model-accessible tool.
-      const counts = { ...last.reasonCounts };
-      const marker = (includeSummaryBudget = true) =>
-        `[Reflection omitted ${count} ranges: ${Object.entries(counts)
-          .filter(
-            ([reason, total]) =>
-              total! > 0 &&
-              (includeSummaryBudget || reason !== "summary-budget"),
-          )
-          .map(([reason, total]) => `${reason}=${total}`)
-          .join(
-            ", ",
-          )}. First Segment ${ranges[0]!.archived.id}; last Segment ${last.archived.id}. Intermediate references omitted for budget.]`;
-      // If all available summaries fit, do not reserve a summary-budget warning
-      // that will disappear. This also avoids shedding cached text on an outage
-      // merely because older uncached ranges now need a missing-summary warning.
-      const allSummaryMarkerTokens = estimateNativeTokens(marker(false)) + 2;
-      const markerTokens =
-        headerTokens + allSummaryMarkerTokens + last.summaryTokensPrefix <=
-        noticeBudget
-          ? allSummaryMarkerTokens
-          : estimateNativeTokens(marker()) + 2;
-      let remaining = noticeBudget - headerTokens - markerTokens;
+    const conservativeBudget = Math.min(summaryBudget, hard - baseTokens);
+    let usageBacked = false;
+    const build = (
+      noticeBudget: number,
+    ): NativeProjectionResult | undefined => {
+      if (headerTokens > noticeBudget) return;
+      let text: string;
+      let keptSummaries: Set<number> | undefined;
       if (
-        remaining < 0 ||
-        (!options.allowLossy && last.summaryTokensPrefix > remaining)
-      )
-        return;
-      keptSummaries = new Set<number>();
-      for (let index = count - 1; index >= 0; index--) {
-        const range = ranges[index]!;
-        if (range.summary === undefined || range.summaryTokens > remaining)
-          continue;
-        keptSummaries.add(index);
-        remaining -= range.summaryTokens;
-        counts["summary-budget"]! -= 1;
+        forcedSummaries === undefined &&
+        headerTokens + last.detailedTokens <= noticeBudget
+      ) {
+        text =
+          header +
+          ranges
+            .slice(0, count)
+            .map((range) => range.detailedText)
+            .join("\n\n");
+      } else {
+        // Only first/last references fit a bounded aggregate. Exact intermediate
+        // metadata stays in the operator's plan, not in a model-accessible tool.
+        const counts = { ...last.reasonCounts };
+        const marker = (includeSummaryBudget = true) =>
+          `[Reflection omitted ${count} ranges: ${Object.entries(counts)
+            .filter(
+              ([reason, total]) =>
+                total! > 0 &&
+                (includeSummaryBudget || reason !== "summary-budget"),
+            )
+            .map(([reason, total]) => `${reason}=${total}`)
+            .join(
+              ", ",
+            )}. First Segment ${ranges[0]!.archived.id}; last Segment ${last.archived.id}. Intermediate references omitted for budget.]`;
+        // If all available summaries fit, do not reserve a summary-budget warning
+        // that will disappear. This also avoids shedding cached text on an outage
+        // merely because older uncached ranges now need a missing-summary warning.
+        if (forcedSummaries !== undefined) {
+          if (
+            !options.allowLossy &&
+            last.reasonCounts["summary-budget"] !== forcedSummaries.size
+          )
+            return;
+          keptSummaries = forcedSummaries;
+          for (const index of keptSummaries) counts["summary-budget"]! -= 1;
+        } else {
+          const allSummaryMarkerTokens =
+            estimateNativeTokens(marker(false)) + 2;
+          const markerTokens =
+            headerTokens + allSummaryMarkerTokens + last.summaryTokensPrefix <=
+            noticeBudget
+              ? allSummaryMarkerTokens
+              : estimateNativeTokens(marker()) + 2;
+          let remaining = noticeBudget - headerTokens - markerTokens;
+          if (
+            remaining < 0 ||
+            (!options.allowLossy && last.summaryTokensPrefix > remaining)
+          )
+            return;
+          keptSummaries = new Set<number>();
+          for (let index = count - 1; index >= 0; index--) {
+            const range = ranges[index]!;
+            if (range.summary === undefined || range.summaryTokens > remaining)
+              continue;
+            keptSummaries.add(index);
+            remaining -= range.summaryTokens;
+            counts["summary-budget"]! -= 1;
+          }
+        }
+        const texts = [...keptSummaries]
+          .sort((a, b) => a - b)
+          .map((index) => ranges[index]!.summaryText!);
+        text = header + [marker(), ...texts].join("\n\n");
       }
-      const texts = [...keptSummaries]
-        .reverse()
-        .map((index) => ranges[index]!.summaryText!);
-      text = header + [marker(), ...texts].join("\n\n");
-    }
-    const estimatedTokens = baseTokens + estimateNativeTokens(text) + 12;
-    if (estimatedTokens > hard) return;
-    if (estimateNativeTokens(text) + 12 > summaryBudget) return;
-    const selected = ranges.slice(0, count);
-    const omissions: NativeProjectionOmission[] = [];
-    selected.forEach((range, index) => {
-      const reasons: Reason[] = [...range.warnings];
-      if (range.summary === undefined)
-        reasons.unshift("missing-or-stale-summary");
-      else if (keptSummaries && !keptSummaries.has(index))
-        reasons.unshift("summary-budget");
-      for (const reason of reasons)
-        omissions.push({
-          segmentId: range.archived.id,
-          startSourceMessageId: range.archived.start_source_message_id,
-          endSourceMessageId: range.archived.end_source_message_id,
-          reason,
-        });
-    });
-    const preservedPrefixIndices = pinnedIndices.filter(
-      (index) => index < tailStartIndex,
-    );
-    const cachedSummaries: NativeCachedSummary[] = selected.flatMap(
-      (range, index) =>
-        range.summary === undefined ||
-        (keptSummaries && !keptSummaries.has(index))
-          ? []
-          : [
-              {
-                id: range.archived.id,
-                start_source_message_id: range.archived.start_source_message_id,
-                end_source_message_id: range.archived.end_source_message_id,
-                source_fingerprint: range.archived.source_fingerprint,
-                projection_version: 3,
-                summary: range.summary,
-              },
-            ],
-    );
-    const identity = {
-      version: 2 as const,
-      source_id: source.id,
-      session_id: sessionId,
-      archived: selected.map((range) => range.archived),
-      source_prefix_fingerprint: last.sourcePrefixFingerprint,
-      tail_start_source_id: records[end + 1]?.source.id ?? null,
-      restored_user_id:
-        anchorMessageIndex === undefined
-          ? null
-          : records[latestUser]!.source.id,
-      manifest_summary_fingerprint: last.summaryPrefixFingerprint,
-      cachedSummaries,
-      cached_summaries_fingerprint: digest(cachedSummaries),
-      context_limit: options.contextLimit,
-      input_limit: inputLimit,
-      output_limit: options.outputLimit,
-    };
-    const noticeId = `reflection-native-${digest([identity, text]).slice(0, 32)}`;
-    const checkpoint: NativeProjectionCheckpoint = {
-      ...identity,
-      notice_id: noticeId,
-    };
-    const reused =
-      previous !== undefined && digest(previous) === digest(checkpoint);
-    return {
-      tailStartIndex,
-      preservedPrefixIndices,
-      notice: {
+      if (estimateNativeTokens(text) + 12 > summaryBudget) return;
+      const selected = ranges.slice(0, count);
+      const omissions: NativeProjectionOmission[] = [];
+      selected.forEach((range, index) => {
+        const reasons: Reason[] = [...range.warnings];
+        if (range.summary === undefined)
+          reasons.unshift("missing-or-stale-summary");
+        else if (keptSummaries && !keptSummaries.has(index))
+          reasons.unshift("summary-budget");
+        for (const reason of reasons)
+          omissions.push({
+            segmentId: range.archived.id,
+            startSourceMessageId: range.archived.start_source_message_id,
+            endSourceMessageId: range.archived.end_source_message_id,
+            reason,
+          });
+      });
+      const preservedPrefixIndices = pinnedIndices.filter(
+        (index) => index < tailStartIndex,
+      );
+      const cachedSummaries: NativeCachedSummary[] = selected.flatMap(
+        (range, index) =>
+          range.summary === undefined ||
+          (keptSummaries && !keptSummaries.has(index))
+            ? []
+            : [
+                {
+                  id: range.archived.id,
+                  start_source_message_id:
+                    range.archived.start_source_message_id,
+                  end_source_message_id: range.archived.end_source_message_id,
+                  source_fingerprint: range.archived.source_fingerprint,
+                  projection_version: 3,
+                  summary: range.summary,
+                },
+              ],
+      );
+      const identity = {
+        version: 2 as const,
+        source_id: source.id,
+        session_id: sessionId,
+        archived: selected.map((range) => range.archived),
+        source_prefix_fingerprint: last.sourcePrefixFingerprint,
+        tail_start_source_id: records[end + 1]?.source.id ?? null,
+        restored_user_id:
+          anchorMessageIndex === undefined
+            ? null
+            : records[latestUser]!.source.id,
+        manifest_summary_fingerprint: last.summaryPrefixFingerprint,
+        cachedSummaries,
+        cached_summaries_fingerprint: digest(cachedSummaries),
+        context_limit: options.contextLimit,
+        input_limit: inputLimit,
+        output_limit: options.outputLimit,
+      };
+      const noticeId = `reflection-native-${digest([identity, text]).slice(0, 32)}`;
+      const notice = {
         id: noticeId,
         text,
         ...(anchorMessageIndex === undefined ? {} : { anchorMessageIndex }),
-      },
-      checkpoint: reused ? previous : checkpoint,
-      lossy: omissions.length > 0,
-      omissions,
-      estimatedTokens,
-      reset: !reused,
+      };
+      const shape = { tailStartIndex, preservedPrefixIndices, notice };
+      const conservativeTokens = baseTokens + estimateNativeTokens(text) + 12;
+      const measured = usageEstimate(shape);
+      usageBacked = measured !== undefined;
+      const estimatedTokens = measured ?? conservativeTokens;
+      if (estimatedTokens > hard) return;
+      const checkpoint: NativeProjectionCheckpoint = {
+        ...identity,
+        notice_id: noticeId,
+      };
+      const reused =
+        previous !== undefined && digest(previous) === digest(checkpoint);
+      if (
+        forcedSummaries !== undefined &&
+        (measured === undefined || !reused || noticeId !== previous?.notice_id)
+      )
+        return;
+      return {
+        tailStartIndex,
+        preservedPrefixIndices,
+        notice,
+        checkpoint: reused ? previous : checkpoint,
+        lossy: omissions.length > 0,
+        omissions,
+        estimatedTokens,
+        reset: !reused,
+      };
     };
+    // Re-render the exact old selection independently of today's conservative
+    // base. Only measured whole-input usage may authorize that old notice.
+    if (forcedSummaries !== undefined) return build(summaryBudget);
+    // The whole-payload estimate must not discard a usage-backed plan before
+    // the caller sees its actual notice. Keep the old tighter notice budget
+    // when usage is unavailable, including for this exact candidate.
+    const full = build(summaryBudget);
+    if (full && (conservativeBudget >= summaryBudget || usageBacked))
+      return full;
+    if (conservativeBudget < summaryBudget) return build(conservativeBudget);
+    return full;
   }
 
   // Recompute budgets/mapping on every invocation; raw model messages and user
@@ -797,6 +856,36 @@ export function projectNativeContext(
   ) {
     const count = previous.archived.length;
     if (count > 0 && count <= ranges.length) {
+      if (Array.isArray(previous.cachedSummaries)) {
+        const selected = new Set<number>();
+        let next = 0;
+        let valid = true;
+        for (const cachedSummary of previous.cachedSummaries) {
+          const entry = object(cachedSummary);
+          while (next < count && ranges[next]!.archived.id !== entry?.id)
+            next++;
+          const range = ranges[next];
+          if (
+            next >= count ||
+            !range ||
+            entry?.projection_version !== 3 ||
+            entry.summary !== range.summary ||
+            entry.start_source_message_id !==
+              range.archived.start_source_message_id ||
+            entry.end_source_message_id !==
+              range.archived.end_source_message_id ||
+            entry.source_fingerprint !== range.archived.source_fingerprint
+          ) {
+            valid = false;
+            break;
+          }
+          selected.add(next++);
+        }
+        if (valid) {
+          const forced = candidate(count, selected);
+          if (forced && forced.estimatedTokens <= soft) return forced;
+        }
+      }
       const existing = candidate(count);
       if (
         existing &&

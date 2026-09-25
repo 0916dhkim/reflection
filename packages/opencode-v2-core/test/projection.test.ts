@@ -100,6 +100,180 @@ function retained(
 }
 
 describe("native projection plans", () => {
+  it("retains an existing checkpoint when an append-only provider estimate is below soft despite huge static content", () => {
+    const input = fixture();
+    const original = projectNativeContext(input);
+    input.previous = original.checkpoint;
+    input.messages = input.messages.map((message, index) =>
+      index === 2
+        ? {
+            ...message,
+            content: [{ type: "reasoning", encrypted: "x".repeat(100_000) }],
+          }
+        : message,
+    );
+    expect(() => projectNativeContext(input)).toThrow(/no source-safe/);
+    input.estimateInput = (shape) =>
+      shape.notice?.id === original.notice?.id ? 2500 : undefined;
+    const plan = projectNativeContext(input);
+    expect(plan.checkpoint).toBe(input.previous);
+    expect(plan.reset).toBe(false);
+    expect(plan.estimatedTokens).toBe(2500);
+    input.estimateInput = () => NaN;
+    expect(() => projectNativeContext(input)).toThrow(/no source-safe/);
+  });
+
+  it("reuses an exactly reconstructed budget-trimmed notice despite a negative current conservative budget", () => {
+    const input = fixture(
+      [
+        user("u"),
+        assistant("a"),
+        assistant("a2", "small completed work"),
+        assistant("a3", "small completed work"),
+        { ...assistant("tail", "x".repeat(11_400)), time: { created: 0 } },
+      ],
+      1,
+    );
+    input.allowLossy = true;
+    input.manifest.segments.forEach((entry, index) => {
+      entry.summary = `Verified ${index}: ${"specific work ".repeat(4)}`;
+    });
+    const prior = projectNativeContext(input);
+    expect(prior.notice?.text).toContain("summary-budget=");
+    expect(prior.checkpoint!.cachedSummaries).toHaveLength(1);
+    input.previous = prior.checkpoint;
+    input.messages = input.messages.map((message, index) =>
+      index === input.messages.length - 1
+        ? {
+            ...message,
+            content: [{ type: "reasoning", encrypted: "x".repeat(100_000) }],
+          }
+        : message,
+    );
+    expect(() => projectNativeContext(input)).toThrow(/no source-safe/);
+    const unforced = projectNativeContext({
+      ...input,
+      previous: undefined,
+      estimateInput: (shape) => (shape.notice ? 2500 : undefined),
+    });
+    expect(unforced.notice?.id).not.toBe(prior.notice?.id);
+    input.estimateInput = (shape) =>
+      shape.notice?.id === prior.notice?.id ? 2500 : undefined;
+    const reused = projectNativeContext(input);
+    expect(reused.notice).toEqual(prior.notice);
+    expect(reused.checkpoint).toBe(input.previous);
+    expect(reused.reset).toBe(false);
+    expect(reused.estimatedTokens).toBe(2500);
+
+    const selected = input.previous!.cachedSummaries[0]!;
+    input.manifest.segments.find((entry) => entry.id === selected.id)!.summary =
+      "Changed verified work";
+    expect(() => projectNativeContext(input)).toThrow(/no source-safe/);
+  });
+
+  it("reconstructs multiple selected summaries in original source order", () => {
+    const input = fixture(
+      [
+        user("u"),
+        assistant("a", "x".repeat(12_000)),
+        ...Array.from({ length: 6 }, (_, index) =>
+          assistant(`a-${index}`, "small completed work"),
+        ),
+        { ...assistant("tail", "x".repeat(10_800)), time: { created: 0 } },
+      ],
+      1,
+    );
+    input.allowLossy = true;
+    input.manifest.segments.forEach((entry, index) => {
+      entry.summary = `Verified ${index}: ${"specific work ".repeat(4)}`;
+    });
+    const prior = projectNativeContext(input);
+    expect(prior.notice!.text).toContain("summary-budget=");
+    expect(prior.checkpoint!.cachedSummaries.length).toBeGreaterThanOrEqual(2);
+    expect(prior.checkpoint!.cachedSummaries.length).toBeLessThan(
+      prior.checkpoint!.archived.length,
+    );
+    input.previous = prior.checkpoint;
+    input.messages = input.messages.map((message, index) =>
+      index === input.messages.length - 1
+        ? {
+            ...message,
+            content: [{ type: "reasoning", encrypted: "x".repeat(100_000) }],
+          }
+        : message,
+    );
+    input.estimateInput = (shape) =>
+      shape.notice?.id === prior.notice?.id ? 2500 : undefined;
+    const reused = projectNativeContext(input);
+    expect(reused.notice).toEqual(prior.notice);
+    expect(reused.checkpoint).toBe(prior.checkpoint);
+    expect(reused.reset).toBe(false);
+    const summaries = prior.checkpoint!.cachedSummaries;
+    for (let index = 1; index < summaries.length; index++) {
+      expect(
+        prior.notice!.text.indexOf(summaries[index - 1]!.summary),
+      ).toBeLessThan(prior.notice!.text.indexOf(summaries[index]!.summary));
+    }
+  });
+
+  it("reuses an aggregate notice with no cached summaries when usage authorizes it", () => {
+    const input = fixture();
+    input.allowLossy = true;
+    input.manifest.segments.forEach((entry) => {
+      entry.summary = "verified ".repeat(500);
+    });
+    const original = projectNativeContext(input);
+    expect(original.checkpoint!.cachedSummaries).toEqual([]);
+    input.previous = original.checkpoint;
+    input.messages = input.messages.map((message, index) =>
+      index === 2
+        ? {
+            ...message,
+            content: [{ type: "reasoning", encrypted: "x".repeat(100_000) }],
+          }
+        : message,
+    );
+    input.estimateInput = () => 2500;
+    const reused = projectNativeContext(input);
+    expect(reused.notice).toEqual(original.notice);
+    expect(reused.checkpoint).toBe(original.checkpoint);
+    expect(reused.reset).toBe(false);
+  });
+
+  it("provider estimates do not bypass source-safe cuts or unsupported media", () => {
+    const input = fixture();
+    input.estimateInput = () => 0;
+    input.messages = [
+      ...input.messages,
+      { role: "tool", content: [{ type: "tool-result", id: "unmapped" }] },
+    ];
+    // Mapping remains source-safe even when raw usage is zero.
+    expect(projectNativeContext(input).notice).toBeUndefined();
+    input.messages = [
+      { id: "u", role: "user", content: [{ type: "audio", data: "opaque" }] },
+    ];
+    expect(() => projectNativeContext(input)).toThrow(/audio/);
+  });
+
+  it("growth above soft pressure declines prior reuse and builds a new source-safe projection", () => {
+    const initial = fixture();
+    const prior = projectNativeContext(initial);
+    const input = fixture([
+      ...initial.records.map((record) => record.raw),
+      assistant("next", "x".repeat(12_000)),
+      assistant("live", "recent"),
+    ]);
+    input.previous = prior.checkpoint;
+    input.estimateInput = (shape) =>
+      shape.notice?.id === prior.notice?.id ? 3800 : undefined;
+    const plan = projectNativeContext(input);
+    expect(plan.notice?.id).not.toBe(prior.notice?.id);
+    expect(plan.checkpoint?.archived.length).toBeGreaterThan(
+      prior.checkpoint!.archived.length,
+    );
+    expect(plan.estimatedTokens).toBeLessThanOrEqual(4050);
+  });
+
   it("labels verified summaries with the actual source and exact segment identities", () => {
     const input = fixture(undefined, 1000, {
       ...source,
