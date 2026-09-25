@@ -35,6 +35,7 @@ import { Operations, bounded } from "./operations.js";
 import {
   applyModelAllowlist,
   guardGeminiToolResults,
+  instructionUsageIdentity,
   isUserModelAllowed,
   parseUserPolicy,
   readUserInstructionParts,
@@ -263,6 +264,7 @@ export async function setup(ctx: Plugin.Context) {
     try {
       const { http, ingestion } = await requireReady(signal);
       let requestSystem = event.system;
+      let usageSystem = event.system;
       let requestMessages: readonly SessionContext["messages"][number][] =
         event.messages;
       const baseSystem = instructionBases.get(event.system) ?? event.system;
@@ -276,6 +278,10 @@ export async function setup(ctx: Plugin.Context) {
           );
           signal.throwIfAborted();
           requestSystem = [...baseSystem, ...parts];
+          usageSystem = [
+            ...baseSystem,
+            ...instructionUsageIdentity(userPolicy, parts),
+          ];
           requestMessages = guardGeminiToolResults(
             event.messages,
             event.model,
@@ -424,7 +430,7 @@ export async function setup(ctx: Plugin.Context) {
         event.sessionID,
         snapshot.records,
         event.model,
-        system,
+        estimationValue(usageSystem),
         toolBudget,
         estimationValue(event.options),
       );

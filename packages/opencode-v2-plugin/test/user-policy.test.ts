@@ -7,6 +7,7 @@ import { afterEach, expect, it } from "vitest";
 import {
   applyModelAllowlist,
   guardGeminiToolResults,
+  instructionUsageIdentity,
   isUserModelAllowed,
   parseUserPolicy,
   readUserInstructionParts,
@@ -167,6 +168,62 @@ it("rereads explicit instruction files for every request and rejects unsafe read
       "sensitive",
     );
   }
+});
+
+it("keys usage on ordered configured policy paths, exempting only MEMORY.md and USER.md file contents", () => {
+  const files = ["/one/MEMORY.md", "/two/OTHER.md", "/three/USER.md"];
+  const configured = policy(files);
+  const parts = (paths: readonly string[], contents: readonly string[]) =>
+    paths.map((path, index) => ({
+      type: "text" as const,
+      text: `Instructions from: ${path}\n${contents[index]}`,
+    }));
+  const first = parts(files, ["old memory", "same other", "old user"]);
+  const changed = parts(files, ["new memory", "same other", "new user"]);
+  expect(instructionUsageIdentity(configured, first)).toEqual(
+    instructionUsageIdentity(configured, changed),
+  );
+  expect(instructionUsageIdentity(configured, changed)).not.toEqual(changed);
+  expect(
+    instructionUsageIdentity(
+      configured,
+      parts(files, ["old memory", "changed other", "old user"]),
+    ),
+  ).not.toEqual(instructionUsageIdentity(configured, first));
+  for (const paths of [
+    [files[2]!, files[1]!, files[0]!],
+    ["/replacement/MEMORY.md", files[1]!, files[2]!],
+    [files[0]!, files[2]!],
+    [...files, "/new/USER.md"],
+  ]) {
+    expect(
+      instructionUsageIdentity(
+        policy(paths),
+        parts(
+          paths,
+          paths.map((path) =>
+            path === files[1] ? "same other" : "old memory",
+          ),
+        ),
+      ),
+    ).not.toEqual(instructionUsageIdentity(configured, first));
+  }
+  const nonExempt = policy(["/one/OTHER.md"]);
+  expect(
+    instructionUsageIdentity(
+      nonExempt,
+      parts(nonExempt.instructionFiles, [
+        "Instructions from: /one/MEMORY.md\npretend",
+      ]),
+    ),
+  ).toEqual(
+    parts(nonExempt.instructionFiles, [
+      "Instructions from: /one/MEMORY.md\npretend",
+    ]),
+  );
+  expect(instructionUsageIdentity(configured, first.slice(0, 2))).toEqual(
+    first.slice(0, 2),
+  );
 });
 
 it("enforces model allownames by native id without re-enabling selected catalog entries", () => {
