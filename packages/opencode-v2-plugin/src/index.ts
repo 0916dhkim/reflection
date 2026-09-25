@@ -282,11 +282,14 @@ export async function setup(ctx: Plugin.Context) {
         }
       }
       const source = await http.source(http.config.sourceId, signal);
+      // Every model step needs full records, so reuse the settled prefix and
+      // read only the tail instead of re-paging the whole session.
       const snapshot = await http.snapshot(
         source,
         event.sessionID,
         signal,
         false,
+        true,
       );
       const directory = String(object(snapshot.info.location).directory);
       if (directory !== ctx.location.directory)
@@ -670,6 +673,7 @@ export async function setup(ctx: Plugin.Context) {
       if (typeof id !== "string") continue;
       if (event.type === "session.deleted") {
         ingestion?.clear(id);
+        http?.forget(http.config.sourceId, id);
         void operations
           .delete(id, () =>
             bounded(ctx.storage.remove(key(id)), AbortSignal.timeout(5000)),

@@ -1,11 +1,14 @@
 import { describe, expect, it } from "vitest";
+import { canonicalizeNativeHistory } from "@reflection/opencode-v2-core/history";
 import {
   AvailabilityError,
+  HISTORY_CACHE_SESSIONS,
   RequestRejectedError,
   Transport,
   automaticCompaction,
   configSchema,
   legacyHistory,
+  nativeCursorAfter,
   type Config,
 } from "../src/transport.js";
 
@@ -344,5 +347,335 @@ describe("source-owned transport", () => {
       "new",
     ]);
     expect(() => legacyHistory([...history].reverse())).toThrow("out of order");
+  });
+});
+
+// Emulates the 2.0.8 message store: rows ordered by an append sequence,
+// updates keep the sequence, a revert deletes a suffix, and a cursor anchors
+// after an existing message or returns [] when the anchor is gone.
+function nativeServer() {
+  const sessions = new Map<string, Array<Record<string, unknown>>>();
+  const reads: Array<{ session: string; after?: string }> = [];
+  const control = { rejectNextCursor: false, racing: false, revision: 1 };
+  const rows = (session: string) => {
+    if (!sessions.has(session)) sessions.set(session, []);
+    return sessions.get(session)!;
+  };
+  let created = 0;
+  const user = (id: string) => ({
+    id,
+    type: "user",
+    text: id,
+    time: { created: ++created },
+  });
+  const assistant = (id: string, text = id) => ({
+    id,
+    type: "assistant",
+    agent: "build",
+    model: { providerID: "p", id: "m" },
+    content: [{ type: "text", text }],
+    time: { created: ++created, completed: created },
+  });
+  const shell = (id: string, status: string) => ({
+    id,
+    type: "shell",
+    shellID: id,
+    command: "sleep",
+    status,
+    time: { created: ++created },
+  });
+  const http = new Transport(config, async (input) => {
+    const url = new URL(String(input));
+    if (url.pathname === "/api/session/active")
+      return Response.json({ data: {} });
+    const match = url.pathname.match(/^\/api\/session\/([^/]+)(\/message)?$/);
+    if (!match) throw new Error(`unexpected ${url.pathname}`);
+    const session = decodeURIComponent(match[1]!);
+    if (!match[2])
+      return Response.json({
+        data: {
+          id: session,
+          time: { updated: control.revision },
+          location: { directory: "/work" },
+        },
+      });
+    if (control.racing) control.revision++;
+    const cursor = url.searchParams.get("cursor");
+    if (cursor && control.rejectNextCursor) {
+      control.rejectNextCursor = false;
+      return Response.json(
+        { _tag: "InvalidCursorError", message: "Invalid cursor" },
+        { status: 400 },
+      );
+    }
+    const after = cursor
+      ? (
+          JSON.parse(Buffer.from(cursor, "base64url").toString("utf8")) as {
+            id: string;
+          }
+        ).id
+      : undefined;
+    reads.push({ session, ...(after === undefined ? {} : { after }) });
+    const all = rows(session);
+    let start = 0;
+    if (after !== undefined) {
+      start = all.findLastIndex((message) => message.id === after) + 1;
+      if (start === 0)
+        return Response.json({
+          data: [],
+          cursor: { previous: null, next: null },
+        });
+    }
+    const page = structuredClone(
+      all.slice(start, start + Number(url.searchParams.get("limit"))),
+    );
+    const last = page.at(-1);
+    return Response.json({
+      data: page,
+      cursor: {
+        previous: null,
+        next: last ? nativeCursorAfter(String(last.id)) : null,
+      },
+    });
+  });
+  return {
+    http,
+    reads,
+    control,
+    rows,
+    user,
+    assistant,
+    shell,
+    snapshot: (session = "s", incremental = true) =>
+      http.snapshot(registry, session, signal(), false, incremental),
+    expected: (session = "s") =>
+      canonicalizeNativeHistory(structuredClone(rows(session))),
+    revert: (session: string, id: string) => {
+      const all = rows(session);
+      all.splice(all.findIndex((message) => message.id === id));
+    },
+  };
+}
+
+describe("incremental native snapshots", () => {
+  it("encodes the 2.0.8 message cursor", () => {
+    expect(
+      JSON.parse(
+        Buffer.from(nativeCursorAfter("msg_1"), "base64url").toString(),
+      ),
+    ).toEqual({ id: "msg_1", order: "asc", direction: "next" });
+  });
+  it("reads only the tail after the settled prefix and matches a full read", async () => {
+    const native = nativeServer();
+    const { user, assistant } = native;
+    native
+      .rows("s")
+      .push(
+        user("u1"),
+        assistant("a1"),
+        user("u2"),
+        assistant("a2"),
+        user("u3"),
+      );
+    expect((await native.snapshot()).records).toEqual(native.expected());
+    expect(native.reads).toEqual([
+      { session: "s" },
+      { session: "s", after: "u3" },
+    ]);
+
+    native.rows("s").push(assistant("a3"), user("u4"));
+    native.reads.length = 0;
+    // The latest assistant a2 was not cached, so the settled prefix is u1..u2
+    // and the overlap re-reads u2 after anchor a1.
+    expect((await native.snapshot()).records).toEqual(native.expected());
+    expect(native.reads).toEqual([
+      { session: "s", after: "a1" },
+      { session: "s", after: "u4" },
+    ]);
+
+    native.reads.length = 0;
+    expect((await native.snapshot()).records).toEqual(native.expected());
+    expect(native.reads[0]).toEqual({ session: "s", after: "a2" });
+  });
+  it("never caches the latest assistant or anything from the first incomplete record", async () => {
+    const native = nativeServer();
+    const { user, assistant, shell } = native;
+    native
+      .rows("s")
+      .push(
+        user("u1"),
+        assistant("a1"),
+        user("u2"),
+        shell("sh", "running"),
+        user("u3"),
+        assistant("a2"),
+        user("u4"),
+      );
+    await native.snapshot();
+    // A background shell finishes and a step retry revives the latest assistant.
+    const all = native.rows("s");
+    all[3] = { ...all[3], status: "exited", output: "done" };
+    all[5] = assistant("a2", "retried");
+    native.reads.length = 0;
+    expect((await native.snapshot()).records).toEqual(native.expected());
+    expect(native.reads[0]).toEqual({ session: "s", after: "a1" });
+  });
+  it("re-reads a retried latest assistant even when every record is complete", async () => {
+    const native = nativeServer();
+    const { user, assistant } = native;
+    native
+      .rows("s")
+      .push(
+        user("u1"),
+        assistant("a1"),
+        user("u2"),
+        assistant("a2"),
+        user("u3"),
+      );
+    await native.snapshot();
+    native.rows("s")[3] = assistant("a2", "retried");
+    native.reads.length = 0;
+    expect((await native.snapshot()).records).toEqual(native.expected());
+    expect(native.reads[0]).toEqual({ session: "s", after: "a1" });
+  });
+  it.each([
+    ["inside the cached prefix", "u2"],
+    ["at the last cached message", "u3"],
+  ])("falls back to a full read after a revert %s", async (_, boundary) => {
+    const native = nativeServer();
+    const { user, assistant } = native;
+    native
+      .rows("s")
+      .push(
+        user("u1"),
+        assistant("a1"),
+        user("u2"),
+        assistant("a2"),
+        user("u3"),
+        assistant("a3"),
+        user("u4"),
+      );
+    await native.snapshot();
+    native.revert("s", boundary);
+    native.rows("s").push(user("u5"), assistant("a4"), user("u6"));
+    native.reads.length = 0;
+    expect((await native.snapshot()).records).toEqual(native.expected());
+    expect(native.reads.at(-2)).toEqual({ session: "s" });
+  });
+  it("falls back to a full read when the last cached message changed", async () => {
+    const native = nativeServer();
+    const { user, assistant } = native;
+    native
+      .rows("s")
+      .push(
+        user("u1"),
+        assistant("a1"),
+        user("u2"),
+        assistant("a2"),
+        user("u3"),
+      );
+    await native.snapshot();
+    native.rows("s")[2] = { ...native.rows("s")[2], text: "edited" };
+    native.reads.length = 0;
+    expect((await native.snapshot()).records).toEqual(native.expected());
+    expect(native.reads.map((read) => read.after)).toEqual([
+      "a1",
+      "u3",
+      undefined,
+      "u3",
+    ]);
+  });
+  it("never returns a tail that repeats a cached message ID", async () => {
+    const native = nativeServer();
+    const { user, assistant } = native;
+    native
+      .rows("s")
+      .push(
+        user("u1"),
+        assistant("a1"),
+        user("u2"),
+        assistant("a2"),
+        user("u3"),
+      );
+    await native.snapshot();
+    native.rows("s").push(user("u1"));
+    native.reads.length = 0;
+    // The tail is discarded and the full read rejects the duplicate itself.
+    await expect(native.snapshot()).rejects.toThrow("duplicate");
+    expect(native.reads[0]).toEqual({ session: "s", after: "a1" });
+    expect(native.reads.slice(1)).toContainEqual({ session: "s" });
+  });
+  it("caches only a stable snapshot", async () => {
+    const native = nativeServer();
+    const { user, assistant } = native;
+    native
+      .rows("s")
+      .push(
+        user("u1"),
+        assistant("a1"),
+        user("u2"),
+        assistant("a2"),
+        user("u3"),
+      );
+    native.control.racing = true;
+    await expect(native.snapshot()).rejects.toThrow("revision/status changed");
+    expect(native.http.histories.size).toBe(0);
+    native.control.racing = false;
+    await native.snapshot();
+    expect(native.http.histories.size).toBe(1);
+  });
+  it("falls back to a full read when the host rejects the cursor", async () => {
+    const native = nativeServer();
+    const { user, assistant } = native;
+    native
+      .rows("s")
+      .push(
+        user("u1"),
+        assistant("a1"),
+        user("u2"),
+        assistant("a2"),
+        user("u3"),
+      );
+    await native.snapshot();
+    native.rows("s").push(assistant("a3"));
+    native.control.rejectNextCursor = true;
+    native.reads.length = 0;
+    expect((await native.snapshot()).records).toEqual(native.expected());
+    expect(native.reads[0]).toEqual({ session: "s" });
+  });
+  it("keeps non-incremental snapshots uncached and bounds cached sessions", async () => {
+    const native = nativeServer();
+    const { user, assistant } = native;
+    const fill = (session: string) =>
+      native
+        .rows(session)
+        .push(
+          user(`${session}u1`),
+          user(`${session}u2`),
+          assistant(`${session}a1`),
+        );
+    fill("idle");
+    await native.snapshot("idle", false);
+    await native.snapshot("idle", false);
+    expect(native.http.histories.size).toBe(0);
+    expect(
+      native.reads.every(
+        (read) => read.after === undefined || read.after === "idlea1",
+      ),
+    ).toBe(true);
+
+    for (let index = 0; index <= HISTORY_CACHE_SESSIONS; index++) {
+      fill(`s${index}`);
+      await native.snapshot(`s${index}`);
+    }
+    expect(native.http.histories.size).toBe(HISTORY_CACHE_SESSIONS);
+    expect([...native.http.histories.keys()][0]).toBe(
+      JSON.stringify(["native", "s1"]),
+    );
+
+    native.http.forget("native", "s1");
+    native.reads.length = 0;
+    await native.snapshot("s1");
+    expect(native.reads[0]).toEqual({ session: "s1" });
   });
 });
