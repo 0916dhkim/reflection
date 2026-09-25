@@ -252,7 +252,7 @@ describe("resolution validation", () => {
     ).toEqual(candidates);
   });
 
-  it("requires supplied candidates and exact occurrence coverage", () => {
+  it("replaces a never-supplied candidate with a new entity and requires exact occurrence coverage", () => {
     const context: MentionContext = {
       mentionId: "c0.subject",
       role: "subject",
@@ -270,25 +270,50 @@ describe("resolution validation", () => {
         },
       ],
     };
-    expect(() => validateResolutionResult(proposed, [context], bad)).toThrow(
-      ExtractionValidationError,
-    );
-    const alphabeticId = "deadbeef-dead-4abc-8abc-123456789012";
-    expect(() =>
-      validateResolutionResult(
-        proposed,
-        [{ ...context, candidates: [entity(alphabeticId, "Reflection")] }],
-        {
-          ...bad,
-          resolutions: [
-            {
-              ...bad.resolutions[0]!,
-              candidate_entity_id: alphabeticId.toUpperCase(),
-            },
-          ],
+    const replaced = validateResolutionResult(proposed, [context], bad);
+    expect(replaced.mentions).toEqual([
+      {
+        context,
+        resolution: {
+          mention_id: "c0.subject",
+          candidate_entity_id: null,
+          same_new_entity_as: null,
         },
-      ),
-    ).toThrow("unknown candidate");
+        selectedCandidate: null,
+      },
+    ]);
+    expect(replaced.substitutions).toEqual([
+      {
+        mentionId: "c0.subject",
+        candidateEntityId: UUIDS[1]!,
+        outcome: "new_entity",
+      },
+    ]);
+    // IDs are matched exactly; a case-changed copy was never supplied.
+    const alphabeticId = "deadbeef-dead-4abc-8abc-123456789012";
+    const caseChanged = validateResolutionResult(
+      proposed,
+      [{ ...context, candidates: [entity(alphabeticId, "Reflection")] }],
+      {
+        ...bad,
+        resolutions: [
+          {
+            ...bad.resolutions[0]!,
+            candidate_entity_id: alphabeticId.toUpperCase(),
+          },
+        ],
+      },
+    );
+    expect(caseChanged.mentions[0]!.selectedCandidate).toBeNull();
+    expect(caseChanged.substitutions[0]!.outcome).toBe("new_entity");
+    expect(
+      validateResolutionResult(proposed, [context], {
+        ...bad,
+        resolutions: [
+          { ...bad.resolutions[0]!, candidate_entity_id: UUIDS[0]! },
+        ],
+      }).substitutions,
+    ).toEqual([]);
     expect(() =>
       validateResolutionResult(
         proposed,
@@ -301,6 +326,155 @@ describe("resolution validation", () => {
         },
       ),
     ).toThrow("every mention");
+  });
+
+  it("accepts a candidate supplied for another mention in the same request", () => {
+    const twoClaims: ExtractedClaim[] = [
+      {
+        subject: "application-ownership.md",
+        predicate: "documents",
+        confidence: 0.9,
+        object_entity: null,
+        object_value: "application ownership",
+      },
+      {
+        subject: "frontend/react/docs/application-ownership.md",
+        predicate: "is scoped to",
+        confidence: 0.9,
+        object_entity: null,
+        object_value: "React applications",
+      },
+    ];
+    const doc = entity(
+      UUIDS[0]!,
+      "frontend/react/docs/application-ownership.md",
+    );
+    const droppedOnly = entity(UUIDS[2]!, "Dropped-only candidate");
+    const contexts: MentionContext[] = [
+      {
+        mentionId: "c0.subject",
+        role: "subject",
+        text: "application-ownership.md",
+        supportingClaim:
+          "application-ownership.md | documents | application ownership",
+        candidates: [entity(UUIDS[1]!, "ownership.md")],
+      },
+      {
+        mentionId: "c1.subject",
+        role: "subject",
+        text: "frontend/react/docs/application-ownership.md",
+        supportingClaim:
+          "frontend/react/docs/application-ownership.md | is scoped to | React applications",
+        candidates: [doc, droppedOnly],
+      },
+    ];
+    const plan = validateResolutionResult(twoClaims, contexts, {
+      claims: [
+        { claim_id: "c0", action: "keep", reason: "supported" },
+        { claim_id: "c1", action: "keep", reason: "supported" },
+      ],
+      resolutions: [
+        {
+          mention_id: "c0.subject",
+          candidate_entity_id: doc.id,
+          same_new_entity_as: null,
+        },
+        {
+          mention_id: "c1.subject",
+          candidate_entity_id: doc.id,
+          same_new_entity_as: null,
+        },
+      ],
+    });
+    expect(plan.mentions.map((mention) => mention.selectedCandidate)).toEqual([
+      doc,
+      doc,
+    ]);
+    expect(plan.substitutions).toEqual([
+      {
+        mentionId: "c0.subject",
+        candidateEntityId: doc.id,
+        outcome: "other_mention_candidate",
+      },
+    ]);
+
+    // Candidates shown only for a dropped claim's mention were still supplied.
+    const afterDrop = validateResolutionResult(twoClaims, contexts, {
+      claims: [
+        { claim_id: "c0", action: "keep", reason: "supported" },
+        { claim_id: "c1", action: "drop", reason: "transient" },
+      ],
+      resolutions: [
+        {
+          mention_id: "c0.subject",
+          candidate_entity_id: droppedOnly.id,
+          same_new_entity_as: null,
+        },
+      ],
+    });
+    expect(afterDrop.mentions[0]!.selectedCandidate).toEqual(droppedOnly);
+    expect(afterDrop.substitutions[0]!.outcome).toBe("other_mention_candidate");
+  });
+
+  it("keeps a substituted mention out of new-entity groups", () => {
+    const contexts: MentionContext[] = ["c0.subject", "c1.subject"].map(
+      (mentionId, index) => ({
+        mentionId,
+        role: "subject",
+        text: "Reflection",
+        supportingClaim: `Reflection | has property | ${index}`,
+        candidates: [],
+      }),
+    );
+    const groupedProposed = contexts.map((_, index) => ({
+      subject: "Reflection",
+      predicate: "has property",
+      confidence: 0.9,
+      object_entity: null,
+      object_value: String(index),
+    }));
+    const claims = groupedProposed.map((_, index) => ({
+      claim_id: `c${index}`,
+      action: "keep" as const,
+      reason: "supported" as const,
+    }));
+    const unknown = UUIDS[3]!;
+    // The anchor selected a never-supplied candidate.
+    expect(() =>
+      validateResolutionResult(groupedProposed, contexts, {
+        claims,
+        resolutions: [
+          {
+            mention_id: "c0.subject",
+            candidate_entity_id: unknown,
+            same_new_entity_as: null,
+          },
+          {
+            mention_id: "c1.subject",
+            candidate_entity_id: null,
+            same_new_entity_as: "c0.subject",
+          },
+        ],
+      }),
+    ).toThrow("invalid new-entity group for c1.subject");
+    // The grouped mention selected a never-supplied candidate.
+    expect(() =>
+      validateResolutionResult(groupedProposed, contexts, {
+        claims,
+        resolutions: [
+          {
+            mention_id: "c0.subject",
+            candidate_entity_id: null,
+            same_new_entity_as: null,
+          },
+          {
+            mention_id: "c1.subject",
+            candidate_entity_id: unknown,
+            same_new_entity_as: "c0.subject",
+          },
+        ],
+      }),
+    ).toThrow("invalid new-entity group for c1.subject");
   });
 
   it("allows only direct earlier links between equivalent new mentions", () => {

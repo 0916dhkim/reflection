@@ -130,7 +130,11 @@ export class ExtractionEngine {
       contextSpecs.map((spec) => [spec.mentionId, spec.claim]),
     );
 
-    let plan: ValidatedResolutionPlan = { keptClaims: [], mentions: [] };
+    let plan: ValidatedResolutionPlan = {
+      keptClaims: [],
+      mentions: [],
+      substitutions: [],
+    };
     if (contexts.length > 0) {
       plan = await this.#models.resolve(
         job,

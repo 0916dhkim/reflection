@@ -731,7 +731,15 @@ export class ModelClient {
       maxTokens: 32_768,
     });
     try {
-      return validateResolutionResult(claims, mentions, rawResult);
+      const plan = validateResolutionResult(claims, mentions, rawResult);
+      for (const substitution of plan.substitutions) {
+        this.#logger.warn("substituted candidate outside mention list", {
+          model: this.#settings.resolutionModel,
+          segmentId: source.segmentId,
+          ...substitution,
+        });
+      }
+      return plan;
     } catch (error) {
       if (!(error instanceof ExtractionValidationError)) throw error;
       this.#logger.warn("invalid joint resolution result", {
