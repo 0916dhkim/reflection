@@ -1,5 +1,5 @@
-import { constants, type BigIntStats } from "node:fs";
-import { open, stat } from "node:fs/promises";
+import { constants } from "node:fs";
+import { open } from "node:fs/promises";
 import { basename, isAbsolute, resolve } from "node:path";
 import {
   SystemPart,
@@ -185,51 +185,10 @@ export function applyModelAllowlist(
   }
 }
 
-interface FileSnapshot {
-  readonly dev: bigint;
-  readonly ino: bigint;
-  readonly mtimeNs: bigint;
-  readonly ctimeNs: bigint;
-  readonly size: bigint;
-}
-
 interface ReadInstruction {
   readonly path: string;
-  readonly snapshot: FileSnapshot;
   readonly text: string;
   readonly bytes: number;
-}
-
-function snapshot(value: BigIntStats): FileSnapshot | undefined {
-  if (
-    !value.isFile() ||
-    value.size < 0n ||
-    value.size > BigInt(MAX_INSTRUCTION_BYTES)
-  ) {
-    return undefined;
-  }
-  return {
-    dev: value.dev,
-    ino: value.ino,
-    mtimeNs: value.mtimeNs,
-    ctimeNs: value.ctimeNs,
-    size: value.size,
-  };
-}
-
-function sameSnapshot(
-  left: FileSnapshot | undefined,
-  right: FileSnapshot | undefined,
-): boolean {
-  return (
-    left !== undefined &&
-    right !== undefined &&
-    left.dev === right.dev &&
-    left.ino === right.ino &&
-    left.mtimeNs === right.mtimeNs &&
-    left.ctimeNs === right.ctimeNs &&
-    left.size === right.size
-  );
 }
 
 function checkSignal(signal: AbortSignal | undefined): void {
@@ -238,14 +197,9 @@ function checkSignal(signal: AbortSignal | undefined): void {
   }
 }
 
-async function pathSnapshot(path: string): Promise<FileSnapshot> {
-  const value = snapshot(await stat(path, { bigint: true }));
-  if (value === undefined) {
-    instructionError();
-  }
-  return value;
-}
-
+// Read once and send what was read. Files are not re-checked for concurrent
+// edits: a write racing the read may yield partial text for that one request,
+// which is preferred over blocking it.
 async function readInstructionFile(
   path: string,
   signal: AbortSignal | undefined,
@@ -253,44 +207,18 @@ async function readInstructionFile(
   let handle: Awaited<ReturnType<typeof open>> | undefined;
   try {
     checkSignal(signal);
-    const beforePath = await pathSnapshot(path);
-    checkSignal(signal);
     handle = await open(path, constants.O_RDONLY | constants.O_NONBLOCK);
-    const beforeFile = snapshot(await handle.stat({ bigint: true }));
-    const afterOpenPath = await pathSnapshot(path);
-    if (
-      !sameSnapshot(beforePath, beforeFile) ||
-      !sameSnapshot(beforePath, afterOpenPath)
-    ) {
+    const stats = await handle.stat();
+    if (!stats.isFile() || stats.size > MAX_INSTRUCTION_BYTES) {
       instructionError();
     }
-    const bytes = Buffer.alloc(Number(beforePath.size));
-    let offset = 0;
-    while (offset < bytes.length) {
-      checkSignal(signal);
-      const { bytesRead } = await handle.read(
-        bytes,
-        offset,
-        bytes.length - offset,
-        offset,
-      );
-      if (bytesRead === 0) {
-        instructionError();
-      }
-      offset += bytesRead;
+    const bytes = await handle.readFile();
+    if (bytes.length > MAX_INSTRUCTION_BYTES) {
+      instructionError();
     }
     checkSignal(signal);
-    const afterFile = snapshot(await handle.stat({ bigint: true }));
-    const afterPath = await pathSnapshot(path);
-    if (
-      !sameSnapshot(beforePath, afterFile) ||
-      !sameSnapshot(beforePath, afterPath)
-    ) {
-      instructionError();
-    }
     return {
       path,
-      snapshot: beforePath,
       text: new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(
         bytes,
       ),
@@ -318,17 +246,6 @@ export async function readUserInstructionParts(
         instructionError();
       }
       instructions.push(instruction);
-    }
-    checkSignal(signal);
-    for (const instruction of instructions) {
-      if (
-        !sameSnapshot(
-          instruction.snapshot,
-          await pathSnapshot(instruction.path),
-        )
-      ) {
-        instructionError();
-      }
     }
     checkSignal(signal);
     return instructions.map((instruction) =>
