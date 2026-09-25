@@ -6,6 +6,10 @@ import { setup } from "../src/index.js";
 import { canonicalizeNativeHistory } from "@reflection/opencode-v2-core/history";
 import { planNativeSegments } from "@reflection/opencode-v2-core/segmentation";
 import { Message } from "@opencode/ai";
+import { materializedTokens } from "../src/projection.js";
+import { Effect, Exit, Scope } from "effect";
+import { cancellableStorage } from "../src/native.js";
+import { nativeStorage } from "./native-storage.js";
 
 const state = vi.hoisted(() => ({ config: "{}" }));
 vi.mock("node:fs/promises", () => ({
@@ -255,7 +259,7 @@ it("uses normalized usage to retain materialized context and pass the final hard
       throw new Error(`unexpected ${path}`);
     }),
   );
-  cleanups.push(await setup(fake.ctx));
+  cleanups.push(await setup(fake.ctx, fake.ctx.storage));
   const first = event();
   first.messages = [
     Message.make({ id: "u", role: "user", content: "ask" }),
@@ -264,8 +268,11 @@ it("uses normalized usage to retain materialized context and pass the final hard
   ];
   await fake.hooks.get("context")!(first);
   expect(first.messages[0]?.id).toMatch(/^reflection-native-/);
-  expect([...fake.storage.values()][0]).toBeDefined();
-  const previousCheckpoint = [...fake.storage.values()][0];
+  const checkpointKey = "reflection-v2/checkpoint/2/native/s";
+  const usageKey = "reflection-v2/usage/1/native/s";
+  const previousCheckpoint = fake.storage.get(checkpointKey);
+  expect(previousCheckpoint).toBeDefined();
+  expect(fake.storage.get(usageKey)).toBeDefined();
   history = [...initial, assistant];
   const next = event();
   next.messages = [
@@ -290,7 +297,211 @@ it("uses normalized usage to retain materialized context and pass the final hard
   expect(next.messages.at(-1)?.id).toBe("a");
   // The real host supplies native history again, not our last materialization.
   // Reconstructing the same notice must reuse its checkpoint and usage anchor.
-  expect([...fake.storage.values()][0]).toEqual(previousCheckpoint);
+  expect(fake.storage.get(checkpointKey)).toEqual(previousCheckpoint);
+  // A new plugin instance retains the exact checkpoint and persisted usage
+  // fingerprints; no raw assistant payload or instructions enter storage.
+  const savedUsage = fake.storage.get(usageKey);
+  expect(JSON.stringify(savedUsage)).not.toContain("reasoningEncryptedContent");
+  await cleanups.pop()!();
+  expect(fake.storage.get(usageKey)).toEqual(savedUsage);
+  cleanups.push(await setup(fake.ctx, fake.ctx.storage));
+  const restarted = event();
+  restarted.messages = [
+    Message.make({ id: "u", role: "user", content: "ask" }),
+    Message.make({ id: "old", role: "assistant", content: "x".repeat(50_000) }),
+    Message.make({ id: "new-user", role: "user", content: "continue" }),
+    Message.make({
+      id: "a",
+      role: "assistant",
+      content: [
+        {
+          type: "reasoning",
+          text: "",
+          providerMetadata: { test: reasoningState },
+        },
+        { type: "text", text: "answer" },
+      ],
+    }),
+  ];
+  await fake.hooks.get("context")!(restarted);
+  expect(restarted.messages.map((message) => message.id)).toEqual(
+    next.messages.map((message) => message.id),
+  );
+  expect(fake.storage.get(checkpointKey)).toEqual(previousCheckpoint);
+});
+it("hydrates measured usage and keeps the exact restored-user notice when a new user follows encrypted assistant metadata", async () => {
+  state.config = JSON.stringify(config);
+  const fake = sdk();
+  const source = {
+    id: "native",
+    kind: "opencode-v2" as const,
+    identity_scheme: "source-v1" as const,
+  };
+  const oldRequest =
+    "Keep this exact archived request.\nIncluding its second line.";
+  const initial = [
+    { id: "u", type: "user", text: oldRequest, time: { created: 1 } },
+    {
+      id: "old",
+      type: "assistant",
+      agent: "build",
+      model: { id: "small", providerID: "test" },
+      time: { created: 2, completed: 3 },
+      content: [{ type: "text", text: "x".repeat(50_000) }],
+    },
+    {
+      id: "tail",
+      type: "assistant",
+      agent: "build",
+      model: { id: "small", providerID: "test" },
+      time: { created: 4, completed: 5 },
+      content: [{ type: "text", text: "Recent work." }],
+    },
+  ];
+  let history: unknown[] = initial;
+  const segments = planNativeSegments({
+    source,
+    sessionId: "s",
+    records: canonicalizeNativeHistory(initial),
+    softLimitChars: 1000,
+  });
+  const manifest = {
+    source_id: "native",
+    session_id: "s",
+    manifest_version: 3,
+    targets: [],
+    boundaries: segments.map((segment) => ({
+      id: segment.id,
+      projection_version: 3,
+      source_boundary_version: 3,
+      start_source_message_id: segment.request.start_source_message_id,
+      end_source_message_id: segment.request.end_source_message_id,
+      source_fingerprint: segment.fingerprint,
+      source_eligible: true,
+    })),
+    segments: segments.map((segment) => ({
+      id: segment.id,
+      projection_version: 3,
+      source_boundary_version: 3,
+      start_source_message_id: segment.request.start_source_message_id,
+      end_source_message_id: segment.request.end_source_message_id,
+      summary: "Verified work.",
+    })),
+  };
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (input: URL) => {
+      const path = new URL(String(input)).pathname;
+      if (path === "/v1/sources/native") return Response.json(source);
+      if (path === "/api/session/s")
+        return Response.json({
+          data: {
+            id: "s",
+            time: { updated: history.length },
+            location: { directory: "/work" },
+          },
+        });
+      if (path === "/api/session/active")
+        return Response.json({ data: { s: { type: "busy" } } });
+      if (path.endsWith("/message"))
+        return Response.json({ data: history, cursor: {} });
+      if (path === "/api/config")
+        return Response.json([
+          { type: "document", info: { compaction: { auto: false } } },
+        ]);
+      if (path === "/v1/sessions/s/segments") return Response.json(manifest);
+      throw new Error(`unexpected ${path}`);
+    }),
+  );
+  cleanups.push(await setup(fake.ctx, fake.ctx.storage));
+  const nativeMessages = [
+    Message.make({ id: "u", role: "user", content: oldRequest }),
+    Message.make({ id: "old", role: "assistant", content: "x".repeat(50_000) }),
+    Message.make({ id: "tail", role: "assistant", content: "Recent work." }),
+  ];
+  const first = event();
+  first.messages = [...nativeMessages];
+  await fake.hooks.get("context")!(first);
+  const notice = first.messages[0]!;
+  expect(notice.id).toMatch(/^reflection-native-/);
+  expect(first.messages.map((message) => message.id)).toEqual([
+    notice.id,
+    "tail",
+  ]);
+  expect(notice.content).toContainEqual(nativeMessages[0]!.content[0]);
+  const checkpointKey = "reflection-v2/checkpoint/2/native/s";
+  const usageKey = "reflection-v2/usage/1/native/s";
+  const previousCheckpoint = structuredClone(fake.storage.get(checkpointKey));
+  expect(previousCheckpoint).toMatchObject({ restored_user_id: "u" });
+  expect(fake.storage.get(usageKey)).toBeDefined();
+
+  // Dispose before observing the completion: only the persisted projected
+  // request can prove its measured usage in this new plugin instance.
+  await cleanups.pop()!();
+  cleanups.push(await setup(fake.ctx, fake.ctx.storage));
+  const reasoningState = {
+    itemId: "rs_continued",
+    reasoningEncryptedContent: "x".repeat(100_000),
+  };
+  history = [
+    ...initial,
+    {
+      id: "a",
+      type: "assistant",
+      agent: "build",
+      model: { id: "small", providerID: "test" },
+      time: { created: 6, completed: 7 },
+      content: [
+        { type: "reasoning", text: "", state: reasoningState },
+        { type: "text", text: "answer" },
+      ],
+      tokens: {
+        input: 8000,
+        output: 1000,
+        reasoning: 200,
+        cache: { read: 300, write: 100 },
+      },
+    },
+    { id: "new-user", type: "user", text: "Next step.", time: { created: 8 } },
+  ];
+  const completion = Message.make({
+    id: "a",
+    role: "assistant",
+    content: [
+      {
+        type: "reasoning",
+        text: "",
+        providerMetadata: { test: reasoningState },
+      },
+      { type: "text", text: "answer" },
+    ],
+  });
+  const newUser = Message.make({
+    id: "new-user",
+    role: "user",
+    content: "Next step.",
+  });
+  const next = event();
+  next.messages = [...nativeMessages, completion, newUser];
+  await fake.hooks.get("context")!(next);
+
+  expect(next.messages).toEqual([...first.messages, completion, newUser]);
+  expect(next.messages[0]?.id).toBe(notice.id);
+  expect(next.messages[0]?.content).toEqual(notice.content);
+  expect(
+    next.messages[0]?.content.filter(
+      (part) => part.type === "text" && part.text === oldRequest,
+    ),
+  ).toEqual(nativeMessages[0]!.content);
+  expect(next.messages.filter((message) => message.id === "new-user")).toEqual([
+    newUser,
+  ]);
+  expect(fake.storage.get(checkpointKey)).toEqual(previousCheckpoint);
+  // The ciphertext alone exceeds even the model's full context limit. Passing
+  // with the exact old notice requires measured usage, not a fallback estimate.
+  expect(
+    materializedTokens(next.messages, next.system, next.tools),
+  ).toBeGreaterThan(20_000);
 });
 it.each(["2.0.7", "2.0.9", "v2.0.8", "2.0.8-dev", "unknown", ""])(
   "unsupported host %s retains guards and refuses all model/source IO",
@@ -301,7 +512,7 @@ it.each(["2.0.7", "2.0.9", "v2.0.8", "2.0.8-dev", "unknown", ""])(
     vi.stubGlobal("fetch", fetch);
     vi.mocked(readFile).mockClear();
     const modelList = vi.spyOn(fake.ctx.model, "list");
-    const cleanup = await setup(fake.ctx);
+    const cleanup = await setup(fake.ctx, fake.ctx.storage);
     cleanups.push(cleanup);
     expect(cleanup).toBeTypeOf("function");
     expect(() => fake.hooks.get("compaction")!(event())).toThrow(
@@ -390,7 +601,7 @@ it.each([503, 404])(
         ? new Response("unavailable", { status })
         : Response.json(nativeRegistry),
     );
-    cleanups.push(await setup(fake.ctx));
+    cleanups.push(await setup(fake.ctx, fake.ctx.storage));
     expect(fake.subscription.starts).toBe(0);
     expect(fake.hooks.has("compaction")).toBe(true);
     await fake.hooks.get("context")!(event());
@@ -418,7 +629,7 @@ it("concurrent model and tool invocations coalesce one registry retry and one su
     });
     return Response.json(nativeRegistry);
   });
-  cleanups.push(await setup(fake.ctx));
+  cleanups.push(await setup(fake.ctx, fake.ctx.storage));
   const tool = fake.tools
     .get("memory_search")!
     .execute({ query: "q" }, { sessionID: "s" });
@@ -441,7 +652,7 @@ it("each failed invocation retries registry at most once and does not cache its 
     attempts++;
     return new Response("unavailable", { status: 503 });
   });
-  cleanups.push(await setup(fake.ctx));
+  cleanups.push(await setup(fake.ctx, fake.ctx.storage));
   for (let i = 0; i < 2; i++) {
     const result = await fake.tools
       .get("memory_search")!
@@ -458,7 +669,7 @@ it("invalid config remains a reload-required refusal without registry retries", 
   });
   const fake = sdk();
   const fetch = recoveryFetch(async () => Response.json(nativeRegistry));
-  cleanups.push(await setup(fake.ctx));
+  cleanups.push(await setup(fake.ctx, fake.ctx.storage));
   for (let i = 0; i < 2; i++) {
     expect(
       (
@@ -497,7 +708,7 @@ it("disposal aborts registry retry without later readiness, source posts, or an 
     // Simulate a late successful response despite the aborted request.
     return Response.json(nativeRegistry);
   });
-  const cleanup = await setup(fake.ctx);
+  const cleanup = await setup(fake.ctx, fake.ctx.storage);
   cleanups.push(cleanup);
   const execute = fake.tools.get("memory_search")!.execute;
   const tool = execute({ query: "q" }, { sessionID: "s" });
@@ -530,7 +741,7 @@ it("fatal event-stream failure remains reload-required rather than restarting re
     attempts++;
     return Response.json(nativeRegistry);
   });
-  cleanups.push(await setup(fake.ctx));
+  cleanups.push(await setup(fake.ctx, fake.ctx.storage));
   await vi.waitFor(() => expect(fake.subscription.active).toBe(0));
   expect(
     (
@@ -560,7 +771,7 @@ it("registers fail-closed context and unscoped compaction veto before any regist
     }),
   );
   let returned = false;
-  const initializing = setup(fake.ctx).then((cleanup) => {
+  const initializing = setup(fake.ctx, fake.ctx.storage).then((cleanup) => {
     returned = true;
     return cleanup;
   });
@@ -590,7 +801,7 @@ it.each([undefined, "relative.json"])(
     const fake = sdk(path === undefined ? null : path);
     const fetch = vi.fn();
     vi.stubGlobal("fetch", fetch);
-    const cleanup = await setup(fake.ctx);
+    const cleanup = await setup(fake.ctx, fake.ctx.storage);
     cleanups.push(cleanup);
     await vi.waitFor(async () => {
       const result = await fake.tools
@@ -610,7 +821,7 @@ it("disabled projection is an explicit startup error, not native fallback", asyn
     contextProjection: { enabled: false },
   });
   const fake = sdk();
-  const cleanup = await setup(fake.ctx);
+  const cleanup = await setup(fake.ctx, fake.ctx.storage);
   cleanups.push(cleanup);
   await vi.waitFor(async () =>
     expect(
@@ -739,7 +950,7 @@ it.each([
         });
       }),
     );
-    cleanups.push(await setup(fake.ctx));
+    cleanups.push(await setup(fake.ctx, fake.ctx.storage));
     const pendingTool = fake.tools
       .get("memory_search")!
       .execute({ query: "pending" }, { sessionID: "s" });
@@ -810,7 +1021,7 @@ it.each(["/work", "/work/\uD55C\uAE00 project"])(
         });
       }),
     );
-    const cleanup = await setup(fake.ctx);
+    const cleanup = await setup(fake.ctx, fake.ctx.storage);
     cleanups.push(cleanup);
     await vi.waitFor(async () =>
       expect(
@@ -865,7 +1076,7 @@ it("memory_read_segment rejects wrong source/segment pair and unavailable legacy
       return Response.json({ source_id: "wrong" });
     }),
   );
-  const cleanup = await setup(fake.ctx);
+  const cleanup = await setup(fake.ctx, fake.ctx.storage);
   cleanups.push(cleanup);
   await vi.waitFor(async () =>
     expect(
@@ -948,7 +1159,7 @@ it("hydrates native exact ranges and reports absence of backend fingerprint hone
       return Response.json({});
     }),
   );
-  const cleanup = await setup(fake.ctx);
+  const cleanup = await setup(fake.ctx, fake.ctx.storage);
   cleanups.push(cleanup);
   await vi.waitFor(async () =>
     expect(
@@ -1000,7 +1211,7 @@ it("session deletion aborts in-flight tools, removes checkpoint, and prevents ne
       return Response.json({});
     }),
   );
-  const cleanup = await setup(fake.ctx);
+  const cleanup = await setup(fake.ctx, fake.ctx.storage);
   cleanups.push(cleanup);
   await vi.waitFor(async () =>
     expect(
@@ -1012,6 +1223,7 @@ it("session deletion aborts in-flight tools, removes checkpoint, and prevents ne
     ).not.toContain("initializing"),
   );
   fake.storage.set("reflection-v2/checkpoint/2/native/s", {});
+  fake.storage.set("reflection-v2/usage/1/native/s", {});
   slow = true;
   const pending = fake.tools
     .get("memory_search")!
@@ -1028,6 +1240,125 @@ it("session deletion aborts in-flight tools, removes checkpoint, and prevents ne
     ).content,
   ).toContain("deletion");
 });
+it("awaits usage storage before dispatch and blocks dispatch on a failed save", async () => {
+  state.config = JSON.stringify(config);
+  const fake = sdk();
+  recoveryFetch(async () => Response.json(nativeRegistry));
+  cleanups.push(await setup(fake.ctx, fake.ctx.storage));
+  const original = fake.ctx.storage.set.bind(fake.ctx.storage);
+  let release!: () => void;
+  vi.spyOn(fake.ctx.storage, "set").mockImplementation(async (key, value) => {
+    if (key.includes("/usage/")) {
+      await new Promise<void>((resolve) => {
+        release = resolve;
+      });
+    }
+    await original(key, value);
+  });
+  const first = event();
+  const pending = fake.hooks.get("context")!(first);
+  await vi.waitFor(() => expect(release).toBeTypeOf("function"));
+  expect(fake.storage.has("reflection-v2/usage/1/native/s")).toBe(false);
+  release();
+  await pending;
+  expect(fake.storage.has("reflection-v2/usage/1/native/s")).toBe(true);
+  vi.mocked(fake.ctx.storage.set).mockRejectedValueOnce(
+    new Error("storage unavailable"),
+  );
+  await expect(fake.hooks.get("context")!(event())).rejects.toThrow(
+    "usage anchor persistence failed",
+  );
+  expect(fake.storage.has("reflection-v2/usage/1/native/s")).toBe(false);
+});
+it.each(["disposal", "deletion"])(
+  "%s interrupts a pending native usage save without mutating dispatch or overwriting the next setup",
+  async (cancel) => {
+    state.config = JSON.stringify(config);
+    const fake = sdk();
+    recoveryFetch(async () => Response.json(nativeRegistry));
+    const native = nativeStorage();
+    const scope = Scope.makeUnsafe();
+    const storage = await Effect.runPromise(
+      cancellableStorage(native.storage).pipe(Scope.provide(scope)),
+    );
+    cleanups.push(() => Effect.runPromise(Scope.close(scope, Exit.void)));
+    vi.spyOn(fake.ctx.storage, "get").mockImplementation(async (key) =>
+      native.values.get(key),
+    );
+    // Mutation methods in the Promise SDK must never be used by this path.
+    const promiseSet = vi.spyOn(fake.ctx.storage, "set");
+    const promiseRemove = vi.spyOn(fake.ctx.storage, "remove");
+    const dispose = await setup(fake.ctx, storage);
+    cleanups.push(dispose);
+    await native.hold();
+    const old = event();
+    old.options = { temperature: 0.1 };
+    const before = structuredClone(old);
+    const messages = old.messages;
+    const system = old.system;
+    const pending = fake.hooks.get("context")!(old);
+    const rejected = expect(pending).rejects.toThrow(
+      "usage anchor persistence failed",
+    );
+    const usageKey = "reflection-v2/usage/1/native/s";
+    await vi.waitFor(() =>
+      expect(native.started).toEqual([
+        { type: "set", key: usageKey, value: expect.any(Object) },
+      ]),
+    );
+    const stale = native.started[0];
+    expect(native.applied).toEqual([]);
+    let disposing: Promise<void> | undefined;
+    if (cancel === "disposal") disposing = dispose();
+    else fake.emit("session.deleted", { sessionID: "s" });
+    // Wait for the actual queued write's finalizer while the permit is still
+    // held. Caller rejection alone does not prove the old writer is gone.
+    await vi.waitFor(() => expect(native.finished).toContainEqual(stale));
+    expect(native.applied).toEqual([]);
+    expect(old).toEqual(before);
+    expect(old.messages).toBe(messages);
+    expect(old.system).toBe(system);
+    await native.release();
+    await rejected;
+    if (cancel === "deletion") {
+      await vi.waitFor(() =>
+        expect(native.applied).toContainEqual({
+          type: "remove",
+          key: "reflection-v2/checkpoint/2/native/s",
+        }),
+      );
+      await expect(fake.hooks.get("context")!(event())).rejects.toThrow(
+        "unavailable",
+      );
+      await dispose();
+    } else await disposing;
+    cleanups.pop();
+    expect(native.values.has(usageKey)).toBe(false);
+    const nextScope = Scope.makeUnsafe();
+    const nextStorage = await Effect.runPromise(
+      cancellableStorage(native.storage).pipe(Scope.provide(nextScope)),
+    );
+    cleanups.push(() => Effect.runPromise(Scope.close(nextScope, Exit.void)));
+    cleanups.push(await setup(fake.ctx, nextStorage));
+    const next = event();
+    next.options = { temperature: 0.8 };
+    await fake.hooks.get("context")!(next);
+    const writes = native.applied.filter((entry) => entry.type === "set");
+    expect(writes).toHaveLength(1);
+    expect(writes[0]).not.toEqual(stale);
+    expect(writes[0]).toEqual({
+      type: "set",
+      key: usageKey,
+      value: native.values.get(usageKey),
+    });
+    expect(native.values.get(usageKey)).toBeDefined();
+    expect(old).toEqual(before);
+    expect(old.messages).toBe(messages);
+    expect(old.system).toBe(system);
+    expect(promiseSet).not.toHaveBeenCalled();
+    expect(promiseRemove).not.toHaveBeenCalled();
+  },
+);
 it.each([1, 2])(
   "hydrates legacy boundary version %s through shared exact reader and rejects absent endpoints",
   async (version) => {
@@ -1088,7 +1419,7 @@ it.each([1, 2])(
         return Response.json({});
       }),
     );
-    const cleanup = await setup(fake.ctx);
+    const cleanup = await setup(fake.ctx, fake.ctx.storage);
     cleanups.push(cleanup);
     await vi.waitFor(async () =>
       expect(

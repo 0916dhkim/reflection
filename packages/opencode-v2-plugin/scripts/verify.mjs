@@ -15,7 +15,7 @@ try {
       "-e",
       `
   const mod = await import(${JSON.stringify(pathToFileURL(file).href)});
-  if (mod.default?.id !== 'reflection-v2' || typeof mod.default.setup !== 'function') throw Error('invalid plugin');
+  if (mod.default?.id !== 'reflection-v2' || typeof mod.default.effect !== 'function' || 'setup' in mod.default) throw Error('invalid native plugin');
   console.log('Standalone Reflection v2 bundle imported');
 `,
     ],

@@ -75,7 +75,8 @@ export class Operations {
 }
 
 // The v2 Promise SDK does not propagate native request cancellation into hooks,
-// tools, model.list, or storage. Bound our wait and guard every later mutation.
+// tools, model.list, or storage reads. Bound our wait and guard later mutations;
+// storage mutations additionally interrupt their native fiber via native.ts.
 // The host independently prevents primary dispatch after native interruption.
 export function bounded<T>(
   promise: Promise<T>,

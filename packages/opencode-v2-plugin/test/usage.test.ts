@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { Message, ToolCallPart, ToolResultPart } from "@opencode/ai";
 import { canonicalizeNativeHistory } from "@reflection/opencode-v2-core/history";
 import { estimateNativeTokens } from "@reflection/opencode-v2-core/projection";
@@ -35,6 +36,39 @@ const history = (assistant: unknown = raw()) =>
     { id: "u", type: "user", text: "ask", time: { created: 1 } },
     assistant,
   ]);
+// Match usage.ts's private fingerprint encoding for these plain-data fixtures,
+// including undefined fields and the delimiters for arrays and sorted objects.
+const fingerprint = (value: unknown): string => {
+  const hash = createHash("sha256");
+  const visit = (item: unknown): void => {
+    if (item === null || typeof item !== "object") {
+      hash.update(JSON.stringify([typeof item, item ?? null]));
+    } else if (Array.isArray(item)) {
+      hash.update(`array:${item.length}:`);
+      for (const value of item) visit(value);
+      hash.update("]");
+    } else {
+      hash.update("object:");
+      const fields = Object.getOwnPropertyDescriptors(item);
+      for (const key of Object.keys(fields).sort()) {
+        hash.update(JSON.stringify(key));
+        visit(fields[key]!.value);
+      }
+      hash.update("}");
+    }
+  };
+  visit(value);
+  return hash.digest("hex");
+};
+const messageFingerprint = (message: Message): string =>
+  fingerprint({
+    id: message.id,
+    role: message.role,
+    content: message.content,
+    metadata: message.metadata,
+    providerMetadata: message.providerMetadata,
+    native: message.native,
+  });
 const prepare = (
   tracker: UsageTracker,
   records = history(),
@@ -486,5 +520,260 @@ describe("provider usage continuity", () => {
     prepare(tracker, history().slice(0, 1)).remember([user]);
     tracker.clear();
     expect(prepare(tracker).estimate([user, answer])).toBeUndefined();
+  });
+
+  it("persists only bounded fingerprints and restores plain-response and tool continuations", () => {
+    const tracker = new UsageTracker();
+    prepare(tracker, history().slice(0, 1)).remember([user]);
+    const prefix = tracker.export("s", "source", "/work");
+    expect(JSON.stringify(prefix)).not.toContain("instructions");
+    expect(JSON.stringify(prefix)).not.toContain("ask");
+    expect(JSON.stringify(prefix)).not.toContain("lookup");
+    const fresh = new UsageTracker();
+    expect(fresh.restore("s", "source", "/work", prefix)).toBe(true);
+    expect(prepare(fresh).estimate([user, answer])).toBe(120_000);
+    prepare(fresh).remember([user, answer]);
+    const anchored = fresh.export("s", "source", "/work");
+    expect(JSON.stringify(anchored)).not.toContain("answer");
+    expect(anchored?.state.anchor?.id).toMatch(/^[0-9a-f]{64}$/);
+    const next = new UsageTracker();
+    expect(next.restore("s", "source", "/work", anchored)).toBe(true);
+    const tool = Message.tool(
+      ToolResultPart.make({
+        id: "call",
+        name: "search",
+        result: "found",
+        resultType: "text",
+      }),
+    );
+    const cost =
+      8 + estimateNativeTokens({ role: tool.role, content: tool.content });
+    expect(prepare(next).estimate([user, answer, tool])).toBe(120_000 + cost);
+    prepare(next).remember([user, answer, tool]);
+    const continued = new UsageTracker();
+    expect(
+      continued.restore(
+        "s",
+        "source",
+        "/work",
+        next.export("s", "source", "/work"),
+      ),
+    ).toBe(true);
+    expect(prepare(continued).estimate([user, answer, tool])).toBe(
+      120_000 + cost,
+    );
+    expect(prepare(continued).estimate([user, answer])).toBeUndefined();
+  });
+
+  it.each(["before", "message", "after"] as const)(
+    "rejects hash-valid anchors whose %s disagrees with the saved messages",
+    (field) => {
+      const original = new UsageTracker();
+      const next = Message.make({ id: "next", role: "user", content: "next" });
+      prepare(original, history().slice(0, 1)).remember([user]);
+      prepare(original).remember([user, answer, next]);
+      const saved = original.export("s", "source", "/work")!;
+      expect(saved.state.anchor).toBeDefined();
+      const changed = structuredClone(saved);
+      const replacement = fingerprint("inconsistent anchor");
+      expect(replacement).toMatch(/^[0-9a-f]{64}$/);
+      if (field === "message") {
+        expect(changed.state.anchor!.message).not.toBe(replacement);
+        changed.state.anchor!.message = replacement;
+      } else {
+        expect(changed.state.anchor![field]).toHaveLength(1);
+        expect(changed.state.anchor![field][0]).not.toBe(replacement);
+        changed.state.anchor![field][0] = replacement;
+      }
+      const restored = new UsageTracker();
+      expect(restored.restore("s", "source", "/work", changed)).toBe(false);
+      expect(restored.has("s")).toBe(false);
+      expect(restored.restore("s", "source", "/work", saved)).toBe(true);
+      expect(prepare(restored).estimate([user, answer, next])).toBe(
+        120_000 +
+          8 +
+          estimateNativeTokens({ role: next.role, content: next.content }),
+      );
+    },
+  );
+
+  it("bounds combined fingerprint slots while accepting supported boundaries", () => {
+    const original = new UsageTracker();
+    const prefix = Array.from({ length: 2048 }, (_, index) =>
+      Message.make({ id: `prefix-${index}`, role: "user", content: "ask" }),
+    );
+    const suffix = Array.from({ length: 2047 }, (_, index) =>
+      Message.make({ id: `suffix-${index}`, role: "user", content: "next" }),
+    );
+    prepare(original, history().slice(0, 1)).remember(prefix);
+    prepare(original).remember([...prefix, answer, ...suffix]);
+    const saved = original.export("s", "source", "/work")!;
+    expect(saved).toBeDefined();
+    expect(saved.state.messages).toHaveLength(4096);
+    expect(saved.state.anchor!.before).toHaveLength(2048);
+    expect(saved.state.anchor!.after).toHaveLength(2047);
+    const restored = new UsageTracker();
+    expect(restored.restore("s", "source", "/work", saved)).toBe(true);
+    expect(restored.export("s", "source", "/work")).toEqual(saved);
+    expect(prepare(restored).estimate([...prefix, answer, ...suffix])).toBe(
+      120_000 +
+        suffix.reduce(
+          (sum, message) =>
+            sum +
+            8 +
+            estimateNativeTokens({
+              role: message.role,
+              content: message.content,
+            }),
+          0,
+        ),
+    );
+
+    // Anchors duplicate every message hash except the assistant itself, so
+    // their largest supported total is 8191; one more message uses 8193 slots.
+    const oversized = structuredClone(saved);
+    const extra = suffix[0]!;
+    oversized.state.messages.push(messageFingerprint(extra));
+    oversized.state.anchor!.after.push(messageFingerprint(extra));
+    expect(oversized.state.messages).toEqual([
+      ...oversized.state.anchor!.before,
+      oversized.state.anchor!.message,
+      ...oversized.state.anchor!.after,
+    ]);
+    const arrays = [
+      oversized.state.messages,
+      oversized.state.anchor!.before,
+      oversized.state.anchor!.after,
+    ];
+    expect(arrays.every((array) => array.length <= 8192)).toBe(true);
+    expect(arrays.reduce((sum, array) => sum + array.length, 0)).toBe(8193);
+    expect(new UsageTracker().restore("s", "source", "/work", oversized)).toBe(
+      false,
+    );
+    prepare(original).remember([...prefix, answer, ...suffix, extra]);
+    expect(original.export("s", "source", "/work")).toBeUndefined();
+
+    const unanchored = new UsageTracker();
+    prepare(unanchored, history().slice(0, 1)).remember(Array(8192).fill(user));
+    const boundary = unanchored.export("s", "source", "/work")!;
+    expect(boundary.state.anchor).toBeUndefined();
+    expect(boundary.state.messages).toHaveLength(8192);
+    expect(new UsageTracker().restore("s", "source", "/work", boundary)).toBe(
+      true,
+    );
+  });
+
+  it("rechecks native assistant content even when restored anchor hashes consistently describe a transformed assistant", () => {
+    const original = new UsageTracker();
+    prepare(original, history().slice(0, 1)).remember([user]);
+    prepare(original).remember([user, answer]);
+    const saved = original.export("s", "source", "/work")!;
+    expect(saved.state.anchor!.message).toBe(messageFingerprint(answer));
+    expect(saved.state.anchor!.raw).toBe(fingerprint(history()[1]!.raw));
+    const control = new UsageTracker();
+    expect(control.restore("s", "source", "/work", saved)).toBe(true);
+    expect(prepare(control).estimate([user, answer])).toBe(120_000);
+
+    const transformed = Message.make({
+      id: "a",
+      role: "assistant",
+      content: "expanded answer",
+    });
+    const changed = structuredClone(saved);
+    const hash = messageFingerprint(transformed);
+    expect(hash).not.toBe(changed.state.anchor!.message);
+    changed.state.messages[1] = hash;
+    changed.state.anchor!.message = hash;
+    expect(changed.state.anchor!.raw).toBe(saved.state.anchor!.raw);
+    expect(changed.state.messages).toEqual([
+      ...changed.state.anchor!.before,
+      changed.state.anchor!.message,
+      ...changed.state.anchor!.after,
+    ]);
+    const restored = new UsageTracker();
+    expect(restored.restore("s", "source", "/work", changed)).toBe(true);
+    expect(restored.export("s", "source", "/work")).toEqual(changed);
+    expect(prepare(restored).estimate([user, transformed])).toBeUndefined();
+  });
+
+  it("restored hints do not authorize changed inputs or latest assistant history", () => {
+    const original = new UsageTracker();
+    prepare(original, history().slice(0, 1)).remember([user]);
+    prepare(original).remember([user, answer]);
+    const saved = original.export("s", "source", "/work");
+    const tracker = new UsageTracker();
+    expect(tracker.restore("s", "source", "/work", saved)).toBe(true);
+    for (const changed of [
+      { model: { ...model, id: "other" } },
+      { system: ["changed"] },
+      { tools: { search: "changed" } },
+      { options: { temperature: 0.9 } },
+    ]) {
+      expect(
+        prepare(tracker, history(), changed).estimate([user, answer]),
+      ).toBeUndefined();
+    }
+    expect(
+      prepare(tracker).estimate([
+        Message.make({ id: "u", role: "user", content: "changed" }),
+        answer,
+      ]),
+    ).toBeUndefined();
+    expect(
+      prepare(tracker).estimate([
+        user,
+        Message.make({ id: "a", role: "assistant", content: "changed" }),
+      ]),
+    ).toBeUndefined();
+    expect(
+      prepare(
+        tracker,
+        history(raw(tokens, { time: { created: 2, completed: 4 } })),
+      ).estimate([user, answer]),
+    ).toBeUndefined();
+    expect(
+      prepare(tracker, history(raw({ ...tokens, input: -1 }))).estimate([
+        user,
+        answer,
+      ]),
+    ).toBeUndefined();
+  });
+
+  it("ignores malformed, oversized, unknown-version and wrong-scope envelopes without replacing a live entry", () => {
+    const original = new UsageTracker();
+    prepare(original, history().slice(0, 1)).remember([user]);
+    const saved = original.export("s", "source", "/work");
+    const next = new UsageTracker();
+    for (const args of [
+      ["s", "other", "/work", saved],
+      ["other", "source", "/work", saved],
+      ["s", "source", "/other", saved],
+      ["s", "source", "/work", { ...(saved as object), version: 2 }],
+      ["s", "source", "/work", { ...(saved as object), extra: true }],
+      [
+        "s",
+        "source",
+        "/work",
+        { ...(saved as object), state: { config: "invalid", messages: [] } },
+      ],
+      [
+        "s",
+        "source",
+        "/work",
+        {
+          ...(saved as object),
+          state: {
+            config: "0".repeat(64),
+            messages: Array(8193).fill("0".repeat(64)),
+          },
+        },
+      ],
+    ] as const) {
+      expect(next.restore(args[0], args[1], args[2], args[3])).toBe(false);
+    }
+    expect(prepare(next).estimate([user, answer])).toBeUndefined();
+    expect(next.restore("s", "source", "/work", saved)).toBe(true);
+    expect(next.restore("s", "source", "/work", undefined)).toBe(false);
+    expect(prepare(next).estimate([user, answer])).toBe(120_000);
   });
 });

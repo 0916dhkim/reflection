@@ -22,11 +22,11 @@ const ASSETS = {
   "bin/opencode":
     "80fb8f312afa53182fbddc1230fe7937ba4b8ec2c5bf1de97510092919662196",
   "plugins/reflection-v2/index.js":
-    "6d0f4dcaa3d1d250c91b7ba44fa04a2df0d6c118a46432ea28034ed303188e92",
+    "44b6a726c2bb664bb84be23429cc02bd8594347389315db808a9d16da26824ee",
   "bin/launch.mjs":
     "8d79a76f94537f17a70977fc0cadd6d6c268b1c2603a9968f8916de1718422b6",
   "bin/contract.mjs":
-    "deec4ac00043f3d8ed7c80650e2e26e0f70a660b8264e2c5eb5ff983849f6540",
+    "b0a3e2a82ed288daa147729c4387e753ce1ee9a805fb8c320eb66e9aa24a4d08",
 };
 const MAX = 256 * 1024 * 1024;
 const fail = (code) => {

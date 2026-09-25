@@ -44,6 +44,9 @@ importers:
       '@reflection/shared':
         specifier: workspace:*
         version: link:../shared
+      effect:
+        specifier: 4.0.0-rc.112
+        version: 4.0.0-rc.112
       zod:
         specifier: 4.1.8
         version: 4.1.8

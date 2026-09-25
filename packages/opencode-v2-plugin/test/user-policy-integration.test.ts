@@ -158,7 +158,7 @@ async function fixture() {
       ],
     }) as unknown as SessionContext;
   const start = async () => {
-    const dispose = await setup(ctx);
+    const dispose = await setup(ctx, ctx.storage);
     cleanups.push(dispose);
     return dispose;
   };

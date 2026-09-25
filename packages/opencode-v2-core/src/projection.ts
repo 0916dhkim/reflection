@@ -658,11 +658,44 @@ export function projectNativeContext(
     // Unknown messages remain pinned, but a mapped archived group in the tail
     // makes this cutoff impossible. Never drop or duplicate half a group.
     if (lastModel[end]! >= tailStartIndex || firstPinnedOwner <= end) return;
+    // Only exact checkpoint reconstruction may keep a formerly restored user
+    // after a newer user arrives in the raw tail. The completed identity and
+    // notice must still match the checkpoint, and measured usage must authorize
+    // that exact rendering below. Fresh candidates always use the latest user.
+    let anchorUser = latestUser;
+    let anchorModels = latestUserModels;
+    if (forcedSummaries !== undefined) {
+      const restored = previous?.restored_user_id;
+      if (restored === null) {
+        anchorUser = -1;
+      } else {
+        const index =
+          typeof restored === "string" ? positions.get(restored) : undefined;
+        if (
+          index === undefined ||
+          index > end ||
+          records[index]!.raw.type !== "user"
+        )
+          return;
+        anchorUser = index;
+        anchorModels = messages.flatMap((message, modelIndex) =>
+          message.id === restored ? [modelIndex] : [],
+        );
+      }
+    }
     let anchorMessageIndex: number | undefined;
-    if (latestUser >= 0 && latestUser <= end) {
-      if (latestUserModels.length !== 1) return;
-      anchorMessageIndex = latestUserModels[0]!;
+    if (anchorUser >= 0 && anchorUser <= end) {
+      if (anchorModels.length !== 1) return;
+      anchorMessageIndex = anchorModels[0]!;
       if (messages[anchorMessageIndex]!.role !== "user") return;
+      if (
+        forcedSummaries !== undefined &&
+        (anchorMessageIndex >= tailStartIndex ||
+          pinned[anchorMessageIndex] ||
+          owners[anchorMessageIndex]!.length !== 1 ||
+          owners[anchorMessageIndex]![0] !== anchorUser)
+      )
+        return;
     }
     if (last.reasonCounts["missing-or-stale-summary"] && !options.allowLossy)
       return;
@@ -675,12 +708,13 @@ export function projectNativeContext(
     let usageBacked = false;
     const build = (
       noticeBudget: number,
+      forceAggregate = forcedSummaries !== undefined,
     ): NativeProjectionResult | undefined => {
       if (headerTokens > noticeBudget) return;
       let text: string;
       let keptSummaries: Set<number> | undefined;
       if (
-        forcedSummaries === undefined &&
+        !forceAggregate &&
         headerTokens + last.detailedTokens <= noticeBudget
       ) {
         text =
@@ -791,7 +825,7 @@ export function projectNativeContext(
         restored_user_id:
           anchorMessageIndex === undefined
             ? null
-            : records[latestUser]!.source.id,
+            : records[anchorUser]!.source.id,
         manifest_summary_fingerprint: last.summaryPrefixFingerprint,
         cachedSummaries,
         cached_summaries_fingerprint: digest(cachedSummaries),
@@ -835,7 +869,8 @@ export function projectNativeContext(
     };
     // Re-render the exact old selection independently of today's conservative
     // base. Only measured whole-input usage may authorize that old notice.
-    if (forcedSummaries !== undefined) return build(summaryBudget);
+    if (forcedSummaries !== undefined)
+      return build(summaryBudget, false) ?? build(summaryBudget);
     // The whole-payload estimate must not discard a usage-backed plan before
     // the caller sees its actual notice. Keep the old tighter notice budget
     // when usage is unavailable, including for this exact candidate.

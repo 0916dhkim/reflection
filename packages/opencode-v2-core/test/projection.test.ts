@@ -10,6 +10,7 @@ import {
   type ModelMessageLike,
   type NativeProjectionOptions,
   type NativeProjectionResult,
+  type NativeProjectionShape,
 } from "../src/projection.js";
 
 const source = {
@@ -99,7 +100,289 @@ function retained(
   ];
 }
 
+function materialized(
+  shape: NativeProjectionShape,
+  input: NativeProjectionOptions,
+): unknown[] {
+  return [
+    ...shape.preservedPrefixIndices.map((index) => input.messages[index]),
+    ...(shape.notice ? [shape.notice] : []),
+    ...(shape.notice?.anchorMessageIndex === undefined
+      ? []
+      : [input.messages[shape.notice.anchorMessageIndex]]),
+    ...input.messages.slice(shape.tailStartIndex),
+  ];
+}
+
+function continuedUserFixture(
+  notice: "detailed" | "trimmed" | "missing" = "detailed",
+) {
+  const original = fixture();
+  if (notice !== "detailed") original.allowLossy = true;
+  if (notice === "trimmed")
+    original.manifest.segments[0]!.summary = "verified ".repeat(500);
+  if (notice === "missing") original.manifest.segments = [];
+  const prior = projectNativeContext(original);
+  const input = fixture([
+    ...original.records.map((record) => record.raw),
+    assistant("final"),
+    user("new-user", "new actual request"),
+  ]);
+  input.allowLossy = original.allowLossy;
+  input.manifest.segments =
+    notice === "missing"
+      ? []
+      : input.manifest.segments.map(
+          (entry) =>
+            original.manifest.segments.find((old) => old.id === entry.id) ??
+            entry,
+        );
+  input.previous = prior.checkpoint;
+  const prefix = materialized(prior, original);
+  input.estimateInput = (shape) =>
+    JSON.stringify(materialized(shape, input).slice(0, prefix.length)) ===
+    JSON.stringify(prefix)
+      ? 2500
+      : undefined;
+  return { original, prior, input };
+}
+
 describe("native projection plans", () => {
+  it.each(["detailed", "trimmed", "missing"] as const)(
+    "keeps the exact %s notice and restored user when a new user follows the measured prefix",
+    (notice) => {
+      const { original, prior, input } = continuedUserFixture(notice);
+      expect(prior.checkpoint!.restored_user_id).toBe("u");
+      if (notice === "trimmed")
+        expect(prior.notice!.text).toContain("summary-budget=");
+      if (notice === "missing")
+        expect(prior.checkpoint!.cachedSummaries).toEqual([]);
+      const conservative = projectNativeContext({
+        ...input,
+        estimateInput: undefined,
+      });
+      expect(conservative.reset).toBe(true);
+      expect(conservative.tailStartIndex).toBeGreaterThan(prior.tailStartIndex);
+      const reused = projectNativeContext(input);
+      expect(reused.notice).toEqual(prior.notice);
+      expect(reused.checkpoint).toBe(prior.checkpoint);
+      expect(reused.reset).toBe(false);
+      expect(reused.estimatedTokens).toBe(2500);
+      expect(reused.tailStartIndex).toBe(prior.tailStartIndex);
+      expect(input.messages[reused.notice!.anchorMessageIndex!]).toEqual(
+        original.messages[0],
+      );
+      expect(retained(reused, input)).toEqual([2, 3, 4]);
+      expect(
+        materialized(reused, input).filter(
+          (entry) => (entry as ModelMessageLike).id === "new-user",
+        ),
+      ).toHaveLength(1);
+    },
+  );
+
+  it("keeps the old restored user through flattened tool continuation after the new user", () => {
+    const { input, prior } = continuedUserFixture();
+    const expanded = fixture([
+      ...input.records.map((record) => record.raw),
+      {
+        ...assistant("tool-step", ""),
+        content: [
+          {
+            type: "tool",
+            id: "new-call",
+            name: "search",
+            time: { created: 0 },
+            state: {
+              status: "completed",
+              input: { query: "new request" },
+              content: [{ type: "text", text: "result" }],
+            },
+          },
+        ],
+      },
+      assistant("live", "recent"),
+    ]);
+    expanded.messages = [
+      ...input.messages,
+      {
+        id: "tool-step",
+        role: "assistant",
+        content: [
+          {
+            type: "tool-call",
+            toolCallId: "new-call",
+            input: { query: "new request" },
+          },
+        ],
+      },
+      {
+        role: "tool",
+        content: [
+          { type: "tool-result", toolCallId: "new-call", output: "result" },
+        ],
+      },
+      expanded.messages.at(-1)!,
+    ];
+    expanded.previous = projectNativeContext(input).checkpoint;
+    const prefix = materialized(projectNativeContext(input), input);
+    expanded.estimateInput = (shape) =>
+      JSON.stringify(materialized(shape, expanded).slice(0, prefix.length)) ===
+      JSON.stringify(prefix)
+        ? 2800
+        : undefined;
+    const next = projectNativeContext(expanded);
+    expect(next.notice).toEqual(prior.notice);
+    expect(next.reset).toBe(false);
+    expect(next.checkpoint).toBe(prior.checkpoint);
+    expect(retained(next, expanded)).toEqual([2, 3, 4, 5, 6, 7]);
+    expect(
+      materialized(next, expanded).filter(
+        (entry) => (entry as ModelMessageLike).id === "new-user",
+      ),
+    ).toHaveLength(1);
+  });
+
+  it("replaces the old anchor with the latest actual user on a budget-driven projection", () => {
+    const { input, prior } = continuedUserFixture();
+    const expanded = fixture([
+      ...input.records.map((record) => record.raw),
+      assistant("new-work"),
+      assistant("live", "recent"),
+    ]);
+    expanded.previous = prior.checkpoint;
+    expanded.estimateInput = (shape) =>
+      shape.notice?.id === prior.notice!.id ? 3800 : undefined;
+    const fresh = projectNativeContext(expanded);
+    expect(fresh.reset).toBe(true);
+    expect(fresh.notice!.id).not.toBe(prior.notice!.id);
+    expect(fresh.checkpoint!.restored_user_id).toBe("new-user");
+    expect(fresh.notice!.anchorMessageIndex).toBe(4);
+    expect(retained(fresh, expanded)).toEqual([6]);
+    expect(
+      materialized(fresh, expanded).filter(
+        (entry) => (entry as ModelMessageLike).id === "new-user",
+      ),
+    ).toHaveLength(1);
+    expect(materialized(fresh, expanded)).not.toContain(expanded.messages[0]);
+  });
+
+  it.each([
+    "unknown-id",
+    "non-user-id",
+    "tail-user-id",
+    "null-id",
+    "source-mutation",
+    "source-non-user",
+    "raw-mutation",
+    "missing-model",
+    "duplicate-model",
+    "non-user-model",
+    "model-mutation",
+    "context-limit",
+    "input-limit",
+    "output-limit",
+    "summary",
+    "selected-summaries",
+    "notice-id",
+  ])(
+    "declines old-user reconstruction on %s and keeps the new user in raw tail",
+    (change) => {
+      const { input, prior } = continuedUserFixture();
+      input.previous = structuredClone(prior.checkpoint!);
+      if (change === "unknown-id") input.previous.restored_user_id = "missing";
+      if (change === "non-user-id") input.previous.restored_user_id = "a";
+      if (change === "tail-user-id")
+        input.previous.restored_user_id = "new-user";
+      if (change === "null-id") input.previous.restored_user_id = null;
+      if (change === "source-mutation" || change === "source-non-user") {
+        const changed = fixture([
+          change === "source-non-user"
+            ? { ...user("u"), type: "synthetic" }
+            : user("u", "changed archived request"),
+          ...input.records.slice(1).map((record) => record.raw),
+        ]);
+        input.records = changed.records;
+        input.segments = changed.segments;
+        input.manifest = changed.manifest;
+        input.messages = changed.messages;
+      }
+      if (change === "raw-mutation") input.records[0]!.raw.time.created = 101;
+      if (change === "missing-model") input.messages = input.messages.slice(1);
+      if (change === "duplicate-model")
+        input.messages = [input.messages[0]!, ...input.messages];
+      if (change === "non-user-model")
+        input.messages = [
+          { ...input.messages[0]!, role: "assistant" },
+          ...input.messages.slice(1),
+        ];
+      if (change === "model-mutation")
+        input.messages = [
+          { ...input.messages[0]!, content: "changed rendered user" },
+          ...input.messages.slice(1),
+        ];
+      if (change === "context-limit") input.contextLimit -= 100;
+      if (change === "input-limit") input.inputLimit = 4900;
+      if (change === "output-limit") input.outputLimit += 100;
+      if (change === "summary")
+        input.manifest.segments[0]!.summary = "changed archived summary";
+      if (change === "selected-summaries") input.previous.cachedSummaries = [];
+      if (change === "notice-id")
+        input.previous.notice_id = "reflection-native-" + "0".repeat(32);
+      const fresh = projectNativeContext(input);
+      expect(fresh.reset).toBe(true);
+      expect(fresh.notice!.id).not.toBe(prior.notice!.id);
+      expect(fresh.notice!.anchorMessageIndex).toBeUndefined();
+      expect(fresh.checkpoint!.restored_user_id).toBeNull();
+      expect(
+        input.messages.slice(fresh.tailStartIndex).map((message) => message.id),
+      ).toEqual(["new-user"]);
+    },
+  );
+
+  it("does not tolerate changed unselected manifest summaries during old-user reconstruction", () => {
+    const { input, prior } = continuedUserFixture("trimmed");
+    const omitted = input.manifest.segments[0]!;
+    expect(
+      prior.checkpoint!.cachedSummaries.some(
+        (entry) => entry.id === omitted.id,
+      ),
+    ).toBe(false);
+    omitted.summary += " changed";
+    const fresh = projectNativeContext(input);
+    expect(fresh.reset).toBe(true);
+    expect(fresh.notice!.id).not.toBe(prior.notice!.id);
+    expect(fresh.checkpoint!.restored_user_id).toBeNull();
+    expect(
+      input.messages.slice(fresh.tailStartIndex).map((message) => message.id),
+    ).toEqual(["new-user"]);
+  });
+
+  it("does not invent an old-user anchor when the prior checkpoint restored none", () => {
+    const original = fixture([
+      user("u"),
+      assistant("a"),
+      user("first-live-user"),
+    ]);
+    const prior = projectNativeContext(original);
+    expect(prior.checkpoint!.restored_user_id).toBeNull();
+    const input = fixture([
+      ...original.records.map((record) => record.raw),
+      assistant("final"),
+      user("new-user"),
+    ]);
+    input.previous = { ...prior.checkpoint!, restored_user_id: "u" };
+    // Even a permissive estimator cannot prove a fabricated checkpoint anchor.
+    input.estimateInput = (shape) => (shape.notice ? 2500 : undefined);
+    const next = projectNativeContext(input);
+    expect(next.reset).toBe(true);
+    expect(next.notice!.id).toBe(prior.notice!.id);
+    expect(next.notice!.anchorMessageIndex).toBeUndefined();
+    expect(next.checkpoint!.restored_user_id).toBeNull();
+    expect(materialized(next, input)).not.toContain(input.messages[0]);
+    expect(retained(next, input)).toEqual([2, 3, 4]);
+  });
+
   it("retains an existing checkpoint when an append-only provider estimate is below soft despite huge static content", () => {
     const input = fixture();
     const original = projectNativeContext(input);
