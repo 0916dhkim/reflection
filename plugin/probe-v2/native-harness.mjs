@@ -713,15 +713,18 @@ async function main() {
       }),
   );
   // The step before the first post-revert request tries the tail, rejects it,
-  // and reads the full history.
+  // and reads the full history. Background ingestion may also read the full
+  // history at any point, so only a full read after the tail attempt counts.
   const revertStarts = sequenceStarts(reverted).filter(
     (read) => read.index >= revertReads && read.requests === revertRequests,
   );
+  const revertTail = revertStarts.findIndex((read) => read.after !== undefined);
   check(
     "a revert into the cached prefix falls back to a full read",
-    revertStarts.findIndex((read) => read.after !== undefined) >= 0 &&
-      revertStarts.findIndex((read) => read.after === undefined) >
-        revertStarts.findIndex((read) => read.after !== undefined),
+    revertTail >= 0 &&
+      revertStarts
+        .slice(revertTail + 1)
+        .some((read) => read.after === undefined),
     { revertStarts },
   );
   check(

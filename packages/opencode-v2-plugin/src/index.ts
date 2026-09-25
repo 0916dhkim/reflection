@@ -9,6 +9,7 @@ import {
   projectNativeContext,
   type NativeProjectionResult,
 } from "@reflection/opencode-v2-core/projection";
+import { NativeSegmentMemo } from "@reflection/opencode-v2-core/memo";
 import {
   hydrateNativeRange,
   planNativeSegments,
@@ -67,6 +68,9 @@ export async function setup(ctx: Plugin.Context) {
   let registryRetryAllowed = false;
   let registryAttempt: Promise<void> | undefined;
   let eventTask: Promise<void> = Promise.resolve();
+  // Per-segment identity and prefix hashes for the context hook's cached
+  // history records; entries die with the records they are keyed by.
+  const segmentMemo = new NativeSegmentMemo();
   const key = (id: string) =>
     `reflection-v2/checkpoint/2/${encodeURIComponent(http!.config.sourceId)}/${encodeURIComponent(id)}`;
   const requireReady = async (signal: AbortSignal) => {
@@ -371,6 +375,7 @@ export async function setup(ctx: Plugin.Context) {
         sessionId: event.sessionID,
         records: snapshot.records,
         manifest,
+        memo: segmentMemo,
       };
       let segments: ReturnType<typeof planNativeSegments>;
       if (!manifestAvailable && previous) {
@@ -425,6 +430,7 @@ export async function setup(ctx: Plugin.Context) {
         outputLimit: output,
         previous,
         allowLossy: true as const,
+        memo: segmentMemo,
       };
       let plan: NativeProjectionResult | undefined;
       try {

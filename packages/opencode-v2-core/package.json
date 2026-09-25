@@ -6,7 +6,8 @@
   "exports": {
     "./history": "./src/history.ts",
     "./segmentation": "./src/segmentation.ts",
-    "./projection": "./src/projection.ts"
+    "./projection": "./src/projection.ts",
+    "./memo": "./src/memo.ts"
   },
   "scripts": {
     "test": "vitest run",
