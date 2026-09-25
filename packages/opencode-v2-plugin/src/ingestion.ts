@@ -308,7 +308,7 @@ export class Ingestion {
     const reader = this.http.reader(source);
     const metadata = await this.http.session(reader, id, signal);
     if (object(metadata.location).directory !== this.directory) return;
-    const snapshot = await this.http.snapshot(source, id, signal, true);
+    const snapshot = await this.http.snapshot(source, id, signal, true, true);
     if (object(snapshot.info.location).directory !== this.directory) return;
     if (open) {
       const time = object(snapshot.info.time);
