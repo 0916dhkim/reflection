@@ -1,22 +1,85 @@
 import { createHash } from "node:crypto";
 import { types } from "node:util";
 import type { Message } from "@opencode/ai";
+import { z } from "zod";
 import type { NativeCanonicalRecord } from "@reflection/opencode-v2-core/history";
 import { estimateNativeTokens } from "@reflection/opencode-v2-core/projection";
 import { estimateMessages } from "./projection.js";
 
 type Model = { id: string; providerID: string; variant?: string };
-type State = {
-  config: string;
-  messages: string[];
-  anchor?: {
-    id: string;
-    raw: string;
-    message: string;
-    before: string[];
-    after: string[];
-  };
-};
+// Persist only hashes and identities. Strict, bounded decoding prevents a corrupt
+// storage entry from becoming a usage anchor (or an unbounded allocation).
+const hash = z.string().regex(/^[0-9a-f]{64}$/);
+const hashes = z.array(hash).max(8192);
+const anchorSchema = z
+  .object({
+    id: hash,
+    raw: hash,
+    message: hash,
+    before: hashes,
+    after: hashes,
+  })
+  .strict();
+const stateSchema = z
+  .object({
+    config: hash,
+    messages: hashes,
+    anchor: anchorSchema.optional(),
+  })
+  .strict();
+const envelopeSchema = z
+  .object({
+    version: z.literal(1),
+    sourceId: z.string().min(1).max(500),
+    sessionId: z.string().min(1).max(1024),
+    directory: z.string().min(1).max(4096),
+    state: stateSchema,
+  })
+  .strict();
+type State = z.infer<typeof stateSchema>;
+
+function validState(state: State): boolean {
+  const anchor = state.anchor;
+  if (!anchor) return true;
+  const index = anchor.before.length;
+  return (
+    state.messages.length === index + 1 + anchor.after.length &&
+    state.messages[index] === anchor.message &&
+    same(state.messages.slice(0, index), anchor.before) &&
+    same(state.messages.slice(index + 1), anchor.after)
+  );
+}
+
+function boundedEnvelope(value: unknown): boolean {
+  const envelope = fields(value);
+  const state = fields(envelope?.state);
+  const anchor = fields(state?.anchor);
+  const strings = [
+    envelope?.sourceId,
+    envelope?.sessionId,
+    envelope?.directory,
+    state?.config,
+    anchor?.id,
+    anchor?.raw,
+    anchor?.message,
+  ];
+  if (
+    strings.some(
+      (item) =>
+        item !== undefined && (typeof item !== "string" || item.length > 4096),
+    )
+  )
+    return false;
+  const arrays = [state?.messages, anchor?.before, anchor?.after];
+  if (
+    arrays.some(
+      (item) =>
+        item !== undefined && (!Array.isArray(item) || item.length > 8192),
+    )
+  )
+    return false;
+  return true;
+}
 
 function fields(value: unknown): Record<string, unknown> | undefined {
   return value !== null && typeof value === "object" && !Array.isArray(value)
@@ -281,6 +344,74 @@ export class UsageTracker {
   private readonly sessions = new Map<string, State>();
   constructor(private readonly capacity = 64) {}
 
+  has(session: string): boolean {
+    return this.sessions.has(session);
+  }
+
+  /** Restore only into an empty slot; never replace a live LRU entry. The
+   * restored hashes are hints, not authorization: prepare still validates the
+   * current config, exact prefix/anchor and complete latest assistant usage. */
+  restore(
+    session: string,
+    sourceId: string,
+    directory: string,
+    value: unknown,
+  ): boolean {
+    if (this.has(session)) return false;
+    try {
+      if (!boundedEnvelope(value)) return false;
+      const parsed = envelopeSchema.safeParse(value);
+      if (
+        !parsed.success ||
+        parsed.data.sourceId !== sourceId ||
+        parsed.data.sessionId !== session ||
+        parsed.data.directory !== directory ||
+        !validState(parsed.data.state) ||
+        parsed.data.state.messages.length +
+          (parsed.data.state.anchor?.before.length ?? 0) +
+          (parsed.data.state.anchor?.after.length ?? 0) >
+          8192
+      )
+        return false;
+      this.sessions.set(session, parsed.data.state);
+      if (this.sessions.size > this.capacity) {
+        this.sessions.delete(this.sessions.keys().next().value!);
+      }
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /** JSON-safe storage envelope, or undefined for an absent/unpersistable state.
+   * A caller must remove an old entry when undefined is returned. */
+  export(
+    session: string,
+    sourceId: string,
+    directory: string,
+  ): z.infer<typeof envelopeSchema> | undefined {
+    const state = this.sessions.get(session);
+    if (!state) return;
+    const value = {
+      version: 1,
+      sourceId,
+      sessionId: session,
+      directory,
+      state,
+    };
+    const parsed = envelopeSchema.safeParse(value);
+    if (
+      !parsed.success ||
+      !validState(parsed.data.state) ||
+      state.messages.length +
+        (state.anchor?.before.length ?? 0) +
+        (state.anchor?.after.length ?? 0) >
+        8192
+    )
+      return;
+    return parsed.data;
+  }
+
   prepare(
     session: string,
     records: readonly NativeCanonicalRecord[],
@@ -297,11 +428,13 @@ export class UsageTracker {
     const rawModel = fields(latest?.raw.model);
     const total = latest && usage(latest);
     const raw = latest && fingerprint(latest.raw);
+    const assistantId = latest && fingerprint(latest.raw.id);
     const eligible =
       config !== undefined &&
       config === previous?.config &&
       latest &&
       raw &&
+      assistantId &&
       total !== undefined &&
       rawModel?.providerID === model.providerID &&
       rawModel.id === model.id &&
@@ -319,7 +452,7 @@ export class UsageTracker {
       const index = matches[0]!;
       const before = hashes.slice(0, index);
       const after = hashes.slice(index + 1);
-      if (previous.anchor?.id === latest.raw.id) {
+      if (previous.anchor?.id === assistantId) {
         if (
           previous.anchor.raw !== raw ||
           previous.anchor.message !== hashes[index] ||
@@ -327,7 +460,8 @@ export class UsageTracker {
           !same(
             after.slice(0, previous.anchor.after.length),
             previous.anchor.after,
-          )
+          ) ||
+          !matchesAssistant(latest, messages[index]!, model.providerID)
         )
           return;
       } else if (
@@ -368,7 +502,7 @@ export class UsageTracker {
         index === undefined
           ? undefined
           : {
-              id: latest!.raw.id,
+              id: assistantId!,
               raw: raw!,
               message: hashes[index]!,
               before: hashes.slice(0, index),

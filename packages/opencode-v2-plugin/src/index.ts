@@ -1,7 +1,7 @@
 import { constants } from "node:fs";
 import { open, readFile } from "node:fs/promises";
 import { isAbsolute } from "node:path";
-import { Plugin } from "@opencode/plugin";
+import type { Plugin } from "@opencode/plugin";
 import type { SessionContext } from "@opencode/plugin/promise/session";
 import { z } from "zod";
 import {
@@ -32,6 +32,7 @@ import {
 import { Ingestion, warn } from "./ingestion.js";
 import { UsageTracker } from "./usage.js";
 import { Operations, bounded } from "./operations.js";
+import { withCancellableStorage, type StorageMutations } from "./native.js";
 import {
   applyModelAllowlist,
   guardGeminiToolResults,
@@ -51,9 +52,9 @@ import {
   materializedTokens,
 } from "./projection.js";
 
-export default Plugin.define({ id: "reflection-v2", setup });
+export default withCancellableStorage({ id: "reflection-v2", setup });
 
-export async function setup(ctx: Plugin.Context) {
+export async function setup(ctx: Plugin.Context, storage: StorageMutations) {
   const operations = new Operations();
   const usage = new UsageTracker();
   const subscriptions = new AbortController();
@@ -76,6 +77,8 @@ export async function setup(ctx: Plugin.Context) {
   const segmentMemo = new NativeSegmentMemo();
   const key = (id: string) =>
     `reflection-v2/checkpoint/2/${encodeURIComponent(http!.config.sourceId)}/${encodeURIComponent(id)}`;
+  const usageKey = (id: string) =>
+    `reflection-v2/usage/1/${encodeURIComponent(http!.config.sourceId)}/${encodeURIComponent(id)}`;
   const requireReady = async (signal: AbortSignal) => {
     signal.throwIfAborted();
     if (!ready && registryRetryAllowed && !operations.stopped)
@@ -427,6 +430,19 @@ export async function setup(ctx: Plugin.Context) {
       const system = estimationValue(requestSystem);
       const toolBudget = estimationValue(event.tools);
       const estimatedMessages = estimateMessages(requestMessages);
+      if (!usage.has(event.sessionID)) {
+        try {
+          const saved = await bounded(
+            ctx.storage.get(usageKey(event.sessionID)),
+            signal,
+          );
+          usage.restore(event.sessionID, source.id, directory, saved);
+        } catch {
+          signal.throwIfAborted();
+          // Storage is an optimization; a failed read never grants usage trust.
+          warn("Usage anchor unavailable; using conservative context estimate");
+        }
+      }
       const tracker = usage.prepare(
         event.sessionID,
         snapshot.records,
@@ -520,16 +536,43 @@ export async function setup(ctx: Plugin.Context) {
       if (plan.checkpoint) {
         // Build structural JSON without unsafe SDK casts or class instances.
         const json = checkpointSchemaJson(plan.checkpoint);
-        await bounded(ctx.storage.set(key(event.sessionID), json), signal);
+        await bounded(storage.set(key(event.sessionID), json, signal), signal);
       } else if (stored !== undefined)
-        await bounded(ctx.storage.remove(key(event.sessionID)), signal);
+        await bounded(storage.remove(key(event.sessionID), signal), signal);
       signal.throwIfAborted();
+      tracker.remember(messages);
+      try {
+        const saved = usage.export(event.sessionID, source.id, directory);
+        if (saved === undefined)
+          await bounded(
+            storage.remove(usageKey(event.sessionID), signal),
+            signal,
+          );
+        else
+          await bounded(
+            storage.set(usageKey(event.sessionID), saved, signal),
+            signal,
+          );
+        signal.throwIfAborted();
+      } catch {
+        usage.delete(event.sessionID);
+        // Best effort invalidation of any older durable hint. A failed remove
+        // cannot authorize reuse: the unchanged config/prefix/anchor checks
+        // still apply on the next invocation.
+        const cleanupSignal = AbortSignal.timeout(5000);
+        await bounded(
+          storage.remove(usageKey(event.sessionID), cleanupSignal),
+          cleanupSignal,
+        ).catch(() => {});
+        throw new Error(
+          "Reflection: usage anchor persistence failed; model dispatch blocked",
+        );
+      }
       if (userPolicy) {
         instructionBases.set(requestSystem, baseSystem);
         event.system = requestSystem;
       }
       event.messages = messages;
-      tracker.remember(messages);
       if (plan.lossy)
         warn(
           `Projection contains ${plan.omissions.length} explicitly marked omitted ranges`,
@@ -704,10 +747,19 @@ export async function setup(ctx: Plugin.Context) {
         ingestion?.clear(id);
         http?.forget(http.config.sourceId, id);
         void operations
-          .delete(id, () =>
-            bounded(ctx.storage.remove(key(id)), AbortSignal.timeout(5000)),
-          )
-          .catch(() => warn("Deleted session checkpoint removal failed"));
+          .delete(id, () => {
+            const cleanupSignal = AbortSignal.timeout(5000);
+            return bounded(
+              Promise.all([
+                storage.remove(key(id), cleanupSignal),
+                storage.remove(usageKey(id), cleanupSignal),
+              ]).then(() => {}),
+              cleanupSignal,
+            );
+          })
+          .catch(() =>
+            warn("Deleted session checkpoint or usage removal failed"),
+          );
       } else if (
         event.type === "session.execution.succeeded" ||
         event.type === "session.execution.failed" ||

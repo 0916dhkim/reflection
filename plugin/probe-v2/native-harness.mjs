@@ -756,6 +756,26 @@ async function main() {
       }),
   );
 
+  // Exercise a real plugin lifecycle boundary in this isolated host. The old
+  // provider input is well below soft, but whole-history byte estimation is not;
+  // losing the request fingerprint at reload would prematurely project it.
+  await api("/location/reload", {});
+  await prompt(usageSession, "NATIVE_USAGE_AFTER_RELOAD");
+  const afterReload = requests.filter((item) => item.phase === "usage-low");
+  const beforeReloadMessages = usageRequests.at(-1).body.messages;
+  const afterReloadMessages = afterReload.at(-1).body.messages;
+  check(
+    "plugin reload restores validated usage without projecting oversized history",
+    afterReload.length === usageRequests.length + 1 &&
+      !text(afterReloadMessages).includes(
+        "[System-generated Reflection context",
+      ) &&
+      text(afterReloadMessages.slice(0, beforeReloadMessages.length)) ===
+        text(beforeReloadMessages) &&
+      text(afterReloadMessages).includes("NATIVE_USAGE_AFTER_RELOAD") &&
+      usagePrompts.every((value) => text(afterReloadMessages).includes(value)),
+  );
+
   phase = "usage-tool-pressure";
   await prompt(usageSession, "NATIVE_USAGE_TOOL_REQUEST");
   const usageToolRequests = requests.filter((item) => item.phase === phase);

@@ -23,6 +23,7 @@
     "@reflection/opencode-v2-core": "workspace:*",
     "@opencode/plugin": "2.0.8",
     "@opencode/ai": "2.0.8",
+    "effect": "4.0.0-rc.112",
     "zod": "4.1.8"
   }
 }

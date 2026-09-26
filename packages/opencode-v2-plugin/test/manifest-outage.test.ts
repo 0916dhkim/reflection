@@ -284,7 +284,7 @@ async function fixture(
       },
     },
   } as unknown as Plugin.Context;
-  cleanups.push(await setup(ctx));
+  cleanups.push(await setup(ctx, ctx.storage));
   const event = {
     sessionID: "s",
     agent: "build",
