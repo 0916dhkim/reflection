@@ -107,6 +107,37 @@ export class NativeProjectionError extends Error {
   }
 }
 
+/** The 70%/75% context policy, bounded by a smaller model input limit and
+ * the actual output cap selected for this request. Shared with the final
+ * materialized-request guard so planning and dispatch cannot disagree.
+ */
+export function nativeInputBudget(
+  contextLimit: number,
+  inputLimit: number | undefined,
+  outputLimit: number,
+): { soft: number; hard: number } {
+  const input = inputLimit ?? contextLimit;
+  if (
+    ![contextLimit, input, outputLimit].every(Number.isFinite) ||
+    contextLimit <= 0 ||
+    input <= 0 ||
+    outputLimit < 0
+  )
+    throw new NativeProjectionError("invalid model limits");
+  const usable = Math.min(input, contextLimit - outputLimit);
+  if (usable <= 0) throw new NativeProjectionError("no usable input budget");
+  const hard = Math.min(Math.floor(contextLimit * 0.75), usable);
+  return {
+    hard,
+    // Preserve a projection buffer even when a smaller model input limit
+    // lowers the hard ceiling below 70% of the context window.
+    soft: Math.min(
+      Math.floor(contextLimit * 0.7),
+      Math.floor((hard * 14) / 15),
+    ),
+  };
+}
+
 function object(value: unknown): Record<string, unknown> | undefined {
   return value !== null && typeof value === "object" && !Array.isArray(value)
     ? (value as Record<string, unknown>)
@@ -208,22 +239,11 @@ export function projectNativeContext(
   }
   if (manifest.session_id !== sessionId) fail("manifest session mismatch");
   const inputLimit = options.inputLimit ?? options.contextLimit;
-  if (
-    ![options.contextLimit, inputLimit, options.outputLimit].every(
-      Number.isFinite,
-    ) ||
-    options.contextLimit <= 0 ||
-    inputLimit <= 0 ||
-    options.outputLimit < 0
-  )
-    fail("invalid model limits");
-  const usable = Math.min(
-    inputLimit,
-    options.contextLimit - options.outputLimit,
+  const { hard, soft } = nativeInputBudget(
+    options.contextLimit,
+    options.inputLimit,
+    options.outputLimit,
   );
-  if (usable <= 0) fail("no usable input budget");
-  const hard = Math.floor(usable * 0.9);
-  const soft = Math.floor(usable * 0.75);
   const summaryBudget = Math.floor(options.contextLimit * 0.05);
   const fixedTokens =
     estimateNativeTokens(options.system) + estimateNativeTokens(options.tools);

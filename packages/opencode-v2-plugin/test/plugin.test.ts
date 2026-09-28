@@ -36,6 +36,11 @@ function sdk(
   configPath: unknown = "/isolated/reflection-v2.json",
   directory = "/work",
   version = "2.0.8",
+  limits: { context: number; input?: number; output: number } = {
+    context: 20_000,
+    input: 16_000,
+    output: 4000,
+  },
 ) {
   const hooks = new Map<string, (event: SessionContext) => Promise<void>>();
   const tools = new Map<
@@ -100,7 +105,7 @@ function sdk(
           {
             id: "small",
             providerID: "test",
-            limit: { context: 20000, input: 16000, output: 4000 },
+            limit: limits,
           },
         ],
       }),
@@ -163,6 +168,102 @@ function event() {
     tools: {},
   } as unknown as SessionContext;
 }
+it.each([
+  {
+    name: "large catalog output",
+    limits: { context: 1_048_576, output: 943_718 },
+    requested: undefined,
+    expected: 262_144,
+  },
+  {
+    name: "smaller model output",
+    limits: { context: 20_000, output: 1200 },
+    requested: undefined,
+    expected: 1200,
+  },
+  {
+    name: "smaller explicit request",
+    limits: { context: 20_000, output: 9000 },
+    requested: 800,
+    expected: 800,
+  },
+  {
+    name: "oversized explicit request",
+    limits: { context: 20_000, output: 9000 },
+    requested: 7000,
+    expected: 5000,
+  },
+])(
+  "caps outgoing maxTokens and budgets the same $name",
+  async ({ limits, requested, expected }) => {
+    state.config = JSON.stringify(config);
+    const fake = sdk("/isolated/reflection-v2.json", "/work", "2.0.8", limits);
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: URL) => {
+        const path = new URL(String(input)).pathname;
+        if (path === "/v1/sources/native")
+          return Response.json({
+            id: "native",
+            kind: "opencode-v2",
+            identity_scheme: "source-v1",
+          });
+        if (path === "/api/session/s")
+          return Response.json({
+            data: {
+              id: "s",
+              time: { updated: 1 },
+              location: { directory: "/work" },
+            },
+          });
+        if (path === "/api/session/active")
+          return Response.json({ data: { s: { type: "busy" } } });
+        if (path.endsWith("/message"))
+          return Response.json({
+            data: [
+              { id: "u", type: "user", text: "hello", time: { created: 1 } },
+            ],
+            cursor: {},
+          });
+        if (path === "/api/config")
+          return Response.json([
+            { type: "document", info: { compaction: { auto: false } } },
+          ]);
+        if (path === "/v1/sessions/s/segments")
+          return Response.json({
+            source_id: "native",
+            session_id: "s",
+            manifest_version: 3,
+            segments: [],
+            boundaries: [],
+            targets: [],
+          });
+        throw new Error(`unexpected ${path}`);
+      }),
+    );
+    cleanups.push(await setup(fake.ctx, fake.ctx.storage));
+    const request = event();
+    request.messages = [
+      Message.make({ id: "u", role: "user", content: "hello" }),
+    ];
+    if (requested !== undefined) request.options.maxTokens = requested;
+    await fake.hooks.get("context")!(request);
+    expect(request.options.maxTokens).toBe(expected);
+    expect(request.messages).toHaveLength(1);
+    expect(
+      materializedTokens(request.messages, request.system, request.tools),
+    ).toBeLessThanOrEqual(
+      Math.min(
+        Math.floor(limits.context * 0.75),
+        limits.context - expected,
+        "input" in limits && typeof limits.input === "number"
+          ? limits.input
+          : Infinity,
+      ),
+    );
+  },
+);
+
 it("uses normalized usage to retain materialized context and pass the final hard guard despite encrypted assistant metadata", async () => {
   state.config = JSON.stringify(config);
   const fake = sdk();
