@@ -2,7 +2,7 @@ import type { Plugin } from "@opencode/plugin";
 import { readFile } from "node:fs/promises";
 import type { SessionContext } from "@opencode/plugin/promise/session";
 import { afterEach, expect, it, vi } from "vitest";
-import { setup } from "../src/index.js";
+import { allowsWireOutputCap, setup } from "../src/index.js";
 import { canonicalizeNativeHistory } from "@reflection/opencode-v2-core/history";
 import { planNativeSegments } from "@reflection/opencode-v2-core/segmentation";
 import { Message } from "@opencode/ai";
@@ -41,6 +41,10 @@ function sdk(
     input: 16_000,
     output: 4000,
   },
+  modelExtra: {
+    settings?: Record<string, unknown>;
+    headers?: Record<string, string>;
+  } = {},
 ) {
   const hooks = new Map<string, (event: SessionContext) => Promise<void>>();
   const tools = new Map<
@@ -106,6 +110,7 @@ function sdk(
             id: "small",
             providerID: "test",
             limit: limits,
+            ...modelExtra,
           },
         ],
       }),
@@ -259,6 +264,143 @@ it.each([
         "input" in limits && typeof limits.input === "number"
           ? limits.input
           : Infinity,
+      ),
+    );
+  },
+);
+
+it("evaluates wire output cap permissions based on model settings and known routes", () => {
+  expect(allowsWireOutputCap({})).toBe(true);
+  expect(allowsWireOutputCap({ settings: { supportsMaxTokens: false } })).toBe(
+    false,
+  );
+  expect(
+    allowsWireOutputCap({ settings: { supportsMaxOutputTokens: false } }),
+  ).toBe(false);
+  expect(allowsWireOutputCap({ settings: { wireOutputCap: false } })).toBe(
+    false,
+  );
+  expect(
+    allowsWireOutputCap({
+      settings: { baseURL: "https://chatgpt.com/backend-api/codex" },
+    }),
+  ).toBe(false);
+  expect(
+    allowsWireOutputCap({
+      headers: { "chatgpt-account-id": "037f47bf-5010" },
+    }),
+  ).toBe(false);
+  expect(
+    allowsWireOutputCap({
+      settings: {
+        baseURL: "https://chatgpt.com/backend-api/codex",
+        supportsMaxTokens: true,
+      },
+    }),
+  ).toBe(true);
+  expect(
+    allowsWireOutputCap({
+      settings: { baseURL: "https://api.openai.com/v1" },
+    }),
+  ).toBe(true);
+});
+
+it.each([
+  {
+    name: "explicitly disabled maxTokens in settings",
+    modelExtra: { settings: { supportsMaxTokens: false } },
+    requested: undefined,
+  },
+  {
+    name: "ChatGPT Codex route via baseURL",
+    modelExtra: {
+      settings: { baseURL: "https://chatgpt.com/backend-api/codex" },
+    },
+    requested: undefined,
+  },
+  {
+    name: "ChatGPT Codex route with caller-requested maxTokens",
+    modelExtra: {
+      settings: { baseURL: "https://chatgpt.com/backend-api/codex" },
+    },
+    requested: 4000,
+  },
+  {
+    name: "ChatGPT account header marker",
+    modelExtra: { headers: { "chatgpt-account-id": "acc-123" } },
+    requested: undefined,
+  },
+])(
+  "omits wire maxTokens when $name but preserves context budgeting",
+  async ({ modelExtra, requested }) => {
+    state.config = JSON.stringify(config);
+    const limits = { context: 20_000, input: 16_000, output: 4000 };
+    const fake = sdk(
+      "/isolated/reflection-v2.json",
+      "/work",
+      "2.0.8",
+      limits,
+      modelExtra,
+    );
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: URL) => {
+        const path = new URL(String(input)).pathname;
+        if (path === "/v1/sources/native")
+          return Response.json({
+            id: "native",
+            kind: "opencode-v2",
+            identity_scheme: "source-v1",
+          });
+        if (path === "/api/session/s")
+          return Response.json({
+            data: {
+              id: "s",
+              time: { updated: 1 },
+              location: { directory: "/work" },
+            },
+          });
+        if (path === "/api/session/active")
+          return Response.json({ data: { s: { type: "busy" } } });
+        if (path.endsWith("/message"))
+          return Response.json({
+            data: [
+              { id: "u", type: "user", text: "hello", time: { created: 1 } },
+            ],
+            cursor: {},
+          });
+        if (path === "/api/config")
+          return Response.json([
+            { type: "document", info: { compaction: { auto: false } } },
+          ]);
+        if (path === "/v1/sessions/s/segments")
+          return Response.json({
+            source_id: "native",
+            session_id: "s",
+            manifest_version: 3,
+            segments: [],
+            boundaries: [],
+            targets: [],
+          });
+        throw new Error(`unexpected ${path}`);
+      }),
+    );
+    cleanups.push(await setup(fake.ctx, fake.ctx.storage));
+    const request = event();
+    request.messages = [
+      Message.make({ id: "u", role: "user", content: "hello" }),
+    ];
+    if (requested !== undefined) request.options.maxTokens = requested;
+    await fake.hooks.get("context")!(request);
+    expect(request.options.maxTokens).toBeUndefined();
+    expect(request.messages).toHaveLength(1);
+    expect(
+      materializedTokens(request.messages, request.system, request.tools),
+    ).toBeLessThanOrEqual(
+      Math.min(
+        Math.floor(limits.context * 0.75),
+        limits.context - limits.output,
+        limits.input,
       ),
     );
   },
