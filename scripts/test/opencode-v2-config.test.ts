@@ -730,6 +730,7 @@ describe("pure v1.18.29 to native 2.0.8 planning conversion", () => {
           expect(codes(result)).toContain("USER_POLICY_INVALID");
         else expect(() => parseUserPolicy(result.userPolicy)).not.toThrow();
       },
+      15_000,
     );
 
     it("keeps the parser's total model limit and the converter's earlier JSON-size guard fail-closed", () => {

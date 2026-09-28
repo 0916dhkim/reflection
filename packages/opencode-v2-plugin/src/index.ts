@@ -368,7 +368,14 @@ export async function setup(ctx: Plugin.Context, storage: StorageMutations) {
         quarterContext,
         requestedOutput ?? Infinity,
       );
-      const requestOptions = { ...event.options, maxTokens: output };
+      const wireCapAllowed = allowsWireOutputCap(model);
+      const requestOptions = {
+        ...event.options,
+        ...(wireCapAllowed ? { maxTokens: output } : {}),
+      };
+      if (!wireCapAllowed) {
+        delete (requestOptions as Record<string, unknown>).maxTokens;
+      }
       const stored = await bounded(
         ctx.storage.get(key(event.sessionID)),
         signal,
@@ -585,7 +592,11 @@ export async function setup(ctx: Plugin.Context, storage: StorageMutations) {
         instructionBases.set(requestSystem, baseSystem);
         event.system = requestSystem;
       }
-      event.options.maxTokens = output;
+      if (wireCapAllowed) {
+        event.options.maxTokens = output;
+      } else {
+        delete event.options.maxTokens;
+      }
       event.messages = messages;
       if (plan.lossy)
         warn(
@@ -821,4 +832,38 @@ function safeError(error: unknown): string {
   return error instanceof Error && error.message.startsWith("Reflection:")
     ? error.message
     : "Reflection: operation failed validation or is unavailable; no native fallback";
+}
+
+export function allowsWireOutputCap(model: {
+  settings?: Record<string, unknown>;
+  headers?: Record<string, string>;
+}): boolean {
+  const settings = model.settings;
+  if (settings && typeof settings === "object") {
+    if (
+      settings.supportsMaxTokens === false ||
+      settings.supportsMaxOutputTokens === false ||
+      settings.wireOutputCap === false
+    ) {
+      return false;
+    }
+    if (
+      settings.supportsMaxTokens === true ||
+      settings.supportsMaxOutputTokens === true ||
+      settings.wireOutputCap === true
+    ) {
+      return true;
+    }
+    const baseURL = settings.baseURL;
+    if (typeof baseURL === "string" && baseURL.includes("chatgpt.com")) {
+      return false;
+    }
+  }
+  const headers = model.headers;
+  if (headers && typeof headers === "object") {
+    if ("chatgpt-account-id" in headers) {
+      return false;
+    }
+  }
+  return true;
 }
