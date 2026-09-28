@@ -366,6 +366,9 @@ async function frozenFixture() {
     Message.make({ id: "latest", role: "user", content: "latest" }),
   ];
   f.event.messages = [...originals];
+  // The new 70%-of-context trigger requires more fixed context than the
+  // former 75%-of-(context minus catalog output) policy did.
+  f.event.system = [{ type: "text", text: "policy ".repeat(4500) }];
   const records = canonicalizeNativeHistory(f.history);
   // These were two independent inactive open snapshots before later appends.
   const snapshots = [0, 1].map(
@@ -421,7 +424,7 @@ it("outage planning preserves two frozen underlimit ranges without treating hint
   expect(f.event.messages.at(-1)).toBe(f.originals.at(-1));
   expect(
     materializedTokens(f.event.messages, f.event.system, f.event.tools),
-  ).toBeLessThanOrEqual(4500);
+  ).toBeLessThanOrEqual(15000);
   // Recovered authority merges the old frozen ranges. Local hints must not win.
   f.setMode("verified");
   const merged = planNativeSegments({
@@ -499,7 +502,10 @@ it.each([
     f.storage.set("reflection-v2/checkpoint/2/native/s", corrupted);
     f.setMode("503");
     f.event.messages = [...f.originals];
-    f.event.options.maxTokens = 0;
+    // The saved projection was made under a larger system prompt; the new
+    // request itself is comfortably below the 70% trigger without it.
+    f.event.system = [];
+    f.event.options.maxTokens = 1000;
     await f.context(f.event);
     f.event.messages.forEach((message, i) =>
       expect(message).toBe(f.originals[i]),
@@ -799,9 +805,11 @@ it("503 projects closed source-safe segments with omissions and revalidates a pr
   await context(event);
   expect(JSON.stringify([...storage.values()])).not.toBe(first);
 });
-it("an impossible output reserve still throws explicitly during a Reflection outage", async () => {
+it("an oversized explicit output limit is capped during a Reflection outage", async () => {
   const { context, event } = await fixture("503", false, 20000);
-  await expect(context(event)).rejects.toThrow("no usable input budget");
+  event.options.maxTokens = 20000;
+  await context(event);
+  expect(event.options.maxTokens).toBe(5000);
 });
 it("manifest outage never permits a projection that cannot safely fit the latest user", async () => {
   const { context, event, history } = await fixture("503");

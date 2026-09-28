@@ -6,6 +6,7 @@ import type { SessionContext } from "@opencode/plugin/promise/session";
 import { z } from "zod";
 import {
   NativeProjectionError,
+  nativeInputBudget,
   projectNativeContext,
   type NativeProjectionResult,
 } from "@reflection/opencode-v2-core/projection";
@@ -350,11 +351,24 @@ export async function setup(ctx: Plugin.Context, storage: StorageMutations) {
       );
       if (!model)
         throw new Error("Reflection: current model limits unavailable");
-      const output =
-        typeof event.options.maxTokens === "number" &&
-        Number.isFinite(event.options.maxTokens)
-          ? event.options.maxTokens
-          : model.limit.output;
+      const catalogOutput = model.limit.output;
+      const quarterContext = Math.floor(model.limit.context * 0.25);
+      const requestedOutput = event.options.maxTokens;
+      if (
+        !Number.isSafeInteger(catalogOutput) ||
+        catalogOutput <= 0 ||
+        !Number.isSafeInteger(quarterContext) ||
+        quarterContext <= 0 ||
+        (requestedOutput !== undefined &&
+          (!Number.isSafeInteger(requestedOutput) || requestedOutput <= 0))
+      )
+        throw new Error("Reflection: invalid output token limit");
+      const output = Math.min(
+        catalogOutput,
+        quarterContext,
+        requestedOutput ?? Infinity,
+      );
+      const requestOptions = { ...event.options, maxTokens: output };
       const stored = await bounded(
         ctx.storage.get(key(event.sessionID)),
         signal,
@@ -449,7 +463,7 @@ export async function setup(ctx: Plugin.Context, storage: StorageMutations) {
         event.model,
         estimationValue(usageSystem),
         toolBudget,
-        estimationValue(event.options),
+        estimationValue(requestOptions),
       );
       const estimateInput = (shape: Parameters<typeof materialize>[0]) =>
         tracker.estimate(materialize(shape, requestMessages));
@@ -521,14 +535,13 @@ export async function setup(ctx: Plugin.Context, storage: StorageMutations) {
           manifestUnavailable: !manifestAvailable,
         });
       const messages = materialize(plan, requestMessages);
-      const usable = Math.min(
-        model.limit.input ?? model.limit.context,
-        model.limit.context - output,
+      const { hard } = nativeInputBudget(
+        model.limit.context,
+        model.limit.input,
+        output,
       );
       const conservative = materializedTokens(messages, system, toolBudget);
-      if (
-        (tracker.estimate(messages) ?? conservative) > Math.floor(usable * 0.9)
-      )
+      if ((tracker.estimate(messages) ?? conservative) > hard)
         throw new Error(
           "Reflection: materialized context exceeds hard input budget",
         );
@@ -572,6 +585,7 @@ export async function setup(ctx: Plugin.Context, storage: StorageMutations) {
         instructionBases.set(requestSystem, baseSystem);
         event.system = requestSystem;
       }
+      event.options.maxTokens = output;
       event.messages = messages;
       if (plan.lossy)
         warn(

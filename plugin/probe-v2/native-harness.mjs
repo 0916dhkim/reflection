@@ -533,6 +533,7 @@ async function main() {
         models: Object.fromEntries(
           [
             ["mock", 24000],
+            ["budget", 24000],
             ["anchor", 40000],
             ["tools", 96000],
           ].map(([id, context]) => [
@@ -543,7 +544,7 @@ async function main() {
                 input: id === "tools" ? ["text", "image"] : ["text"],
                 output: ["text"],
               },
-              limit: { context, output: 1000 },
+              limit: { context, output: id === "budget" ? 20000 : 1000 },
             },
           ]),
         ),
@@ -621,6 +622,23 @@ async function main() {
     ["memory_search", "memory_read_segment"].every((name) =>
       requests[0].body.tools.some((tool) => tool.function?.name === name),
     ),
+  );
+
+  phase = "budget-wire";
+  const budgetSession = await session("output budget wire", "budget");
+  await prompt(budgetSession, "NATIVE_OUTPUT_BUDGET");
+  const budgetRequests = requests.filter((item) => item.phase === phase);
+  requireCheck(
+    "actual provider request caps output at 25% of model context",
+    budgetRequests.length === 1 &&
+      (budgetRequests[0].body.max_tokens ??
+        budgetRequests[0].body.max_completion_tokens) === 6000,
+    {
+      count: budgetRequests.length,
+      maxTokens:
+        budgetRequests[0]?.body.max_tokens ??
+        budgetRequests[0]?.body.max_completion_tokens,
+    },
   );
 
   phase = "pressure";

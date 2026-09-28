@@ -468,12 +468,12 @@ it("includes instructions in the real hard budget before provider dispatch", asy
   await f.dispatch(event);
   expect(
     materializedTokens(event.messages, event.system, event.tools),
-  ).toBeLessThanOrEqual(14400);
+  ).toBeLessThanOrEqual(15000);
 });
 
 it("materializes guarded tool results without changing canonical source IDs or fingerprints", async () => {
   const f = await fixture();
-  const old = "old ".repeat(7000);
+  const old = "old ".repeat(11000);
   f.history.unshift({
     id: "old",
     type: "user",

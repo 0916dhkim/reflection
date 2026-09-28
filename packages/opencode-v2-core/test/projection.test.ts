@@ -5,6 +5,7 @@ import { canonicalizeNativeHistory } from "../src/history.js";
 import { planNativeSegments } from "../src/segmentation.js";
 import {
   estimateNativeTokens,
+  nativeInputBudget,
   NativeProjectionError,
   projectNativeContext,
   type ModelMessageLike,
@@ -413,13 +414,14 @@ describe("native projection plans", () => {
         assistant("a"),
         assistant("a2", "small completed work"),
         assistant("a3", "small completed work"),
-        { ...assistant("tail", "x".repeat(11_400)), time: { created: 0 } },
+        { ...assistant("tail", "x".repeat(13_500)), time: { created: 0 } },
       ],
       1,
     );
     input.allowLossy = true;
+    input.contextLimit = 6500;
     input.manifest.segments.forEach((entry, index) => {
-      entry.summary = `Verified ${index}: ${"specific work ".repeat(4)}`;
+      entry.summary = `Verified ${index}: ${"specific work ".repeat(20)}`;
     });
     const prior = projectNativeContext(input);
     expect(prior.notice?.text).toContain("summary-budget=");
@@ -467,6 +469,7 @@ describe("native projection plans", () => {
       1,
     );
     input.allowLossy = true;
+    input.contextLimit = 6500;
     input.manifest.segments.forEach((entry, index) => {
       entry.summary = `Verified ${index}: ${"specific work ".repeat(4)}`;
     });
@@ -605,6 +608,59 @@ describe("native projection plans", () => {
     expect(projectNativeContext(input).notice).toBeUndefined();
   });
 
+  it("uses 70% of context for projection and 75% for the hard ceiling", () => {
+    expect(nativeInputBudget(1_048_576, undefined, 262_144)).toEqual({
+      soft: 734_003,
+      hard: 786_432,
+    });
+    expect(nativeInputBudget(20_000, 10_000, 2000)).toEqual({
+      soft: 9333,
+      hard: 10_000,
+    });
+    expect(nativeInputBudget(20_000, undefined, 8000)).toEqual({
+      soft: 11_200,
+      hard: 12_000,
+    });
+    expect(() => nativeInputBudget(20_000, undefined, 20_000)).toThrow(
+      "no usable input budget",
+    );
+  });
+
+  it("projects before dispatch at 70% and blocks only above the 75% ceiling", () => {
+    const input = fixture([user("u", "x".repeat(20_000))]);
+    input.segments = [];
+    input.contextLimit = 100_000;
+    input.outputLimit = 25_000;
+    const tokens = projectNativeContext(input).estimatedTokens;
+    input.contextLimit = Math.ceil(tokens / 0.69);
+    input.outputLimit = Math.floor(input.contextLimit * 0.25);
+    expect(projectNativeContext(input).deferredReason).toBeUndefined();
+    input.contextLimit = Math.ceil(tokens / 0.72);
+    input.outputLimit = Math.floor(input.contextLimit * 0.25);
+    expect(projectNativeContext(input).deferredReason).toContain(
+      "retaining raw",
+    );
+    input.contextLimit = Math.floor(tokens / 0.76);
+    input.outputLimit = Math.floor(input.contextLimit * 0.25);
+    expect(() => projectNativeContext(input)).toThrow(/hard input budget/);
+  });
+
+  it("projects an oversized complete prefix before dispatch, retaining the latest user", () => {
+    const input = fixture([
+      user("old"),
+      assistant("a", "x".repeat(30_000)),
+      user("latest", "continue this task"),
+    ]);
+    input.contextLimit = 10_000;
+    input.outputLimit = 2500;
+    const raw = projectNativeContext({ ...input, contextLimit: 100_000 });
+    expect(raw.estimatedTokens).toBeGreaterThan(7500);
+    const projected = projectNativeContext(input);
+    expect(projected.notice).toBeDefined();
+    expect(projected.estimatedTokens).toBeLessThanOrEqual(7500);
+    expect(retained(projected, input)).toContain(2);
+  });
+
   it("restores the latest actual user by index with verbatim multimodal content", () => {
     const input = fixture();
     const content = [
@@ -623,7 +679,7 @@ describe("native projection plans", () => {
       content,
     );
     expect(retained(plan, input)).toEqual([2]);
-    expect(plan.estimatedTokens).toBeLessThanOrEqual(5850);
+    expect(plan.estimatedTokens).toBeLessThanOrEqual(6500);
   });
 
   it("never duplicates a user already in the raw tail", () => {
@@ -1008,11 +1064,11 @@ describe("native projection plans", () => {
       contextLimit: 100_000,
     }).estimatedTokens;
     input.outputLimit = 0;
-    input.contextLimit = Math.ceil(tokens / 0.8);
+    input.contextLimit = Math.ceil(tokens / 0.72);
     expect(projectNativeContext(input).deferredReason).toContain(
       "retaining raw",
     );
-    input.contextLimit = Math.floor(tokens / 0.95);
+    input.contextLimit = Math.floor(tokens / 0.76);
     expect(() => projectNativeContext(input)).toThrow(NativeProjectionError);
   });
 
