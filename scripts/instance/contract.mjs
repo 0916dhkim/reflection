@@ -642,16 +642,11 @@ export function validateActiveConfig(
     !exactKeys(policy, [
       "version",
       "instructionFiles",
-      "modelAllowlists",
       "geminiOpenRouterToolGuard",
     ]) ||
     policy.version !== 1 ||
     !stringArray(policy.instructionFiles) ||
     !policy.instructionFiles.every(isAbsolute) ||
-    !object(policy.modelAllowlists) ||
-    !Object.values(policy.modelAllowlists).every(
-      (models) => stringArray(models) && models.every(requiredText),
-    ) ||
     policy.geminiOpenRouterToolGuard !== true
   )
     fail("E_CONFIG");

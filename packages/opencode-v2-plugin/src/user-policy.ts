@@ -11,11 +11,6 @@ import {
 const MAX_INSTRUCTION_FILES = 32;
 const MAX_INSTRUCTION_BYTES = 256 * 1024;
 const MAX_TOTAL_INSTRUCTION_BYTES = 1024 * 1024;
-const MAX_PROVIDER_NAME_LENGTH = 200;
-const MAX_MODEL_ID_LENGTH = 500;
-const MAX_ALLOWLIST_PROVIDERS = 256;
-const MAX_MODELS_PER_PROVIDER = 10_000;
-const MAX_ALLOWLIST_MODELS = 20_000;
 
 const POLICY_ERROR = "Invalid user policy";
 const INSTRUCTION_ERROR = "Unable to read user instruction files";
@@ -23,22 +18,12 @@ const INSTRUCTION_ERROR = "Unable to read user instruction files";
 export interface UserPolicy {
   readonly version: 1;
   readonly instructionFiles: readonly string[];
-  readonly modelAllowlists: Readonly<Record<string, readonly string[]>>;
   readonly geminiOpenRouterToolGuard: boolean;
 }
 
 export interface NativeModel {
   readonly providerID: string;
   readonly id: string;
-}
-
-export interface NativeModelEditor {
-  list(): readonly NativeModel[];
-  update(
-    providerID: string,
-    modelID: string,
-    update: (model: { enabled: boolean }) => void,
-  ): void;
 }
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
@@ -65,24 +50,6 @@ function exactKeys(
   return own.length === keys.length && own.every((key) => keys.includes(key));
 }
 
-function modelIDs(value: unknown): readonly string[] {
-  if (!Array.isArray(value) || value.length > MAX_MODELS_PER_PROVIDER) {
-    return policyError();
-  }
-  for (const id of value) {
-    if (
-      typeof id !== "string" ||
-      id.length === 0 ||
-      id.length > MAX_MODEL_ID_LENGTH ||
-      id.includes("\0") ||
-      id.trim().length === 0
-    ) {
-      return policyError();
-    }
-  }
-  return value;
-}
-
 export function parseUserPolicy(value: unknown): UserPolicy {
   try {
     if (
@@ -90,7 +57,6 @@ export function parseUserPolicy(value: unknown): UserPolicy {
       !exactKeys(value, [
         "version",
         "instructionFiles",
-        "modelAllowlists",
         "geminiOpenRouterToolGuard",
       ])
     ) {
@@ -126,62 +92,13 @@ export function parseUserPolicy(value: unknown): UserPolicy {
         instructionFiles.push(normalized);
       }
     }
-    if (
-      !isPlainObject(value.modelAllowlists) ||
-      Object.keys(value.modelAllowlists).length > MAX_ALLOWLIST_PROVIDERS
-    ) {
-      return policyError();
-    }
-    let totalModels = 0;
-    const modelAllowlists: Record<string, readonly string[]> =
-      Object.create(null);
-    for (const [providerID, configuredModels] of Object.entries(
-      value.modelAllowlists,
-    )) {
-      if (
-        providerID.length === 0 ||
-        providerID.length > MAX_PROVIDER_NAME_LENGTH ||
-        providerID.includes("\0") ||
-        providerID.trim().length === 0
-      ) {
-        return policyError();
-      }
-      const models = modelIDs(configuredModels);
-      totalModels += models.length;
-      if (totalModels > MAX_ALLOWLIST_MODELS) {
-        return policyError();
-      }
-      modelAllowlists[providerID] = Object.freeze([...models]);
-    }
     return Object.freeze({
       version: 1 as const,
       instructionFiles: Object.freeze(instructionFiles),
-      modelAllowlists: Object.freeze(modelAllowlists),
       geminiOpenRouterToolGuard: value.geminiOpenRouterToolGuard,
     });
   } catch {
     return policyError();
-  }
-}
-
-export function isUserModelAllowed(
-  policy: UserPolicy,
-  model: NativeModel,
-): boolean {
-  const allowlist = policy.modelAllowlists[model.providerID];
-  return allowlist === undefined || allowlist.includes(model.id);
-}
-
-export function applyModelAllowlist(
-  policy: UserPolicy,
-  editor: NativeModelEditor,
-): void {
-  for (const model of editor.list()) {
-    if (!isUserModelAllowed(policy, model)) {
-      editor.update(model.providerID, model.id, (draft) => {
-        draft.enabled = false;
-      });
-    }
   }
 }
 

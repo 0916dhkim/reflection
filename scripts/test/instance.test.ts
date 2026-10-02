@@ -111,7 +111,6 @@ async function active(value: Fixture) {
       join(value.home, "MEMORY.md"),
       join(value.home, "USER.md"),
     ],
-    modelAllowlists: { openrouter: ["google/gemini-3.8-flash"] },
     geminiOpenRouterToolGuard: true,
   };
   Schema.decodeUnknownSync(Config.Info, { onExcessProperty: "error" })(native);
@@ -867,9 +866,9 @@ describe("isolated preparation and mock-only launch", () => {
         },
       ],
       [
-        "policy allowlist",
+        "policy removed allowlist key",
         (a) => {
-          Object.assign(a.policy, { modelAllowlists: [] });
+          Object.assign(a.policy, { modelAllowlists: {} });
         },
       ],
       [

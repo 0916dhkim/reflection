@@ -35,10 +35,8 @@ import { UsageTracker } from "./usage.js";
 import { Operations, bounded } from "./operations.js";
 import { withCancellableStorage, type StorageMutations } from "./native.js";
 import {
-  applyModelAllowlist,
   guardGeminiToolResults,
   instructionUsageIdentity,
-  isUserModelAllowed,
   parseUserPolicy,
   readUserInstructionParts,
   type UserPolicy,
@@ -62,7 +60,6 @@ export async function setup(ctx: Plugin.Context, storage: StorageMutations) {
   let http: Transport | undefined;
   let ingestion: Ingestion | undefined;
   let userPolicy: UserPolicy | undefined;
-  let modelFilter: Awaited<ReturnType<typeof ctx.model.transform>> | undefined;
   const instructionBases = new WeakMap<
     SessionContext["system"],
     SessionContext["system"]
@@ -103,8 +100,6 @@ export async function setup(ctx: Plugin.Context, storage: StorageMutations) {
   const dispatch = await ctx.session.hook("model.request", (event) =>
     operations.run(event.sessionID, async (signal) => {
       const { http } = await requireReady(signal);
-      if (userPolicy && !isUserModelAllowed(userPolicy, event.model))
-        throw new Error("Reflection: user policy forbids selected model");
       if (event.kind === "compaction")
         throw new Error(
           "Reflection owns compaction; native checkpoint forbidden",
@@ -274,8 +269,6 @@ export async function setup(ctx: Plugin.Context, storage: StorageMutations) {
         event.messages;
       const baseSystem = instructionBases.get(event.system) ?? event.system;
       if (userPolicy) {
-        if (!isUserModelAllowed(userPolicy, event.model))
-          throw new Error("Reflection: user policy forbids selected model");
         try {
           const parts = await bounded(
             readUserInstructionParts(userPolicy, signal),
@@ -667,27 +660,6 @@ export async function setup(ctx: Plugin.Context, storage: StorageMutations) {
             else void opening.then((late) => late.close()).catch(() => {});
           }
           signal.throwIfAborted();
-          const policy = userPolicy;
-          const registration = ctx.model.transform((editor) => {
-            if (signal.aborted || operations.stopped) return;
-            applyModelAllowlist(policy, {
-              list: () =>
-                editor.list().map((model) => ({
-                  id: String(model.id),
-                  providerID: String(model.providerID),
-                })),
-              update: (providerID, modelID, update) =>
-                editor.update(providerID, modelID, update),
-            });
-          });
-          try {
-            modelFilter = await bounded(registration, signal);
-            signal.throwIfAborted();
-          } catch (error) {
-            modelFilter = undefined;
-            void registration.then((late) => late.dispose()).catch(() => {});
-            throw error;
-          }
         } catch {
           throw new Error(
             "Reflection: user policy unavailable or invalid; reload required",
@@ -811,15 +783,12 @@ export async function setup(ctx: Plugin.Context, storage: StorageMutations) {
     await operations.dispose();
     await initialization;
     await bounded(eventTask, AbortSignal.timeout(5000)).catch(() => {});
-    const filter = modelFilter;
-    modelFilter = undefined;
     await bounded(
       Promise.all([
         context.dispose(),
         compaction.dispose(),
         dispatch.dispose(),
         tools.dispose(),
-        filter?.dispose(),
       ]),
       AbortSignal.timeout(5000),
     );
