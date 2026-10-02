@@ -130,11 +130,9 @@ function fixture() {
     compaction: { auto: false, preserve_recent_tokens: 12000, tail_turns: 4 },
     provider: {
       openai: {
-        whitelist: ["gpt-5.6-terra-fast"],
         options: { apiKey: SECRET },
       },
       openrouter: {
-        whitelist: ["google/gemini-3.8-flash"],
         options: {
           headers: { Authorization: SECRET },
           body: { reasoningEffort: "high" },
@@ -646,124 +644,6 @@ describe("pure v1.18.29 to native 2.0.8 planning conversion", () => {
       },
     );
 
-    it.each(["", "   ", "model\0private", "m".repeat(500), "m".repeat(501)])(
-      "agrees on model ID boundaries without exposing parser errors",
-      (model) => {
-        const result = convert(
-          { provider: { openai: { whitelist: [model] } } },
-          { publicStrings: [...context.publicStrings, model] },
-        );
-        const valid = model.length === 500;
-        expect(result.conversionComplete).toBe(valid);
-        if (model.includes("\0")) {
-          expect(codes(result)).toContain("PUBLIC_DECLARATION_REQUIRED");
-          expect(result.userPolicy.modelAllowlists.openai).toEqual([]);
-        } else {
-          expect(result.userPolicyValid).toBe(valid);
-          if (valid)
-            expect(() => parseUserPolicy(result.userPolicy)).not.toThrow();
-          else {
-            expect(() => parseUserPolicy(result.userPolicy)).toThrow();
-            expect(codes(result)).toContain("USER_POLICY_INVALID");
-          }
-        }
-        expect(JSON.stringify(result.diagnostics)).not.toContain(
-          "Invalid user policy",
-        );
-      },
-    );
-
-    it.each(["", "   ", "provider\0private", "p".repeat(200), "p".repeat(201)])(
-      "uses the actual provider-name constraints (%s)",
-      (provider) => {
-        const result = convert(
-          { provider: { [provider]: { whitelist: [] } } },
-          { publicStrings: [...context.publicStrings, provider] },
-        );
-        // Unreviewed providers remain blocked independently of the policy schema.
-        expect(result.conversionComplete).toBe(false);
-        if (!provider.includes("\0")) {
-          expect(result.userPolicyValid).toBe(provider.length === 200);
-          if (result.userPolicyValid)
-            expect(() => parseUserPolicy(result.userPolicy)).not.toThrow();
-          else expect(codes(result)).toContain("USER_POLICY_INVALID");
-        }
-      },
-    );
-
-    it.each([256, 257])(
-      "checks %i allowlist providers with the actual parser",
-      (count) => {
-        const ids = Array.from({ length: count }, (_, i) => `synthetic-${i}`);
-        const result = convert(
-          {
-            provider: Object.fromEntries(
-              ids.map((id) => [id, { whitelist: [] }]),
-            ),
-          },
-          { publicStrings: [...context.publicStrings, ...ids] },
-        );
-        expect(result.userPolicyValid).toBe(count === 256);
-        expect(result.conversionComplete).toBe(false);
-        if (count === 257)
-          expect(codes(result)).toContain("USER_POLICY_INVALID");
-        else expect(() => parseUserPolicy(result.userPolicy)).not.toThrow();
-      },
-    );
-
-    it.each([10000, 10001])(
-      "checks %i models per provider using the actual parser",
-      (count) => {
-        const result = convert({
-          provider: {
-            openai: {
-              whitelist: Array.from(
-                { length: count },
-                () => "gpt-5.6-terra-fast",
-              ),
-            },
-          },
-        });
-        expect(result.userPolicyValid).toBe(count === 10000);
-        expect(result.conversionComplete).toBe(count === 10000);
-        if (count === 10001)
-          expect(codes(result)).toContain("USER_POLICY_INVALID");
-        else expect(() => parseUserPolicy(result.userPolicy)).not.toThrow();
-      },
-      15_000,
-    );
-
-    it("keeps the parser's total model limit and the converter's earlier JSON-size guard fail-closed", () => {
-      const policy = convert({}).userPolicy;
-      const models = Array.from({ length: 10000 }, () => "gpt-5.6-terra-fast");
-      const modelAllowlists = { openai: models, openrouter: models };
-      expect(() =>
-        parseUserPolicy({ ...policy, modelAllowlists }),
-      ).not.toThrow();
-      expect(() =>
-        parseUserPolicy({
-          ...policy,
-          modelAllowlists: { ...modelAllowlists, synthetic: ["extra"] },
-        }),
-      ).toThrow();
-      for (const allowlists of [
-        modelAllowlists,
-        { ...modelAllowlists, synthetic: ["extra"] },
-      ]) {
-        const result = convert({
-          provider: Object.fromEntries(
-            Object.entries(allowlists).map(([id, whitelist]) => [
-              id,
-              { whitelist },
-            ]),
-          ),
-        });
-        expect(result.conversionComplete).toBe(false);
-        expect(result.userPolicyValid).toBe(false);
-        expect(codes(result)).toContain("INVALID_JSON_INPUT");
-      }
-    });
-
     it("does not let relative instruction paths reach a completed conversion", () => {
       const result = convert(
         { instructions: ["relative.md"] },
@@ -787,18 +667,10 @@ describe("pure v1.18.29 to native 2.0.8 planning conversion", () => {
       ).toThrow();
     });
 
-    it("still completes the synthetic two-file/eleven-model shape", () => {
-      const models = Array.from(
-        { length: 11 },
-        (_, i) => `synthetic/model-${i}`,
-      );
-      const result = convert(
-        {
-          instructions: ["/legacy/v1/MEMORY.md", "/legacy/v1/USER.md"],
-          provider: { openrouter: { whitelist: models } },
-        },
-        { publicStrings: [...context.publicStrings, ...models] },
-      );
+    it("still completes the synthetic two-file shape", () => {
+      const result = convert({
+        instructions: ["/legacy/v1/MEMORY.md", "/legacy/v1/USER.md"],
+      });
       expect(result.conversionComplete).toBe(true);
       expect(result.userPolicyValid).toBe(true);
       expect(parseUserPolicy(result.userPolicy)).toEqual(result.userPolicy);
@@ -947,10 +819,6 @@ describe("pure v1.18.29 to native 2.0.8 planning conversion", () => {
         "/legacy/v1/MEMORY.md",
         "/legacy/v1/USER.md",
       ],
-      modelAllowlists: {
-        openai: ["gpt-5.6-terra-fast"],
-        openrouter: ["google/gemini-3.8-flash"],
-      },
       geminiOpenRouterToolGuard: true,
     });
   });
@@ -1717,14 +1585,9 @@ describe("pure v1.18.29 to native 2.0.8 planning conversion", () => {
     ).toEqual([{ action: "*", resource: "*", effect: "ask" }]);
   });
 
-  it("preserves provider policy order and allowlist order", () => {
+  it("preserves provider policy order", () => {
     const result = convert({
       disabled_providers: ["openrouter", "openai"],
-      provider: {
-        openrouter: {
-          whitelist: ["google/gemini-3.8-flash", "gpt-5.6-terra-fast"],
-        },
-      },
     });
     expect(result.conversionComplete).toBe(true);
     expect(result.draftNativeConfig.experimental).toEqual({
@@ -1733,10 +1596,6 @@ describe("pure v1.18.29 to native 2.0.8 planning conversion", () => {
         { action: "provider.use", resource: "openai", effect: "deny" },
       ],
     });
-    expect(result.userPolicy.modelAllowlists.openrouter).toEqual([
-      "google/gemini-3.8-flash",
-      "gpt-5.6-terra-fast",
-    ]);
   });
 
   it("requires an explicit compaction override and never emits auto=true", () => {
@@ -1771,6 +1630,10 @@ describe("pure v1.18.29 to native 2.0.8 planning conversion", () => {
     [
       { provider: { openai: { blacklist: [SECRET] } } },
       "UNSUPPORTED_PROVIDER_BLACKLIST",
+    ],
+    [
+      { provider: { openai: { whitelist: [SECRET] } } },
+      "UNSUPPORTED_PROVIDER_WHITELIST",
     ],
     [{ plugin: [SECRET] }, "UNKNOWN_PLUGIN"],
     [{ command: { secret: SECRET } }, "UNSUPPORTED_NONEMPTY_FIELD"],

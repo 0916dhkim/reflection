@@ -62,7 +62,6 @@ export interface ConversionResult {
   userPolicy: {
     version: 1;
     instructionFiles: string[];
-    modelAllowlists: Record<string, string[]>;
     geminiOpenRouterToolGuard: true;
   };
   runtime: ConversionContext["runtime"] | null;
@@ -265,7 +264,6 @@ export function convertV1ToNative208(
     userPolicy: {
       version: 1,
       instructionFiles: [],
-      modelAllowlists: Object.create(null),
       geminiOpenRouterToolGuard: true,
     },
     runtime: null,
@@ -1019,22 +1017,7 @@ export function convertV1ToNative208(
           name: (v, r) => {
             out.name = slot(v, r, "text");
           },
-          whitelist: (v, r) => {
-            if (!Array.isArray(v)) {
-              diagnostic("INVALID_ARRAY", r);
-              return;
-            }
-            const list: string[] = [];
-            result.userPolicy.modelAllowlists[id] = list;
-            v.forEach((model, i) => {
-              const s = [...r, i];
-              if (declared(model, s)) {
-                list.push(model);
-                mark(s, "externalized");
-              }
-            });
-            mark(r, "externalized");
-          },
+          whitelist: (_v, r) => diagnostic("UNSUPPORTED_PROVIDER_WHITELIST", r),
           blacklist: (_v, r) => diagnostic("UNSUPPORTED_PROVIDER_BLACKLIST", r),
           options: (v, r) => {
             const config: ObjectValue = Object.create(null);

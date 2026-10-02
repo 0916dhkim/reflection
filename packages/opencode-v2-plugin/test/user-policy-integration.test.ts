@@ -10,7 +10,6 @@ import { canonicalizeNativeHistory } from "@reflection/opencode-v2-core/history"
 import { estimateNativeTokens } from "@reflection/opencode-v2-core/projection";
 import { planNativeSegments } from "@reflection/opencode-v2-core/segmentation";
 import { setup } from "../src/index.js";
-import type { NativeModelEditor } from "../src/user-policy.js";
 import * as userPolicy from "../src/user-policy.js";
 import { materializedTokens } from "../src/projection.js";
 import { UsageTracker } from "../src/usage.js";
@@ -44,7 +43,6 @@ async function fixture() {
   const policy = {
     version: 1,
     instructionFiles: [memory, user],
-    modelAllowlists: { openrouter: [selected.id] },
     geminiOpenRouterToolGuard: true,
   };
   await Promise.all([
@@ -66,12 +64,6 @@ async function fixture() {
   ]);
   const hooks = new Map<string, (event: SessionContext) => Promise<void>>();
   const storage = new Map<string, unknown>();
-  let transform: ((editor: NativeModelEditor) => void) | undefined;
-  const filterDispose = vi.fn(async () => {});
-  const modelTransform = vi.fn(async (callback: typeof transform) => {
-    transform = callback;
-    return { dispose: filterDispose };
-  });
   const limits = { context: 20000, input: 16000, output: 4000 };
   const history: unknown[] = [
     { id: "latest", type: "user", text: "latest", time: { created: 1 } },
@@ -126,7 +118,7 @@ async function fixture() {
       },
     },
     tool: { transform: async () => ({ dispose: async () => {} }) },
-    model: { list: modelList, transform: modelTransform },
+    model: { list: modelList },
     storage: {
       get: async (key: string) => storage.get(key),
       set: async (key: string, value: unknown) => {
@@ -173,13 +165,10 @@ async function fixture() {
     fetch,
     event,
     start,
-    modelTransform,
-    filterDispose,
     modelList,
     limits,
     history,
     storage,
-    replay: (editor: NativeModelEditor) => transform!(editor),
     context: (value: SessionContext) => hooks.get("context")!(value),
     dispatch: (value: SessionContext, kind = "chat") =>
       hooks.get("model.request")!({ ...value, kind } as SessionContext),
@@ -204,7 +193,6 @@ it.each([undefined, null, "relative.json", "/missing/private-policy.json"])(
       );
     }
     expect(f.fetch).not.toHaveBeenCalled();
-    expect(f.modelTransform).not.toHaveBeenCalled();
   },
 );
 it.each(["not JSON private-value", "{}", " ".repeat(1024 * 1024 + 1)])(
@@ -220,10 +208,9 @@ it.each(["not JSON private-value", "{}", " ".repeat(1024 * 1024 + 1)])(
   },
 );
 
-it("absent policy never uses model.transform and retains the native system", async () => {
+it("absent policy retains the native system", async () => {
   const f = await fixture();
   delete f.options.userPolicyPath;
-  Reflect.deleteProperty(f.ctx.model, "transform");
   await f.start();
   const event = f.event();
   const system = event.system;
@@ -407,46 +394,6 @@ it("invalidates provider usage for nonexempt instructions or changed base system
   }
 });
 
-it("replays filtering for new catalog models and blocks late overrides for every dispatch kind", async () => {
-  const f = await fixture();
-  const dispose = await f.start();
-  for (const id of ["google/blocked", "google/newly-discovered"]) {
-    const models = [
-      { ...selected, enabled: true },
-      { ...selected, id, enabled: true },
-    ];
-    f.replay({
-      list: () => models,
-      update: (provider, model, update) => {
-        update(
-          models.find(
-            (candidate) =>
-              candidate.providerID === provider && candidate.id === model,
-          )!,
-        );
-      },
-    });
-    expect(models.map((model) => model.enabled)).toEqual([true, false]);
-    models[1]!.enabled = true;
-    const base = f.event();
-    const event = { ...base, model: { ...base.model, id } } as SessionContext;
-    f.fetch.mockClear();
-    for (const kind of ["chat", "title", "generate", "compaction"]) {
-      await expect(f.dispatch(event, kind)).rejects.toThrow(
-        "user policy forbids selected model",
-      );
-    }
-    await expect(f.context(event)).rejects.toThrow(
-      "user policy forbids selected model",
-    );
-    expect(f.fetch).not.toHaveBeenCalled();
-    expect(f.modelList).not.toHaveBeenCalled();
-  }
-  await dispose();
-  await dispose();
-  expect(f.filterDispose).toHaveBeenCalledTimes(1);
-});
-
 it("includes instructions in the real hard budget before provider dispatch", async () => {
   const f = await fixture();
   await f.start();
@@ -592,7 +539,6 @@ it.each(["pending", "resolve", "reject", "close-reject"] as const)(
       "Reflection: user policy unavailable or invalid; reload required",
     );
     expect(f.fetch).not.toHaveBeenCalled();
-    expect(f.modelTransform).not.toHaveBeenCalled();
     await dispose();
     if (outcome === "reject") {
       reject(new Error("private late open failure"));
@@ -612,7 +558,6 @@ it.each(["pending", "resolve", "reject", "close-reject"] as const)(
     await dispose();
     expect(close).toHaveBeenCalledTimes(outcome === "pending" ? 0 : 1);
     expect(f.fetch).not.toHaveBeenCalled();
-    expect(f.modelTransform).not.toHaveBeenCalled();
   },
 );
 
@@ -648,69 +593,7 @@ it.each(["stat", "read", "close"] as const)(
       "Reflection: user policy unavailable or invalid; reload required",
     );
     expect(f.fetch).not.toHaveBeenCalled();
-    expect(f.modelTransform).not.toHaveBeenCalled();
     await dispose();
-  },
-);
-
-it.each(["pending", "resolve", "reject", "dispose-reject"] as const)(
-  "bounds pending model registration and handles late %s without revival",
-  async (outcome) => {
-    const f = await fixture();
-    let resolve!: (value: Awaited<ReturnType<typeof f.modelTransform>>) => void;
-    let reject!: (error: Error) => void;
-    let replay: Parameters<typeof f.modelTransform>[0];
-    f.modelTransform.mockImplementationOnce(async (callback) => {
-      replay = callback;
-      return new Promise((yes, no) => {
-        resolve = yes;
-        reject = no;
-      });
-    });
-    vi.useFakeTimers();
-    let returned = false;
-    const starting = f.start().then((dispose) => {
-      returned = true;
-      return dispose;
-    });
-    await vi.waitFor(() => expect(f.modelTransform).toHaveBeenCalled());
-    await vi.advanceTimersByTimeAsync(60001);
-    expect(returned).toBe(true);
-    const dispose = await starting;
-    expect(() => f.hooks.get("compaction")!(f.event())).toThrow(
-      "native checkpoint forbidden",
-    );
-    await expect(f.context(f.event())).rejects.toThrow(
-      "Reflection: user policy unavailable or invalid; reload required",
-    );
-    await expect(f.dispatch(f.event())).rejects.toThrow(
-      "Reflection: user policy unavailable or invalid; reload required",
-    );
-    const editor = {
-      list: vi.fn(() => [{ ...selected, id: "blocked" }]),
-      update: vi.fn(),
-    };
-    replay!(editor);
-    expect(editor.list).not.toHaveBeenCalled();
-    await dispose();
-    const lateDispose = vi.fn(async () => {
-      if (outcome === "dispose-reject")
-        throw new Error("private late disposal failure");
-    });
-    if (outcome === "reject")
-      reject(new Error("private late registration failure"));
-    else if (outcome !== "pending") resolve({ dispose: lateDispose });
-    await vi.advanceTimersByTimeAsync(0);
-    expect(lateDispose).toHaveBeenCalledTimes(
-      outcome === "reject" || outcome === "pending" ? 0 : 1,
-    );
-    await dispose();
-    expect(lateDispose).toHaveBeenCalledTimes(
-      outcome === "reject" || outcome === "pending" ? 0 : 1,
-    );
-    replay!(editor);
-    expect(editor.update).not.toHaveBeenCalled();
-    expect(f.fetch).not.toHaveBeenCalled();
   },
 );
 

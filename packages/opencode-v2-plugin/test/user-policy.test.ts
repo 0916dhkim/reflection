@@ -5,13 +5,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, expect, it } from "vitest";
 import {
-  applyModelAllowlist,
   guardGeminiToolResults,
   instructionUsageIdentity,
-  isUserModelAllowed,
   parseUserPolicy,
   readUserInstructionParts,
-  type NativeModelEditor,
   type UserPolicy,
 } from "../src/user-policy.js";
 import { estimateMessages } from "../src/projection.js";
@@ -36,7 +33,6 @@ function policy(instructionFiles: string[] = []): UserPolicy {
   return parseUserPolicy({
     version: 1,
     instructionFiles,
-    modelAllowlists: {},
     geminiOpenRouterToolGuard: true,
   });
 }
@@ -56,49 +52,46 @@ it("strictly parses policy JSON, lexically deduplicating absolute instruction fi
   const input = {
     version: 1,
     instructionFiles: ["/tmp/one/../first", "/tmp/first", "/tmp/second"],
-    modelAllowlists: { openrouter: ["google/gemini-3", "google/gemini-3"] },
     geminiOpenRouterToolGuard: false,
   };
   const parsed = parseUserPolicy(input);
   expect(parsed).toEqual({
     version: 1,
     instructionFiles: ["/tmp/first", "/tmp/second"],
-    modelAllowlists: { openrouter: ["google/gemini-3", "google/gemini-3"] },
     geminiOpenRouterToolGuard: false,
   });
-  input.modelAllowlists.openrouter.push("late-model");
-  expect(
-    isUserModelAllowed(parsed, { providerID: "openrouter", id: "late-model" }),
-  ).toBe(false);
+  input.instructionFiles.push("/tmp/late");
+  expect(parsed.instructionFiles).toEqual(["/tmp/first", "/tmp/second"]);
   expect(Object.isFrozen(parsed)).toBe(true);
   expect(Object.isFrozen(parsed.instructionFiles)).toBe(true);
-  expect(Object.isFrozen(parsed.modelAllowlists.openrouter)).toBe(true);
   for (const invalid of [
     null,
     [],
     {
       version: 1,
       instructionFiles: [],
-      modelAllowlists: {},
       geminiOpenRouterToolGuard: true,
       extra: true,
     },
     {
       version: 1,
-      instructionFiles: ["relative"],
+      instructionFiles: [],
       modelAllowlists: {},
+      geminiOpenRouterToolGuard: true,
+    },
+    {
+      version: 1,
+      instructionFiles: ["relative"],
       geminiOpenRouterToolGuard: true,
     },
     {
       version: 1,
       instructionFiles: ["/tmp/*.md"],
-      modelAllowlists: {},
       geminiOpenRouterToolGuard: true,
     },
     {
       version: 1,
       instructionFiles: ["/tmp/a\0b"],
-      modelAllowlists: {},
       geminiOpenRouterToolGuard: true,
     },
     {
@@ -107,25 +100,11 @@ it("strictly parses policy JSON, lexically deduplicating absolute instruction fi
         { length: 33 },
         (_, index) => `/tmp/${index}`,
       ),
-      modelAllowlists: {},
       geminiOpenRouterToolGuard: true,
     },
     {
       version: 1,
       instructionFiles: [],
-      modelAllowlists: { openrouter: [""] },
-      geminiOpenRouterToolGuard: true,
-    },
-    {
-      version: 1,
-      instructionFiles: [],
-      modelAllowlists: { ["x".repeat(201)]: [] },
-      geminiOpenRouterToolGuard: true,
-    },
-    {
-      version: 1,
-      instructionFiles: [],
-      modelAllowlists: {},
       geminiOpenRouterToolGuard: "true",
     },
   ]) {
@@ -248,49 +227,6 @@ it("keys usage on ordered configured policy paths, exempting only MEMORY.md and 
   expect(instructionUsageIdentity(configured, first.slice(0, 2))).toEqual(
     first.slice(0, 2),
   );
-});
-
-it("enforces model allownames by native id without re-enabling selected catalog entries", () => {
-  const parsed = parseUserPolicy({
-    version: 1,
-    instructionFiles: [],
-    modelAllowlists: {
-      openrouter: ["google/gemini-3", "google/gemini-3/flash"],
-    },
-    geminiOpenRouterToolGuard: true,
-  });
-  const models = [
-    { providerID: "openrouter", id: "google/gemini-3", enabled: false },
-    { providerID: "openrouter", id: "new-catalog-model", enabled: true },
-    { providerID: "other", id: "anything", enabled: true },
-  ];
-  const updates: Array<{ providerID: string; id: string }> = [];
-  const editor: NativeModelEditor = {
-    list: () => models.map((model) => Object.freeze({ ...model })),
-    update: (providerID, id, update) => {
-      updates.push({ providerID, id });
-      const model = models.find(
-        (candidate) =>
-          candidate.providerID === providerID && candidate.id === id,
-      );
-      if (model === undefined) {
-        throw new Error("unexpected model update");
-      }
-      update(model);
-    },
-  };
-  expect(isUserModelAllowed(parsed, models[0]!)).toBe(true);
-  expect(isUserModelAllowed(parsed, models[1]!)).toBe(false);
-  expect(isUserModelAllowed(parsed, models[2]!)).toBe(true);
-  applyModelAllowlist(parsed, editor);
-  expect(updates).toEqual([
-    { providerID: "openrouter", id: "new-catalog-model" },
-  ]);
-  expect(models).toEqual([
-    { providerID: "openrouter", id: "google/gemini-3", enabled: false },
-    { providerID: "openrouter", id: "new-catalog-model", enabled: false },
-    { providerID: "other", id: "anything", enabled: true },
-  ]);
 });
 
 it("encodes every matching raw text tool result exactly once and leaves other message chains intact", () => {

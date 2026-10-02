@@ -377,14 +377,11 @@ The v2 plugin accepts an optional absolute `options.userPolicyPath` alongside `o
     "/absolute/shared/MEMORY.md",
     "/absolute/shared/USER.md"
   ],
-  "modelAllowlists": { "openrouter": ["google/gemini-3.8-flash"] },
   "geminiOpenRouterToolGuard": true
 }
 ```
 
 Explicit local instruction files are reread coherently for each normal context request and appended in array order after native global/project AGENTS. Missing, changing, invalid-UTF8 or oversized required files block that request; fixing the file allows a later request without reloading the profile. Policy settings themselves are loaded at plugin initialization. Native v1.18.29 upstream rereads instruction contents; a frozen per-session content snapshot is not assumed. Auxiliary title/generate requests are not projected by this context policy.
-
-Catalog transforms disable non-allowlisted models for each listed provider, without enabling otherwise disabled models. An all-request-kind dispatch guard also rejects forbidden selections: a later native config override may expose a model in the UI but cannot bypass this guard. Providers absent from the map are unaffected. This filters catalog IDs, not a claim about upstream routing aliases or account authorization.
 
 The tool guard quotes completed textual tool results containing `{` only for OpenRouter `google/` models. Multipart text is joined like the provider lowerer and encoded once, retaining file parts and surrounding metadata. Both this expansion and appended instructions occur before Reflection's planning and final hard-budget checks. Stored history, ingestion identities and source fingerprints are not rewritten. It is not an HTTP-after-budget workaround.
 

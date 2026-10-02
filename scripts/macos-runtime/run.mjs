@@ -262,7 +262,6 @@ async function config(
         instructionFiles: ["MEMORY.md", "USER.md"].map((name) =>
           join(directory, "instructions", name),
         ),
-        modelAllowlists: { openrouter: ["google/fixture-model"] },
         geminiOpenRouterToolGuard: true,
       }),
     );
@@ -323,27 +322,6 @@ async function config(
               limit: { context: 32000, input: 28000, output: 2048 },
               transport: "http",
             },
-            ...(policyEnabled
-              ? {
-                  "google/fixture-forbidden": {
-                    capabilities: {
-                      tools: true,
-                      input: ["text"],
-                      output: ["text"],
-                    },
-                  },
-                  "google/fixture-late-override": {
-                    disabled: false,
-                    capabilities: {
-                      tools: true,
-                      input: ["text"],
-                      output: ["text"],
-                    },
-                    limit: { context: 32000, input: 28000, output: 2048 },
-                    transport: "http",
-                  },
-                }
-              : {}),
           },
         },
       },
@@ -938,31 +916,12 @@ try {
               model.enabled,
           ),
         );
-        assert.ok(
-          !catalog.some(
-            (model) =>
-              model.providerID === "openrouter" &&
-              model.id === "google/fixture-forbidden" &&
-              model.enabled,
-          ),
-        );
-        assert.ok(
-          catalog.some(
-            (model) =>
-              model.providerID === "openrouter" &&
-              model.id === "google/fixture-late-override" &&
-              model.enabled,
-          ),
-          "Late native override must be selectable to exercise hard refusal",
-        );
-        policyReport.catalogFiltered = true;
-        policyReport.lateOverrideSelectable = true;
-        const newSession = async (id = "google/fixture-model") => {
+        const newSession = async () => {
           const result = (
             await api(policyOrigin, password, "/session", {
               title: "Policy native fixture",
               location: { directory: join(policyRoot, "workspace") },
-              model: { providerID: "openrouter", id },
+              model: { providerID: "openrouter", id: "google/fixture-model" },
             })
           ).data;
           assert.equal(typeof result.id, "string");
@@ -1250,12 +1209,6 @@ try {
           join(policyRoot, "instructions/MEMORY.md"),
           "MEMORY_MACOS_CHANGED_SENTINEL\n",
         );
-        await refuse(
-          "late-model-override",
-          (await newSession("google/fixture-late-override")).id,
-          "user policy forbids selected model",
-        );
-        policyReport.lateOverrideRefused = true;
         await roundtrip("recovery", "MEMORY_MACOS_CHANGED_SENTINEL");
         assert.equal(policyFixture.provider.length, 9);
         assert.equal(
@@ -1300,8 +1253,6 @@ try {
           orderedInstructions: true,
           freshInstructions: true,
           missingFileRefused: true,
-          catalogFiltered: true,
-          lateOverrideRefused: true,
           recoveryRoundtrip: true,
           currentCase: "complete",
         });
