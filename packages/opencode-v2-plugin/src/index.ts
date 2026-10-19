@@ -31,6 +31,7 @@ import {
   object,
 } from "./transport.js";
 import { Ingestion, warn } from "./ingestion.js";
+import { formatProjectionDecision } from "./log.js";
 import { UsageTracker } from "./usage.js";
 import { Operations, bounded } from "./operations.js";
 import { withCancellableStorage, type StorageMutations } from "./native.js";
@@ -361,6 +362,11 @@ export async function setup(ctx: Plugin.Context, storage: StorageMutations) {
         quarterContext,
         requestedOutput ?? Infinity,
       );
+      const budget = nativeInputBudget(
+        model.limit.context,
+        model.limit.input,
+        output,
+      );
       const wireCapAllowed = allowsWireOutputCap(model);
       const requestOptions = {
         ...event.options,
@@ -535,13 +541,26 @@ export async function setup(ctx: Plugin.Context, storage: StorageMutations) {
           manifestUnavailable: !manifestAvailable,
         });
       const messages = materialize(plan, requestMessages);
-      const { hard } = nativeInputBudget(
-        model.limit.context,
-        model.limit.input,
-        output,
-      );
+      const tracked = tracker.estimate(messages);
+      if (plan.lossy || plan.checkpoint !== undefined) {
+        warn(
+          formatProjectionDecision({
+            session: event.sessionID,
+            lossy: plan.lossy,
+            estimatedTokens: plan.estimatedTokens,
+            trackedTokens: tracked,
+            soft: budget.soft,
+            hard: budget.hard,
+            omitted: plan.omissions.length,
+            checkpoint: plan.checkpoint !== undefined,
+            usageAnchor: usage.anchorPresent(event.sessionID),
+            context: model.limit.context,
+            output,
+          }),
+        );
+      }
       const conservative = materializedTokens(messages, system, toolBudget);
-      if ((tracker.estimate(messages) ?? conservative) > hard)
+      if ((tracked ?? conservative) > budget.hard)
         throw new Error(
           "Reflection: materialized context exceeds hard input budget",
         );
@@ -591,10 +610,6 @@ export async function setup(ctx: Plugin.Context, storage: StorageMutations) {
         delete event.options.maxTokens;
       }
       event.messages = messages;
-      if (plan.lossy)
-        warn(
-          `Projection contains ${plan.omissions.length} explicitly marked omitted ranges`,
-        );
       if (plan.deferredReason)
         warn(
           "Projection deferred below hard input budget; raw source-safe context retained",

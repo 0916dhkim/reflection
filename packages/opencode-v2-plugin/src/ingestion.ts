@@ -16,9 +16,9 @@ import {
   object,
   page,
 } from "./transport.js";
+import { warn } from "./log.js";
 
-export const warn = (message: string) =>
-  console.warn(`[reflection-v2] ${message}`);
+export { warn };
 export class Ingestion {
   private readonly submitted = new Map<
     string,

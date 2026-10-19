@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { canonicalizeNativeHistory } from "@reflection/opencode-v2-core/history";
 import {
   AvailabilityError,
@@ -146,6 +146,32 @@ describe("source-owned transport", () => {
     await expect(http.source("native", signal())).rejects.toThrow(
       "source registry missing",
     );
+  });
+  it("logs failed requests with the full URL, timeout, and fetch cause", async () => {
+    const spy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const http = new Transport(config, async () => {
+        throw new TypeError("fetch failed", {
+          cause: Object.assign(new Error("socket closed"), {
+            code: "ECONNRESET",
+          }),
+        });
+      });
+      await expect(
+        http.request("/api/session/s", signal(), config.sources.native),
+      ).rejects.toBeInstanceOf(AvailabilityError);
+      const line = String(spy.mock.calls.at(-1)?.[0]);
+      expect(line).toContain("request-failed");
+      expect(line).toContain("op=session.read");
+      expect(line).toContain("target=source");
+      expect(line).toContain('url="http://native.invalid/api/session/s"');
+      expect(line).toContain("status=none");
+      expect(line).toContain("timeout_ms=5000");
+      expect(line).toContain("error=TypeError");
+      expect(line).toContain("cause=ECONNRESET");
+    } finally {
+      spy.mockRestore();
+    }
   });
   it("uses v2 cursor order and rejects duplicate IDs", async () => {
     const calls: string[] = [];

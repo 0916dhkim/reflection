@@ -6,6 +6,7 @@ import {
   type NativeCanonicalRecord,
 } from "@reflection/opencode-v2-core/history";
 import type { OpenCodeMessage } from "@reflection/shared/segmentation";
+import { formatRequestFailure, warn } from "./log.js";
 
 const endpoint = z.string().refine((value) => {
   try {
@@ -85,6 +86,27 @@ export class RequestRejectedError extends Error {
 const MAX_ERROR_BODY_BYTES = 64 * 1024;
 const SNAPSHOT_RETRY_DELAYS_MS = [100, 300] as const;
 export const HISTORY_CACHE_SESSIONS = 8;
+const REQUEST_TIMEOUT_MS = 5000;
+
+function operationFor(path: string, source?: Reader): string {
+  if (source) {
+    if (path.startsWith("/api/config")) return "config.read";
+    if (path.startsWith("/api/session/active")) return "session.active";
+    if (path.includes("/message")) return "history.read";
+    if (/^\/api\/session\/[^/?]+(?:\?|$)/u.test(path)) return "session.read";
+    return "source.request";
+  }
+  if (path.startsWith("/v1/sources")) return "registry.read";
+  if (path === "/v1/segments") return "segment.submit";
+  if (/^\/v1\/sessions\/[^/?]+\/segments/u.test(path)) return "manifest.read";
+  if (path.includes("/retry")) return "job.retry";
+  if (path.includes("/restart")) return "job.restart";
+  if (path.includes("/supersede")) return "job.supersede";
+  if (/^\/v1\/jobs\/[^/?]+/u.test(path)) return "job.read";
+  if (path === "/v1/search") return "memory.search";
+  if (path === "/v1/queue") return "queue.read";
+  return "backend.request";
+}
 
 // OpenCode 2.0.8, the only accepted host, encodes message cursors as base64url
 // JSON {id, order, direction} and anchors them on the message's sequence
@@ -196,22 +218,42 @@ export class Transport {
         );
     } else headers.set("X-API-Key", this.config.apiKey);
     if (body !== undefined) headers.set("Content-Type", "application/json");
-    const requestSignal = AbortSignal.any([signal, AbortSignal.timeout(5000)]);
+    const method = body === undefined ? "GET" : "POST";
+    const started = performance.now();
+    const logFailure = (status?: number, error?: unknown) =>
+      warn(
+        formatRequestFailure({
+          operation: operationFor(path, source),
+          target: source ? "source" : "backend",
+          method,
+          url: url.toString(),
+          ...(status === undefined ? {} : { status }),
+          elapsedMs: performance.now() - started,
+          timeoutMs: REQUEST_TIMEOUT_MS,
+          ...(error === undefined ? {} : { error }),
+        }),
+      );
+    const requestSignal = AbortSignal.any([
+      signal,
+      AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+    ]);
     let response: Response;
     try {
       signal.throwIfAborted();
       response = await this.fetchImpl(url, {
-        method: body === undefined ? "GET" : "POST",
+        method,
         headers,
         redirect: "error",
         signal: requestSignal,
         ...(body === undefined ? {} : { body: JSON.stringify(body) }),
       });
-    } catch {
+    } catch (error) {
       if (signal.aborted) throw new Error("Reflection: operation cancelled");
+      logFailure(undefined, error);
       throw new AvailabilityError();
     }
     if (!response.ok) {
+      logFailure(response.status);
       if (
         response.status >= 500 ||
         response.status === 408 ||
@@ -236,9 +278,12 @@ export class Transport {
         value,
         before: response.headers.get("X-Next-Cursor") ?? undefined,
       };
-    } catch {
-      if (!signal.aborted && requestSignal.aborted)
+    } catch (error) {
+      if (!signal.aborted && requestSignal.aborted) {
+        logFailure(response.status, error);
         throw new AvailabilityError();
+      }
+      if (!signal.aborted) logFailure(response.status, error);
       throw new Error(
         signal.aborted
           ? "Reflection: operation cancelled"
