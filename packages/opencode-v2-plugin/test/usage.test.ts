@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { Message, ToolCallPart, ToolResultPart } from "@opencode/ai";
 import { canonicalizeNativeHistory } from "@reflection/opencode-v2-core/history";
 import { estimateNativeTokens } from "@reflection/opencode-v2-core/projection";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { UsageTracker } from "../src/usage.js";
 
 const model = { id: "test", providerID: "openai" };
@@ -121,6 +121,30 @@ describe("provider usage continuity", () => {
       120_000 + cost(tool) + cost(next),
     );
     expect(prepare(tracker).estimate([user, answer, next])).toBeUndefined();
+  });
+
+  it("logs a missing anchor when the latest assistant has zero usage", () => {
+    const tracker = new UsageTracker();
+    prepare(tracker, history().slice(0, 1)).remember([user]);
+    prepare(tracker).remember([user, answer]);
+    expect(tracker.anchorPresent("s")).toBe(true);
+    const zero = raw({
+      input: 0,
+      output: 0,
+      reasoning: 0,
+      cache: { read: 0, write: 0 },
+    });
+    const spy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      prepare(tracker, history(zero)).remember([user, answer]);
+      const line = String(spy.mock.calls.at(-1)?.[0]);
+      expect(line).toContain("usage-anchor-missing");
+      expect(line).toContain("reason=latest-assistant-no-usage");
+      expect(line).toContain("previous_anchor=present");
+      expect(tracker.anchorPresent("s")).toBe(false);
+    } finally {
+      spy.mockRestore();
+    }
   });
 
   it("counts tool results emitted by an anchor but not its encrypted content or tool-call arguments", () => {

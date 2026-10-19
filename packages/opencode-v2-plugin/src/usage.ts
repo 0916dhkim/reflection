@@ -5,6 +5,7 @@ import { z } from "zod";
 import type { NativeCanonicalRecord } from "@reflection/opencode-v2-core/history";
 import { estimateNativeTokens } from "@reflection/opencode-v2-core/projection";
 import { estimateMessages } from "./projection.js";
+import { formatAnchorMissing, warn } from "./log.js";
 
 type Model = { id: string; providerID: string; variant?: string };
 // Persist only hashes and identities. Strict, bounded decoding prevents a corrupt
@@ -342,10 +343,15 @@ function usage(record: NativeCanonicalRecord): number | undefined {
 /** Per-plugin-instance, LRU bounded by sessions; no prompts or raw records persist. */
 export class UsageTracker {
   private readonly sessions = new Map<string, State>();
+  private readonly anchorLog = new Map<string, string>();
   constructor(private readonly capacity = 64) {}
 
   has(session: string): boolean {
     return this.sessions.has(session);
+  }
+
+  anchorPresent(session: string): boolean {
+    return this.sessions.get(session)?.anchor !== undefined;
   }
 
   /** Restore only into an empty slot; never replace a live LRU entry. The
@@ -375,7 +381,9 @@ export class UsageTracker {
         return false;
       this.sessions.set(session, parsed.data.state);
       if (this.sessions.size > this.capacity) {
-        this.sessions.delete(this.sessions.keys().next().value!);
+        const evicted = this.sessions.keys().next().value!;
+        this.sessions.delete(evicted);
+        this.anchorLog.delete(evicted);
       }
       return true;
     } catch {
@@ -484,20 +492,74 @@ export class UsageTracker {
     const remember = (messages: readonly Message[]) => {
       const hashes = config && messageHashes(messages);
       if (!config || !hashes) {
+        this.logMissingAnchor(
+          session,
+          !config ? "config-unhashable" : "message-hashes-unavailable",
+          previous,
+          latest?.source.id,
+          total,
+        );
         this.sessions.delete(session);
         return;
       }
-      const matches = eligible
-        ? messages.flatMap((message, index) =>
-            message.id === latest.raw.id && message.role === "assistant"
-              ? [index]
-              : [],
+      const matches =
+        latest === undefined
+          ? []
+          : messages.flatMap((message, index) =>
+              message.id === latest.raw.id && message.role === "assistant"
+                ? [index]
+                : [],
+            );
+      const estimated =
+        eligible && matches.length === 1 ? estimate(messages) : undefined;
+      let reason: string | undefined;
+      if (!latest) reason = "no-assistant";
+      else if (!raw || !assistantId) reason = "assistant-unhashable";
+      else if (total === undefined) reason = "latest-assistant-no-usage";
+      else if (rawModel?.providerID !== model.providerID)
+        reason = "model-provider-changed";
+      else if (rawModel.id !== model.id) reason = "model-id-changed";
+      else if (
+        rawModel.variant !== undefined &&
+        rawModel.variant !== model.variant
+      )
+        reason = "model-variant-changed";
+      else if (previous === undefined) reason = "initial-state";
+      else if (config !== previous.config) reason = "config-changed";
+      else if (matches.length === 0) reason = "latest-assistant-absent";
+      else if (matches.length > 1) reason = "latest-assistant-duplicate";
+      else {
+        const index = matches[0]!;
+        const before = hashes.slice(0, index);
+        const after = hashes.slice(index + 1);
+        if (previous.anchor?.id === assistantId) {
+          if (previous.anchor.raw !== raw) reason = "anchor-raw-changed";
+          else if (previous.anchor.message !== hashes[index])
+            reason = "anchor-message-changed";
+          else if (!same(before, previous.anchor.before))
+            reason = "anchor-prefix-changed";
+          else if (
+            !same(
+              after.slice(0, previous.anchor.after.length),
+              previous.anchor.after,
+            )
           )
-        : [];
+            reason = "anchor-suffix-changed";
+          else if (
+            !matchesAssistant(latest, messages[index]!, model.providerID)
+          )
+            reason = "assistant-lowering-mismatch";
+        } else if (!same(before, previous.messages)) {
+          reason = "prefix-changed";
+        } else if (
+          !matchesAssistant(latest, messages[index]!, model.providerID)
+        ) {
+          reason = "assistant-lowering-mismatch";
+        }
+        if (!reason && estimated === undefined) reason = "estimate-unavailable";
+      }
       const index =
-        matches.length === 1 && estimate(messages) !== undefined
-          ? matches[0]
-          : undefined;
+        reason === undefined && matches.length === 1 ? matches[0] : undefined;
       const anchor =
         index === undefined
           ? undefined
@@ -508,19 +570,58 @@ export class UsageTracker {
               before: hashes.slice(0, index),
               after: hashes.slice(index + 1),
             };
+      if (anchor === undefined) {
+        this.logMissingAnchor(
+          session,
+          reason ?? "estimate-unavailable",
+          previous,
+          latest?.source.id,
+          total,
+        );
+      } else {
+        this.anchorLog.delete(session);
+      }
       this.sessions.delete(session);
       this.sessions.set(session, { config, messages: hashes, anchor });
-      if (this.sessions.size > this.capacity)
-        this.sessions.delete(this.sessions.keys().next().value!);
+      if (this.sessions.size > this.capacity) {
+        const evicted = this.sessions.keys().next().value!;
+        this.sessions.delete(evicted);
+        this.anchorLog.delete(evicted);
+      }
     };
     return { estimate, remember };
   }
 
+  private logMissingAnchor(
+    session: string,
+    reason: string,
+    previous: State | undefined,
+    latest: string | undefined,
+    latestUsage: number | undefined,
+  ): void {
+    if (previous === undefined) return;
+    const previousAnchor = previous.anchor !== undefined;
+    const key = `${reason}|${previousAnchor ? "present" : "absent"}`;
+    if (this.anchorLog.get(session) === key) return;
+    this.anchorLog.set(session, key);
+    warn(
+      formatAnchorMissing({
+        session,
+        reason,
+        previousAnchor,
+        ...(latest === undefined ? {} : { latest }),
+        ...(latestUsage === undefined ? {} : { latestUsage }),
+      }),
+    );
+  }
+
   delete(session: string) {
     this.sessions.delete(session);
+    this.anchorLog.delete(session);
   }
   clear() {
     this.sessions.clear();
+    this.anchorLog.clear();
   }
 }
 
