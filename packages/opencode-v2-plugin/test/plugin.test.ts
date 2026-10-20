@@ -535,7 +535,15 @@ it("uses normalized usage to retain materialized context and pass the final hard
       ],
     }),
   ];
-  await fake.hooks.get("context")!(next);
+  const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+  try {
+    await fake.hooks.get("context")!(next);
+    expect(
+      warn.mock.calls.some(([line]) => String(line).includes("reused=yes")),
+    ).toBe(true);
+  } finally {
+    warn.mockRestore();
+  }
   expect(next.messages[0]?.id).toBe(first.messages[0]?.id);
   expect(next.messages.at(-1)?.id).toBe("a");
   // The real host supplies native history again, not our last materialization.
