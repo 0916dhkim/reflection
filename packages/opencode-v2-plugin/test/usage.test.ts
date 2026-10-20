@@ -123,6 +123,52 @@ describe("provider usage continuity", () => {
     expect(prepare(tracker).estimate([user, answer, next])).toBeUndefined();
   });
 
+  it("bounds a changed request by the reported size plus every message it lacked", () => {
+    const cost = (message: Message) =>
+      8 +
+      estimateNativeTokens({ role: message.role, content: message.content });
+    const tracker = new UsageTracker();
+    const notice = Message.make({
+      id: "notice-1",
+      role: "user",
+      content: "summary one",
+    });
+    prepare(tracker, history().slice(0, 1)).remember([notice, user]);
+    const step = prepare(tracker);
+    expect(step.estimate([notice, user, answer])).toBe(120_000);
+    const changed = Message.make({
+      id: "notice-2",
+      role: "user",
+      content: "summary two",
+    });
+    const next = Message.make({ id: "next", role: "user", content: "go" });
+    expect(step.estimate([changed, user, answer, next])).toBeUndefined();
+    expect(step.bound([changed, user, answer, next], 50)).toBe(
+      120_000 + cost(changed) + cost(next),
+    );
+    // Removed messages are not subtracted.
+    expect(step.bound([answer], 50)).toBe(120_000);
+    expect(
+      prepare(tracker, history(), { system: ["changed"] }).bound(
+        [changed, user, answer],
+        50,
+      ),
+    ).toBe(120_000 + cost(changed) + 50);
+    expect(
+      prepare(tracker, history(), {
+        model: { ...model, id: "other" },
+      }).bound([notice, user, answer], 50),
+    ).toBeUndefined();
+  });
+
+  it("does not bound a request that no response has answered yet", () => {
+    const tracker = new UsageTracker();
+    const next = Message.make({ id: "next", role: "user", content: "go" });
+    prepare(tracker, history().slice(0, 1)).remember([user]);
+    prepare(tracker).remember([user, answer, next]);
+    expect(prepare(tracker).bound([user, answer, next], 50)).toBeUndefined();
+  });
+
   it("logs a missing anchor when the latest assistant has zero usage", () => {
     const tracker = new UsageTracker();
     prepare(tracker, history().slice(0, 1)).remember([user]);

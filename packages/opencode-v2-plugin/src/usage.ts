@@ -26,8 +26,13 @@ const stateSchema = z
     config: hash,
     messages: hashes,
     anchor: anchorSchema.optional(),
+    /** Latest assistant when `messages` was sent; a newer one answered it. */
+    sent: hash.optional(),
   })
   .strict();
+const NO_ASSISTANT = createHash("sha256")
+  .update("reflection-usage-no-assistant")
+  .digest("hex");
 const envelopeSchema = z
   .object({
     version: z.literal(1),
@@ -60,6 +65,7 @@ function boundedEnvelope(value: unknown): boolean {
     envelope?.sessionId,
     envelope?.directory,
     state?.config,
+    state?.sent,
     anchor?.id,
     anchor?.raw,
     anchor?.message,
@@ -489,6 +495,56 @@ export class UsageTracker {
       );
       return total + added;
     };
+    // Upper bound once exact continuity is lost, for example after the
+    // projection notice changed: the reported size of the request that
+    // produced the latest assistant plus every message that request did not
+    // contain. Removed content is never subtracted, and a changed system or
+    // tool set adds `fixedTokens` in full.
+    const bound = (
+      messages: readonly Message[],
+      fixedTokens: number,
+    ): number | undefined => {
+      if (
+        !previous?.sent ||
+        previous.sent === assistantId ||
+        !latest ||
+        !assistantId ||
+        total === undefined ||
+        rawModel?.providerID !== model.providerID ||
+        rawModel.id !== model.id ||
+        (rawModel.variant !== undefined && rawModel.variant !== model.variant)
+      )
+        return;
+      const hashes = messageHashes(messages);
+      if (!hashes) return;
+      const sent = new Map<string, number>();
+      for (const hash of previous.messages)
+        sent.set(hash, (sent.get(hash) ?? 0) + 1);
+      const estimated = estimateMessages(messages);
+      let added =
+        config !== undefined && config === previous.config ? 0 : fixedTokens;
+      hashes.forEach((hash, index) => {
+        const left = sent.get(hash) ?? 0;
+        if (left > 0) {
+          sent.set(hash, left - 1);
+          return;
+        }
+        const message = messages[index]!;
+        if (
+          message.id === latest.raw.id &&
+          message.role === "assistant" &&
+          matchesAssistant(latest, message, model.providerID)
+        )
+          return;
+        added +=
+          8 +
+          estimateNativeTokens({
+            role: estimated[index]!.role,
+            content: estimated[index]!.content,
+          });
+      });
+      return total + added;
+    };
     const remember = (messages: readonly Message[]) => {
       const hashes = config && messageHashes(messages);
       if (!config || !hashes) {
@@ -582,14 +638,19 @@ export class UsageTracker {
         this.anchorLog.delete(session);
       }
       this.sessions.delete(session);
-      this.sessions.set(session, { config, messages: hashes, anchor });
+      this.sessions.set(session, {
+        config,
+        messages: hashes,
+        anchor,
+        sent: assistantId ?? NO_ASSISTANT,
+      });
       if (this.sessions.size > this.capacity) {
         const evicted = this.sessions.keys().next().value!;
         this.sessions.delete(evicted);
         this.anchorLog.delete(evicted);
       }
     };
-    return { estimate, remember };
+    return { estimate, bound, remember };
   }
 
   private logMissingAnchor(

@@ -78,8 +78,8 @@ export interface ProjectionDecision {
   session: string;
   mode: "raw" | "kept" | "fired";
   estimatedTokens: number;
-  /** Anchored to the provider-reported usage of the latest response. */
-  measured: boolean;
+  /** Exact or bounded from the latest response's reported usage, else heuristic. */
+  source: "provider" | "provider-bound" | "heuristic";
   soft: number;
   hard: number;
   summaries: number;
@@ -94,7 +94,7 @@ export function formatProjectionDecision(input: ProjectionDecision): string {
     `session=${token(input.session)}`,
     `mode=${input.mode}`,
     `estimated_tokens=${input.estimatedTokens}`,
-    `estimate_source=${input.measured ? "provider" : "heuristic"}`,
+    `estimate_source=${input.source}`,
     `soft=${input.soft}`,
     `hard=${input.hard}`,
     `summaries=${input.summaries}`,

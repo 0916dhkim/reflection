@@ -595,6 +595,57 @@ it("keeps the projection on measured usage despite encrypted assistant metadata,
   expect(fake.storage.get(cursorKey)).toMatchObject({
     projectedThrough: "old",
   });
+
+  // A revised archived summary changes the notice, so the exact anchor is
+  // lost; the bound from the newest reported usage keeps the cut.
+  for (const segment of manifest.segments) segment.summary = "Revised work.";
+  history = [
+    ...initial,
+    assistant,
+    {
+      id: "b",
+      type: "assistant",
+      agent: "build",
+      model: { id: "small", providerID: "test" },
+      time: { created: 7, completed: 8 },
+      content: [{ type: "text", text: "more" }],
+      tokens: {
+        input: 9000,
+        output: 500,
+        reasoning: 0,
+        cache: { read: 0, write: 0 },
+      },
+    },
+  ];
+  const revised = event();
+  revised.messages = [
+    ...restarted.messages.slice(1).map((message) => message),
+    Message.make({ id: "b", role: "assistant", content: "more" }),
+  ];
+  revised.messages.unshift(
+    Message.make({ id: "u", role: "user", content: "ask" }),
+    Message.make({ id: "old", role: "assistant", content: "x".repeat(50_000) }),
+  );
+  const logged = vi.spyOn(console, "warn").mockImplementation(() => {});
+  try {
+    await fake.hooks.get("context")!(revised);
+    expect(
+      logged.mock.calls.some(([line]) =>
+        /mode=kept estimated_tokens=9\d{3} estimate_source=provider-bound/.test(
+          String(line),
+        ),
+      ),
+    ).toBe(true);
+  } finally {
+    logged.mockRestore();
+  }
+  expect(revised.messages[0]?.id).not.toBe(next.messages[0]?.id);
+  expect(JSON.stringify(revised.messages[0])).toContain("Revised work.");
+  expect(revised.messages.slice(1).map((message) => message.id)).toEqual([
+    "new-user",
+    "a",
+    "b",
+  ]);
 });
 it("hydrates persisted measured usage when a new user follows encrypted assistant metadata", async () => {
   state.config = JSON.stringify(config);

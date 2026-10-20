@@ -464,6 +464,9 @@ export async function setup(ctx: Plugin.Context, storage: StorageMutations) {
         estimationValue(requestOptions),
       );
 
+      const systemTokens =
+        estimateNativeTokens(estimationValue(requestSystem)) +
+        estimateNativeTokens(toolBudget);
       const projection = selectCursorProjection({
         sourceId: source.id,
         messages: requestMessages,
@@ -478,17 +481,16 @@ export async function setup(ctx: Plugin.Context, storage: StorageMutations) {
         contextLimit: model.limit.context,
         softTokens: budget.soft,
         hardTokens: budget.hard,
-        systemTokens:
-          estimateNativeTokens(estimationValue(requestSystem)) +
-          estimateNativeTokens(toolBudget),
+        systemTokens,
         measure: tracker.estimate,
+        bound: (messages) => tracker.bound(messages, systemTokens),
       });
       warn(
         formatProjectionDecision({
           session,
           mode: projection.mode,
           estimatedTokens: projection.estimatedTokens,
-          measured: projection.measured,
+          source: projection.source,
           soft: budget.soft,
           hard: budget.hard,
           summaries: summaries.length,

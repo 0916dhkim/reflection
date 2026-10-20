@@ -133,6 +133,7 @@ export const ANCHOR_FOOTER = "\n[End latest actual user input]";
  * cover and `id` names it. `start` is tool-safe. `anchor` is the archived
  * latest user message copied into the notice, fixed while the cut is kept. */
 type Cut = { id: string; through: number; start: number; anchor?: number };
+export type EstimateSource = "provider" | "provider-bound" | "heuristic";
 /** Rendered archive description, persisted so a manifest outage keeps it. */
 export type ArchiveBlock = { through: string; text: string };
 
@@ -155,10 +156,13 @@ export function selectCursorProjection(input: {
   systemTokens: number;
   /** Provider-anchored size of an exact request, when continuity is proven. */
   measure?: (messages: readonly Message[]) => number | undefined;
+  /** Provider-anchored upper bound, when exact continuity is lost. */
+  bound?: (messages: readonly Message[]) => number | undefined;
 }): {
   messages: Message[];
   estimatedTokens: number;
   measured: boolean;
+  source: EstimateSource;
   omittedSummaries: number;
   missingRanges: number;
   projectedThrough: string | null;
@@ -336,18 +340,33 @@ export function selectCursorProjection(input: {
     };
   };
 
-  const candidate = (cut: Cut | null, start = cut?.start ?? 0) => {
+  // The bound never subtracts archived content, so it only applies to kept and
+  // raw requests, which archive no more than the previous request did.
+  const candidate = (
+    cut: Cut | null,
+    start = cut?.start ?? 0,
+    bounded = false,
+  ) => {
     const head = cut === null && start === 0 ? undefined : notice(cut, start);
     const messages = [
       ...(head ? [head.message] : []),
       ...input.messages.slice(start),
     ];
     const measured = input.measure?.(messages);
+    const bound =
+      measured === undefined && bounded ? input.bound?.(messages) : undefined;
     return {
       messages,
       estimatedTokens:
-        measured ?? input.systemTokens + (head?.cost ?? 0) + suffix[start]!,
+        measured ??
+        bound ??
+        input.systemTokens + (head?.cost ?? 0) + suffix[start]!,
       measured: measured !== undefined,
+      source: (measured !== undefined
+        ? "provider"
+        : bound !== undefined
+          ? "provider-bound"
+          : "heuristic") as EstimateSource,
       omittedSummaries: head?.omitted ?? 0,
       missingRanges: head?.missing ?? 0,
       projectedThrough: cut?.id ?? null,
@@ -389,6 +408,7 @@ export function selectCursorProjection(input: {
           ...trimmed,
           estimatedTokens: estimated - projection.headCost + trimmed.headCost,
           measured: false,
+          source: "heuristic",
         };
       }
     }
@@ -402,10 +422,14 @@ export function selectCursorProjection(input: {
       ? undefined
       : cutThrough(input.projectedThrough);
   if (previous) {
-    const kept = candidate(withAnchor(previous, input.projectedAnchor));
+    const kept = candidate(
+      withAnchor(previous, input.projectedAnchor),
+      undefined,
+      true,
+    );
     if (kept.estimatedTokens <= input.softTokens) return fit(kept, "kept");
   }
-  const raw = candidate(null);
+  const raw = candidate(null, 0, true);
   if (raw.estimatedTokens <= input.softTokens || count < 2)
     return fit(raw, "raw");
   // Fire: archive through the earliest summary that leaves a raw tail within

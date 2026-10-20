@@ -189,6 +189,39 @@ describe("cursor projection", () => {
     );
   });
 
+  it("keeps a cut on the provider bound when exact continuity is lost", () => {
+    const history = [
+      user("u1"),
+      reply("a1", big),
+      user("u2"),
+      reply("a2"),
+      user("u3"),
+    ];
+    const fired = project(history);
+    // The heuristic for the kept request is past the threshold; the bound from
+    // the last reported usage is not.
+    const kept = project([...history, reply("a3", big)], {
+      projectedThrough: fired.projectedThrough,
+      bound: () => 600,
+    });
+    expect(kept).toMatchObject({
+      mode: "kept",
+      estimatedTokens: 600,
+      measured: false,
+      source: "provider-bound",
+    });
+    expect(kept.messages[0]).toEqual(fired.messages[0]);
+  });
+
+  it("sizes a newly fired cut without the bound, which cannot subtract", () => {
+    const fired = project(
+      [user("u1"), reply("a1", big), user("u2"), reply("a2"), user("u3")],
+      { bound: () => 10_000 },
+    );
+    expect(fired).toMatchObject({ mode: "fired", source: "heuristic" });
+    expect(fired.estimatedTokens).toBeLessThanOrEqual(700);
+  });
+
   it("keeps the full request when no projection fits but it does", () => {
     const history = [
       user("u1", "x ".repeat(300)),

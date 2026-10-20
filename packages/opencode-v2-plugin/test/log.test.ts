@@ -68,7 +68,7 @@ describe("failure diagnostics", () => {
       session: "ses_1",
       mode: "fired" as const,
       estimatedTokens: 712345,
-      measured: false,
+      source: "heuristic" as const,
       soft: 734003,
       hard: 786432,
       summaries: 460,
@@ -79,7 +79,13 @@ describe("failure diagnostics", () => {
       "projection session=ses_1 mode=fired estimated_tokens=712345 estimate_source=heuristic soft=734003 hard=786432 summaries=460 omitted=2 missing=1",
     );
     expect(
-      formatProjectionDecision({ ...decision, mode: "kept", measured: true }),
-    ).toContain("mode=kept estimated_tokens=712345 estimate_source=provider");
+      formatProjectionDecision({
+        ...decision,
+        mode: "kept",
+        source: "provider-bound",
+      }),
+    ).toContain(
+      "mode=kept estimated_tokens=712345 estimate_source=provider-bound",
+    );
   });
 });
