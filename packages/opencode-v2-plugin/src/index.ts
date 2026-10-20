@@ -34,8 +34,8 @@ import { Ingestion, warn } from "./ingestion.js";
 import { formatProjectionDecision } from "./log.js";
 import {
   cacheProjectionPlan,
-  canReuseProjectionPlan,
   manifestPrefixFingerprint,
+  projectionPlanReuseReason,
   type CachedProjectionPlan,
 } from "./plan-cache.js";
 import { UsageTracker } from "./usage.js";
@@ -81,6 +81,7 @@ export async function setup(ctx: Plugin.Context, storage: StorageMutations) {
   // history records; entries die with the records they are keyed by.
   const segmentMemo = new NativeSegmentMemo();
   const planCache = new Map<string, CachedProjectionPlan>();
+  const planCacheMiss = new Map<string, string>();
   const key = (id: string) =>
     `reflection-v2/checkpoint/2/${encodeURIComponent(http!.config.sourceId)}/${encodeURIComponent(id)}`;
   const usageKey = (id: string) =>
@@ -445,20 +446,32 @@ export async function setup(ctx: Plugin.Context, storage: StorageMutations) {
               cachedPlan.plan.checkpoint.archived,
             )
           : undefined;
+      const reuseReason = cachedPlan
+        ? !manifestAvailable
+          ? "manifest-unavailable"
+          : currentManifestFingerprint === undefined
+            ? "manifest-prefix-unavailable"
+            : projectionPlanReuseReason(
+                previous,
+                cachedPlan,
+                requestMessages,
+                currentManifestFingerprint,
+                model.limit.context,
+                model.limit.input,
+                output,
+              )
+        : undefined;
       if (
-        cachedPlan &&
-        manifestAvailable &&
-        currentManifestFingerprint !== undefined &&
-        canReuseProjectionPlan(
-          previous,
-          cachedPlan,
-          requestMessages,
-          currentManifestFingerprint,
-          model.limit.context,
-          model.limit.input,
-          output,
-        )
+        reuseReason &&
+        reuseReason !== "ok" &&
+        planCacheMiss.get(event.sessionID) !== reuseReason
       ) {
+        planCacheMiss.set(event.sessionID, reuseReason);
+        warn(
+          `plan-cache-miss session=${event.sessionID} reason=${reuseReason}`,
+        );
+      }
+      if (cachedPlan && reuseReason === "ok") {
         const cachedMessages = materialize(cachedPlan.plan, requestMessages);
         const cachedTracked = tracker.estimate(cachedMessages);
         const cachedConservative = materializedTokens(
@@ -472,6 +485,10 @@ export async function setup(ctx: Plugin.Context, storage: StorageMutations) {
             estimatedTokens: cachedTracked ?? cachedPlan.plan.estimatedTokens,
           };
           reusedPlan = true;
+          planCacheMiss.delete(event.sessionID);
+        } else if (planCacheMiss.get(event.sessionID) !== "hard-budget") {
+          planCacheMiss.set(event.sessionID, "hard-budget");
+          warn(`plan-cache-miss session=${event.sessionID} reason=hard-budget`);
         }
       }
       if (!plan) {
@@ -825,6 +842,7 @@ export async function setup(ctx: Plugin.Context, storage: StorageMutations) {
       if (event.type === "session.deleted") {
         usage.delete(id);
         planCache.delete(id);
+        planCacheMiss.delete(id);
         ingestion?.clear(id);
         http?.forget(http.config.sourceId, id);
         void operations
