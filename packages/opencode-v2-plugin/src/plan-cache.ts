@@ -67,6 +67,46 @@ export function cacheProjectionPlan(
 /** Reuse only when the settled prefix and every checkpoint identity still
  * match. New tail messages are allowed; inserts, reverts, or changed summaries
  * invalidate the cached plan. */
+export function projectionPlanReuseReason(
+  previous: NativeProjectionCheckpoint | undefined,
+  cached: CachedProjectionPlan,
+  requestMessages: readonly Message[],
+  manifestPrefixFingerprint: string,
+  contextLimit: number,
+  inputLimit: number | undefined,
+  outputLimit: number,
+): string {
+  if (!previous) return "no-previous";
+  if (!cached.plan.checkpoint) return "no-checkpoint";
+  if (previous.notice_id !== cached.noticeId) return "notice";
+  if (previous.source_prefix_fingerprint !== cached.prefixFingerprint)
+    return "source-prefix";
+  if (previous.tail_start_source_id !== cached.tailStartSourceId)
+    return "tail-start";
+  if (cached.manifestPrefixFingerprint !== manifestPrefixFingerprint)
+    return "manifest-prefix";
+  if (
+    previous.manifest_summary_fingerprint !== cached.manifestSummaryFingerprint
+  )
+    return "manifest-summary";
+  if (
+    previous.cached_summaries_fingerprint !== cached.cachedSummariesFingerprint
+  )
+    return "cached-summaries";
+  if (previous.context_limit !== contextLimit) return "context-limit";
+  if (previous.input_limit !== inputLimit) return "input-limit";
+  if (previous.output_limit !== outputLimit) return "output-limit";
+  if (cached.contextLimit !== contextLimit) return "cached-context-limit";
+  if (cached.inputLimit !== inputLimit) return "cached-input-limit";
+  if (cached.outputLimit !== outputLimit) return "cached-output-limit";
+  if (cached.prefixIds.length > requestMessages.length) return "prefix-short";
+  for (let index = 0; index < cached.prefixIds.length; index++) {
+    if (requestMessages[index]?.id !== cached.prefixIds[index])
+      return "prefix-id";
+  }
+  return "ok";
+}
+
 export function canReuseProjectionPlan(
   previous: NativeProjectionCheckpoint | undefined,
   cached: CachedProjectionPlan,
@@ -76,27 +116,15 @@ export function canReuseProjectionPlan(
   inputLimit: number | undefined,
   outputLimit: number,
 ): boolean {
-  if (!previous || !cached.plan.checkpoint) return false;
-  if (
-    previous.notice_id !== cached.noticeId ||
-    previous.source_prefix_fingerprint !== cached.prefixFingerprint ||
-    previous.tail_start_source_id !== cached.tailStartSourceId ||
-    cached.manifestPrefixFingerprint !== manifestPrefixFingerprint ||
-    previous.manifest_summary_fingerprint !==
-      cached.manifestSummaryFingerprint ||
-    previous.cached_summaries_fingerprint !==
-      cached.cachedSummariesFingerprint ||
-    previous.context_limit !== contextLimit ||
-    previous.input_limit !== inputLimit ||
-    previous.output_limit !== outputLimit ||
-    cached.contextLimit !== contextLimit ||
-    cached.inputLimit !== inputLimit ||
-    cached.outputLimit !== outputLimit ||
-    cached.prefixIds.length > requestMessages.length
-  )
-    return false;
-  for (let index = 0; index < cached.prefixIds.length; index++) {
-    if (requestMessages[index]?.id !== cached.prefixIds[index]) return false;
-  }
-  return true;
+  return (
+    projectionPlanReuseReason(
+      previous,
+      cached,
+      requestMessages,
+      manifestPrefixFingerprint,
+      contextLimit,
+      inputLimit,
+      outputLimit,
+    ) === "ok"
+  );
 }
