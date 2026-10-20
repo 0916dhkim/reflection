@@ -49,28 +49,12 @@ describe("cursor projection", () => {
     expect(result.fingerprint).toMatch(/^[a-f0-9]{64}$/);
   });
 
-  it("keeps summaries and the raw tail after the summary boundary", () => {
-    const summaries = cursorSummaryState(manifest, source).summaries;
-    const result = selectCursorProjection({
-      sourceId: "native",
-      messages: [
-        Message.make({ id: "u1", role: "user", content: "one" }),
-        Message.make({ id: "a1", role: "assistant", content: "answer" }),
-        Message.make({ id: "u2", role: "user", content: "two" }),
-        Message.make({ id: "a2", role: "assistant", content: "answer" }),
-        Message.make({ id: "u3", role: "user", content: "latest" }),
-      ],
-      summarizedThrough: "a2",
-      summaries,
-      hardTokens: 10_000,
-      systemTokens: 100,
-    });
-    expect(result).toBeDefined();
-    expect(result!.messages[0]?.id).toContain("reflection-cursor-");
-    expect(result!.messages.at(-1)?.id).toBe("u3");
-    expect(result!.omittedSummaries).toBe(0);
-  });
-
+  const summaries = cursorSummaryState(manifest, source).summaries;
+  const big = "x ".repeat(800);
+  const user = (id: string, content = id) =>
+    Message.make({ id, role: "user", content });
+  const reply = (id: string, content = "answer") =>
+    Message.make({ id, role: "assistant", content });
   const call = (id: string, callId: string, command = id) =>
     Message.make({
       id,
@@ -81,78 +65,140 @@ describe("cursor projection", () => {
     });
   const result = (callId: string, output = "ok") =>
     Message.tool({ id: callId, name: "bash", result: output });
+  // Context 1,000: projection fires above 700, hard ceiling 750, raw tail
+  // target 250, summary budget 50.
+  const project = (
+    messages: Message[],
+    options: Partial<Parameters<typeof selectCursorProjection>[0]> = {},
+  ) =>
+    selectCursorProjection({
+      sourceId: "native",
+      messages,
+      summaries,
+      projectedThrough: null,
+      contextLimit: 1000,
+      softTokens: 700,
+      hardTokens: 750,
+      systemTokens: 10,
+      ...options,
+    });
 
-  it("keeps the tool call when the summary ends on a tool-calling message", () => {
-    const summaries = cursorSummaryState(manifest, source).summaries;
+  it("sends raw history below the projection threshold", () => {
     const messages = [
-      Message.make({ id: "u1", role: "user", content: "one" }),
-      Message.make({ id: "a1", role: "assistant", content: "answer" }),
-      Message.make({ id: "u2", role: "user", content: "two" }),
+      user("u1"),
+      reply("a1"),
+      user("u2"),
+      reply("a2"),
+      user("u3"),
+    ];
+    const projection = project(messages);
+    expect(projection.mode).toBe("raw");
+    expect(projection.messages).toEqual(messages);
+    expect(projection.projectedThrough).toBe(null);
+  });
+
+  it("fires above the threshold and keeps a raw tail within the target", () => {
+    const projection = project([
+      user("u1"),
+      reply("a1", big),
+      user("u2"),
+      reply("a2"),
+      user("u3"),
+    ]);
+    expect(projection.mode).toBe("fired");
+    expect(projection.projectedThrough).toBe("a1");
+    expect(projection.messages[0]?.id).toContain("reflection-cursor-");
+    expect(projection.messages.slice(1).map((message) => message.id)).toEqual([
+      "u2",
+      "a2",
+      "u3",
+    ]);
+    expect(JSON.stringify(projection.messages[0])).toContain("first");
+    expect(JSON.stringify(projection.messages[0])).not.toContain("second");
+    expect(projection.estimatedTokens).toBeLessThanOrEqual(700);
+  });
+
+  it("keeps the previous cut until the projection crosses the threshold", () => {
+    const history = [
+      user("u1"),
+      reply("a1", big),
+      user("u2"),
+      reply("a2"),
+      user("u3"),
+    ];
+    const fired = project(history);
+    const kept = project([...history, reply("a3"), user("u4")], {
+      projectedThrough: fired.projectedThrough,
+    });
+    expect(kept.mode).toBe("kept");
+    expect(kept.messages[0]).toEqual(fired.messages[0]);
+
+    const grown = project(
+      [user("u1"), reply("a1", big), user("u2"), reply("a2", big), user("u3")],
+      { projectedThrough: fired.projectedThrough },
+    );
+    expect(grown.mode).toBe("fired");
+    expect(grown.projectedThrough).toBe("a2");
+    expect(grown.messages.slice(1).map((message) => message.id)).toEqual([
+      "u3",
+    ]);
+  });
+
+  it("keeps the tool call when the cut ends on a tool-calling message", () => {
+    const messages = [
+      user("u1"),
+      reply("a1"),
+      user("u2", big),
       call("a2", "c2"),
       result("c2"),
     ];
-    const projection = selectCursorProjection({
-      sourceId: "native",
-      messages,
-      summarizedThrough: "a2",
-      summaries,
-      hardTokens: 10_000,
-      systemTokens: 100,
-    });
-    expect(projection!.messages.slice(1)).toEqual(messages.slice(3));
+    const projection = project(messages);
+    expect(projection.projectedThrough).toBe("a2");
+    expect(projection.messages.slice(1)).toEqual(messages.slice(3));
   });
 
   it("starts a budget-trimmed tail after a complete tool exchange", () => {
     const messages = [
-      Message.make({ id: "u1", role: "user", content: "one" }),
+      user("u1"),
       call("a1", "c1", "x ".repeat(2_000)),
       result("c1"),
       call("a2", "c2"),
       result("c2"),
     ];
-    const projection = selectCursorProjection({
-      sourceId: "native",
-      messages,
-      summarizedThrough: null,
+    const projection = project(messages, {
       summaries: [],
+      softTokens: 560,
       hardTokens: 600,
       systemTokens: 100,
     });
-    expect(projection!.messages).toEqual(messages.slice(3));
-    expect(projection!.estimatedTokens).toBeLessThanOrEqual(600);
+    expect(projection.messages).toEqual(messages.slice(3));
+    expect(projection.estimatedTokens).toBeLessThanOrEqual(600);
   });
 
   it("never starts the tail with an orphaned tool result", () => {
     const messages = [
-      Message.make({ id: "u1", role: "user", content: "one" }),
+      user("u1"),
       call("a1", "c1"),
       result("c1", "x ".repeat(2_000)),
     ];
-    const projection = selectCursorProjection({
-      sourceId: "native",
-      messages,
-      summarizedThrough: null,
+    const projection = project(messages, {
       summaries: [],
+      softTokens: 560,
       hardTokens: 600,
       systemTokens: 100,
     });
-    expect(projection!.messages).toEqual(messages.slice(1));
-    expect(projection!.estimatedTokens).toBeGreaterThan(600);
+    expect(projection.messages).toEqual(messages.slice(1));
+    expect(projection.estimatedTokens).toBeGreaterThan(600);
   });
 
   it("drops older summaries with one marker when they do not fit", () => {
-    const summaries = cursorSummaryState(manifest, source).summaries;
-    const result = selectCursorProjection({
-      sourceId: "native",
-      messages: [Message.make({ id: "u3", role: "user", content: "latest" })],
-      summarizedThrough: null,
-      summaries,
-      hardTokens: 130,
-      systemTokens: 100,
-    });
-    expect(result).toBeDefined();
-    expect(result!.omittedSummaries).toBeGreaterThan(0);
-    expect(JSON.stringify(result!.messages)).toContain(
+    const projection = project(
+      [user("u1"), reply("a1"), user("u2", big), reply("a2"), user("u3")],
+      { contextLimit: 600, softTokens: 420, hardTokens: 450 },
+    );
+    expect(projection.projectedThrough).toBe("a2");
+    expect(projection.omittedSummaries).toBe(1);
+    expect(JSON.stringify(projection.messages[0])).toContain(
       "older summaries omitted",
     );
   });

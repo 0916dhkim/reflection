@@ -336,13 +336,14 @@ export async function setup(ctx: Plugin.Context, storage: StorageMutations) {
     const projection = selectCursorProjection({
       sourceId: source.id,
       messages: requestMessages,
-      summarizedThrough: state.summarizedThrough,
       summaries: summaryState.summaries,
+      projectedThrough: state.projectedThrough ?? null,
+      contextLimit: model.limit.context,
+      softTokens: budget.soft,
       hardTokens: budget.hard,
       systemTokens,
     });
-    if (!projection)
-      throw new Error("Reflection: cursor projection unavailable");
+    state.projectedThrough = projection.projectedThrough;
     if (projection.estimatedTokens > budget.hard)
       throw new Error(
         "Reflection: materialized context exceeds hard input budget",
@@ -390,7 +391,7 @@ export async function setup(ctx: Plugin.Context, storage: StorageMutations) {
       signal,
     );
     warn(
-      `cursor-projection session=${event.sessionID} summaries=${summaryState.summaries.length} omitted=${projection.omittedSummaries} estimated=${projection.estimatedTokens} hard=${budget.hard}`,
+      `cursor-projection session=${event.sessionID} mode=${projection.mode} summaries=${summaryState.summaries.length} omitted=${projection.omittedSummaries} estimated=${projection.estimatedTokens} soft=${budget.soft} hard=${budget.hard}`,
     );
   }
 

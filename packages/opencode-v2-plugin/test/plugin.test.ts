@@ -1707,7 +1707,7 @@ it.each([1, 2])(
   },
 );
 
-it("projects cursor mode from summaries plus tail without a checkpoint", async () => {
+it("projects cursor mode only above the threshold without a checkpoint", async () => {
   state.config = JSON.stringify({
     ...config,
     cursorProjection: { enabled: true },
@@ -1748,14 +1748,32 @@ it("projects cursor mode from summaries plus tail without a checkpoint", async (
     }),
   );
   cleanups.push(await setup(fake.ctx, fake.ctx.storage));
-  const request = event();
-  request.messages = [
+  const cursorKey = "reflection-v2/cursor/1/native/s";
+  const small = event();
+  small.messages = [
     Message.make({ id: "u1", role: "user", content: "one" }),
     Message.make({ id: "a1", role: "assistant", content: "answer" }),
     Message.make({ id: "u2", role: "user", content: "latest" }),
   ];
-  await fake.hooks.get("context")!(request);
-  expect(request.messages[0]?.id).toContain("reflection-cursor-");
-  expect(request.messages.at(-1)?.id).toBe("u2");
+  const raw = [...small.messages];
+  await fake.hooks.get("context")!(small);
+  expect(small.messages).toEqual(raw);
+  expect(fake.storage.get(cursorKey)).toMatchObject({ projectedThrough: null });
+
+  // Context 20,000 fires projection above 14,000 estimated input tokens.
+  const large = event();
+  large.messages = [
+    Message.make({ id: "u1", role: "user", content: "one" }),
+    Message.make({
+      id: "a1",
+      role: "assistant",
+      content: "x ".repeat(15_000),
+    }),
+    Message.make({ id: "u2", role: "user", content: "latest" }),
+  ];
+  await fake.hooks.get("context")!(large);
+  expect(large.messages[0]?.id).toContain("reflection-cursor-");
+  expect(large.messages.slice(1).map((message) => message.id)).toEqual(["u2"]);
+  expect(fake.storage.get(cursorKey)).toMatchObject({ projectedThrough: "a1" });
   expect(fake.storage.has("reflection-v2/checkpoint/2/native/s")).toBe(false);
 });
