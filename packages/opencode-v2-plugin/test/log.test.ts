@@ -63,40 +63,23 @@ describe("failure diagnostics", () => {
     );
   });
 
-  it("records the projection budget and whether provider usage was usable", () => {
-    expect(
-      formatProjectionDecision({
-        session: "ses_1",
-        lossy: true,
-        estimatedTokens: 712345,
-        soft: 734003,
-        hard: 786432,
-        omitted: 458,
-        checkpoint: true,
-        usageAnchor: false,
-        context: 1048576,
-        output: 262144,
-      }),
-    ).toContain("estimate_source=conservative");
-    const line = formatProjectionDecision({
+  it("records the projection mode, budget, and estimate source", () => {
+    const decision = {
       session: "ses_1",
-      lossy: true,
+      mode: "fired" as const,
       estimatedTokens: 712345,
-      trackedTokens: 458000,
+      measured: false,
       soft: 734003,
       hard: 786432,
-      omitted: 458,
-      checkpoint: true,
-      usageAnchor: true,
-      context: 1048576,
-      output: 262144,
-    });
-    expect(line).toContain("estimate_source=provider-anchor");
-    expect(line).toContain("tracked_tokens=458000");
-    expect(line).toContain("soft=734003");
-    expect(line).toContain("hard=786432");
-    expect(line).toContain("omitted=458");
-    expect(line).toContain("checkpoint=yes");
-    expect(line).toContain("usage_anchor=present");
+      summaries: 460,
+      omitted: 2,
+      missing: 1,
+    };
+    expect(formatProjectionDecision(decision)).toBe(
+      "projection session=ses_1 mode=fired estimated_tokens=712345 estimate_source=heuristic soft=734003 hard=786432 summaries=460 omitted=2 missing=1",
+    );
+    expect(
+      formatProjectionDecision({ ...decision, mode: "kept", measured: true }),
+    ).toContain("mode=kept estimated_tokens=712345 estimate_source=provider");
   });
 });

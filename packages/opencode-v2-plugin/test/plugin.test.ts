@@ -406,7 +406,7 @@ it.each([
   },
 );
 
-it("uses normalized usage to retain materialized context and pass the final hard guard despite encrypted assistant metadata", async () => {
+it("keeps the projection on measured usage despite encrypted assistant metadata, across a restart", async () => {
   state.config = JSON.stringify(config);
   const fake = sdk();
   const source = {
@@ -510,11 +510,15 @@ it("uses normalized usage to retain materialized context and pass the final hard
     Message.make({ id: "new-user", role: "user", content: "continue" }),
   ];
   await fake.hooks.get("context")!(first);
-  expect(first.messages[0]?.id).toMatch(/^reflection-native-/);
-  const checkpointKey = "reflection-v2/checkpoint/2/native/s";
+  expect(first.messages[0]?.id).toMatch(/^reflection-cursor-/);
+  expect(first.messages.slice(1).map((message) => message.id)).toEqual([
+    "new-user",
+  ]);
+  const cursorKey = "reflection-v2/cursor/1/native/s";
   const usageKey = "reflection-v2/usage/1/native/s";
-  const previousCheckpoint = fake.storage.get(checkpointKey);
-  expect(previousCheckpoint).toBeDefined();
+  expect(fake.storage.get(cursorKey)).toMatchObject({
+    projectedThrough: "old",
+  });
   expect(fake.storage.get(usageKey)).toBeDefined();
   history = [...initial, assistant];
   const next = event();
@@ -538,17 +542,27 @@ it("uses normalized usage to retain materialized context and pass the final hard
   const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
   try {
     await fake.hooks.get("context")!(next);
+    // The heuristic counts the ciphertext past the threshold; the reported
+    // usage of the previous request keeps the projection.
     expect(
-      warn.mock.calls.some(([line]) => String(line).includes("reused=yes")),
+      warn.mock.calls.some(([line]) =>
+        String(line).includes(
+          "mode=kept estimated_tokens=9600 estimate_source=provider",
+        ),
+      ),
     ).toBe(true);
   } finally {
     warn.mockRestore();
   }
   expect(next.messages[0]?.id).toBe(first.messages[0]?.id);
-  expect(next.messages.at(-1)?.id).toBe("a");
-  // The real host supplies native history again, not our last materialization.
-  // Reconstructing the same notice must reuse its checkpoint and usage anchor.
-  expect(fake.storage.get(checkpointKey)).toEqual(previousCheckpoint);
+  expect(next.messages.map((message) => message.id)).toEqual([
+    first.messages[0]?.id,
+    "new-user",
+    "a",
+  ]);
+  expect(
+    materializedTokens(next.messages, next.system, next.tools),
+  ).toBeGreaterThan(14_000);
   // A new plugin instance retains the exact checkpoint and persisted usage
   // fingerprints; no raw assistant payload or instructions enter storage.
   const savedUsage = fake.storage.get(usageKey);
@@ -578,9 +592,11 @@ it("uses normalized usage to retain materialized context and pass the final hard
   expect(restarted.messages.map((message) => message.id)).toEqual(
     next.messages.map((message) => message.id),
   );
-  expect(fake.storage.get(checkpointKey)).toEqual(previousCheckpoint);
+  expect(fake.storage.get(cursorKey)).toMatchObject({
+    projectedThrough: "old",
+  });
 });
-it("hydrates measured usage and keeps the exact restored-user notice when a new user follows encrypted assistant metadata", async () => {
+it("hydrates persisted measured usage when a new user follows encrypted assistant metadata", async () => {
   state.config = JSON.stringify(config);
   const fake = sdk();
   const source = {
@@ -674,16 +690,12 @@ it("hydrates measured usage and keeps the exact restored-user notice when a new 
   first.messages = [...nativeMessages];
   await fake.hooks.get("context")!(first);
   const notice = first.messages[0]!;
-  expect(notice.id).toMatch(/^reflection-native-/);
+  expect(notice.id).toMatch(/^reflection-cursor-/);
   expect(first.messages.map((message) => message.id)).toEqual([
     notice.id,
     "tail",
   ]);
-  expect(notice.content).toContainEqual(nativeMessages[0]!.content[0]);
-  const checkpointKey = "reflection-v2/checkpoint/2/native/s";
   const usageKey = "reflection-v2/usage/1/native/s";
-  const previousCheckpoint = structuredClone(fake.storage.get(checkpointKey));
-  expect(previousCheckpoint).toMatchObject({ restored_user_id: "u" });
   expect(fake.storage.get(usageKey)).toBeDefined();
 
   // Dispose before observing the completion: only the persisted projected
@@ -737,19 +749,9 @@ it("hydrates measured usage and keeps the exact restored-user notice when a new 
   await fake.hooks.get("context")!(next);
 
   expect(next.messages).toEqual([...first.messages, completion, newUser]);
-  expect(next.messages[0]?.id).toBe(notice.id);
   expect(next.messages[0]?.content).toEqual(notice.content);
-  expect(
-    next.messages[0]?.content.filter(
-      (part) => part.type === "text" && part.text === oldRequest,
-    ),
-  ).toEqual(nativeMessages[0]!.content);
-  expect(next.messages.filter((message) => message.id === "new-user")).toEqual([
-    newUser,
-  ]);
-  expect(fake.storage.get(checkpointKey)).toEqual(previousCheckpoint);
-  // The ciphertext alone exceeds even the model's full context limit. Passing
-  // with the exact old notice requires measured usage, not a fallback estimate.
+  // The ciphertext alone exceeds even the model's full context limit. Keeping
+  // the exact old notice requires measured usage, not a fallback estimate.
   expect(
     materializedTokens(next.messages, next.system, next.tools),
   ).toBeGreaterThan(20_000);
@@ -1436,7 +1438,7 @@ it("hydrates native exact ranges and reports absence of backend fingerprint hone
   ]);
   expect(result.verification).toContain("backend fingerprint unavailable");
 });
-it("session deletion aborts in-flight tools, removes checkpoint, and prevents new work", async () => {
+it("session deletion aborts in-flight tools, removes session state, and prevents new work", async () => {
   state.config = JSON.stringify(config);
   const fake = sdk();
   let slow = false;
@@ -1475,6 +1477,7 @@ it("session deletion aborts in-flight tools, removes checkpoint, and prevents ne
   );
   fake.storage.set("reflection-v2/checkpoint/2/native/s", {});
   fake.storage.set("reflection-v2/usage/1/native/s", {});
+  fake.storage.set("reflection-v2/cursor/1/native/s", {});
   slow = true;
   const pending = fake.tools
     .get("memory_search")!
@@ -1594,8 +1597,11 @@ it.each(["disposal", "deletion"])(
     const next = event();
     next.options = { temperature: 0.8 };
     await fake.hooks.get("context")!(next);
-    const writes = native.applied.filter((entry) => entry.type === "set");
+    const writes = native.applied.filter(
+      (entry) => entry.type === "set" && entry.key === usageKey,
+    );
     expect(writes).toHaveLength(1);
+    expect(native.values.get("reflection-v2/cursor/1/native/s")).toBeDefined();
     expect(writes[0]).not.toEqual(stale);
     expect(writes[0]).toEqual({
       type: "set",
@@ -1707,11 +1713,8 @@ it.each([1, 2])(
   },
 );
 
-it("projects cursor mode only above the threshold without a checkpoint", async () => {
-  state.config = JSON.stringify({
-    ...config,
-    cursorProjection: { enabled: true },
-  });
+it("projects only above the threshold without a checkpoint", async () => {
+  state.config = JSON.stringify(config);
   const fake = sdk();
   const source = {
     id: "native",
@@ -1742,6 +1745,18 @@ it("projects cursor mode only above the threshold without a checkpoint", async (
       if (url.pathname === "/v1/sources/native") return Response.json(source);
       if (url.pathname === "/v1/sessions/s/segments")
         return Response.json(manifest);
+      if (url.pathname === "/api/session/s")
+        return Response.json({
+          data: {
+            id: "s",
+            time: { updated: 1 },
+            location: { directory: "/work" },
+          },
+        });
+      if (url.pathname === "/api/config")
+        return Response.json([
+          { type: "document", info: { compaction: { auto: false } } },
+        ]);
       if (url.pathname === "/api/session/s/message")
         return Response.json({ data: [], cursor: {} });
       throw new Error(`unexpected ${url.pathname}`);

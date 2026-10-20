@@ -1,102 +1,9 @@
 import { Message } from "@opencode/ai";
 import { types } from "node:util";
-import { z } from "zod";
-import {
-  estimateNativeTokens,
-  type NativeProjectionCheckpoint,
-  type NativeProjectionShape,
-} from "@reflection/opencode-v2-core/projection";
+import { estimateNativeTokens } from "@reflection/opencode-v2-core/projection";
 
-const hash = z.string().regex(/^[a-f0-9]{64}$/);
-export const checkpointSchema = z
-  .object({
-    version: z.literal(2),
-    source_id: z.string().min(1),
-    session_id: z.string().min(1),
-    archived: z
-      .array(
-        z
-          .object({
-            id: z.string().uuid(),
-            start_source_message_id: z.string().min(1),
-            end_source_message_id: z.string().min(1),
-            source_fingerprint: hash,
-            source_message_ids: z.array(z.string().min(1)).min(1),
-          })
-          .strict(),
-      )
-      .min(1),
-    source_prefix_fingerprint: hash,
-    tail_start_source_id: z.string().nullable(),
-    restored_user_id: z.string().nullable(),
-    manifest_summary_fingerprint: hash,
-    cachedSummaries: z.array(
-      z
-        .object({
-          id: z.string().uuid(),
-          start_source_message_id: z.string().min(1),
-          end_source_message_id: z.string().min(1),
-          source_fingerprint: hash,
-          projection_version: z.literal(3),
-          summary: z.string(),
-        })
-        .strict(),
-    ),
-    cached_summaries_fingerprint: hash,
-    context_limit: z.number().positive(),
-    input_limit: z.number().positive(),
-    output_limit: z.number().nonnegative(),
-    notice_id: z.string().regex(/^reflection-native-[a-f0-9]{32}$/),
-  })
-  .strict();
-export function checkpoint(
-  value: unknown,
-  source: string,
-  session: string,
-): NativeProjectionCheckpoint | undefined {
-  const result = checkpointSchema.safeParse(value);
-  if (
-    !result.success ||
-    result.data.source_id !== source ||
-    result.data.session_id !== session
-  )
-    return;
-  for (const range of result.data.archived) {
-    if (
-      range.source_message_ids[0] !== range.start_source_message_id ||
-      range.source_message_ids.at(-1) !== range.end_source_message_id ||
-      new Set(range.source_message_ids).size !== range.source_message_ids.length
-    )
-      return;
-  }
-  return result.data;
-}
-export function checkpointSchemaJson(value: NativeProjectionCheckpoint) {
-  // Plain JSON records, with the core's canonical cached-summary field order.
-  return {
-    ...value,
-    archived: value.archived.map((range) => ({
-      id: range.id,
-      start_source_message_id: range.start_source_message_id,
-      end_source_message_id: range.end_source_message_id,
-      source_fingerprint: range.source_fingerprint,
-      source_message_ids: [...range.source_message_ids],
-    })),
-    cachedSummaries: value.cachedSummaries.map((summary) => ({
-      id: summary.id,
-      start_source_message_id: summary.start_source_message_id,
-      end_source_message_id: summary.end_source_message_id,
-      source_fingerprint: summary.source_fingerprint,
-      projection_version: summary.projection_version,
-      summary: summary.summary,
-    })),
-  };
-}
 export const NOTICE_PREFIX =
   "[System-generated Reflection context, not a new user instruction. Archived material may omit details; use memory_search and memory_read_segment with source_id and segment_id.]\n";
-export const ANCHOR_HEADER = "\n[Latest actual user input, copied verbatim]\n";
-export const ANCHOR_FOOTER = "\n[End latest actual user input]";
-export const WRAPPER_RESERVE = NOTICE_PREFIX + ANCHOR_HEADER + ANCHOR_FOOTER;
 
 // Estimation-only copy. Original content, including binary media, is never
 // rewritten. Images reserve 16K tokens each (core adds another 4K). Unknown
@@ -242,36 +149,6 @@ export function estimateMessages(messages: readonly Message[]) {
       ),
     };
   });
-}
-export function materialize(
-  plan: NativeProjectionShape,
-  messages: readonly Message[],
-): Message[] {
-  if (!plan.notice) return [...messages];
-  const content: Message["content"][number][] = [
-    { type: "text", text: NOTICE_PREFIX + plan.notice.text },
-  ];
-  let providerMetadata: Message["providerMetadata"];
-  if (plan.notice.anchorMessageIndex !== undefined) {
-    const anchor = messages[plan.notice.anchorMessageIndex];
-    if (!anchor || anchor.role !== "user")
-      throw new Error("Reflection: invalid latest user anchor");
-    providerMetadata = anchor.providerMetadata;
-    content.push({ type: "text", text: ANCHOR_HEADER }, ...anchor.content, {
-      type: "text",
-      text: ANCHOR_FOOTER,
-    });
-  }
-  return [
-    ...plan.preservedPrefixIndices.map((index) => messages[index]!),
-    Message.make({
-      id: plan.notice.id,
-      role: "user",
-      content,
-      ...(providerMetadata == null ? {} : { providerMetadata }),
-    }),
-    ...messages.slice(plan.tailStartIndex),
-  ];
 }
 export function materializedTokens(
   messages: readonly Message[],

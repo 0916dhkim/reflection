@@ -144,6 +144,92 @@ describe("cursor projection", () => {
     ]);
   });
 
+  it("decides with provider-measured size when continuity is proven", () => {
+    const history = [
+      user("u1"),
+      reply("a1", big),
+      user("u2"),
+      reply("a2"),
+      user("u3"),
+    ];
+    // The heuristic puts raw history past the threshold; the provider did not.
+    const raw = project(history, { measure: () => 500 });
+    expect(raw).toMatchObject({
+      mode: "raw",
+      estimatedTokens: 500,
+      measured: true,
+    });
+    expect(raw.messages).toEqual(history);
+
+    const fired = project(history);
+    expect(fired.measured).toBe(false);
+    const kept = project([...history, reply("a3", big)], {
+      projectedThrough: fired.projectedThrough,
+      measure: (messages) => (messages[0] === undefined ? undefined : 650),
+    });
+    expect(kept).toMatchObject({ mode: "kept", estimatedTokens: 650 });
+
+    const refired = project(history, {
+      projectedThrough: fired.projectedThrough,
+      measure: () => 720,
+    });
+    expect(refired.mode).toBe("fired");
+  });
+
+  it("fires above the threshold without summaries and marks what is missing", () => {
+    const history = [user("u1", big), reply("a1"), user("u2")];
+    const projection = project(history, {
+      summaries: [],
+      measure: (messages) => (messages[0] === history[0] ? 900 : undefined),
+    });
+    expect(projection).toMatchObject({ mode: "fired", measured: false });
+    expect(projection.messages.slice(1)).toEqual(history.slice(1));
+    expect(JSON.stringify(projection.messages[0])).toContain(
+      "[Reflection omitted u1..u1: missing-or-stale-summary]",
+    );
+  });
+
+  it("keeps the full request when no projection fits but it does", () => {
+    const history = [
+      user("u1", "x ".repeat(300)),
+      call("a1", "c1"),
+      result("c1", "y ".repeat(700)),
+    ];
+    const projection = project(history, {
+      summaries: [],
+      measure: (messages) => (messages[0] === history[0] ? 720 : undefined),
+    });
+    expect(projection).toMatchObject({
+      mode: "raw",
+      estimatedTokens: 720,
+      measured: true,
+    });
+    expect(projection.messages).toEqual(history);
+  });
+
+  it("copies an archived latest user and keeps it while the cut is kept", () => {
+    const history = [
+      user("u1", "do the thing"),
+      call("a1", "c1", big),
+      result("c1"),
+      call("a2", "c2"),
+      result("c2"),
+    ];
+    const fired = project(history, { summaries: [] });
+    expect(fired.projectedAnchor).toBe("u1");
+    expect(JSON.stringify(fired.messages[0])).toContain(
+      "[Latest actual user input, copied verbatim]",
+    );
+    expect(fired.messages.slice(1)).toEqual(history.slice(3));
+    const kept = project([...history, reply("a3"), user("u2")], {
+      summaries: [],
+      projectedThrough: fired.projectedThrough,
+      projectedAnchor: fired.projectedAnchor,
+    });
+    expect(kept.mode).toBe("kept");
+    expect(kept.messages[0]).toEqual(fired.messages[0]);
+  });
+
   it("keeps the tool call when the cut ends on a tool-calling message", () => {
     const messages = [
       user("u1"),
@@ -157,7 +243,7 @@ describe("cursor projection", () => {
     expect(projection.messages.slice(1)).toEqual(messages.slice(3));
   });
 
-  it("starts a budget-trimmed tail after a complete tool exchange", () => {
+  it("archives a complete tool exchange with its call when later messages follow", () => {
     const messages = [
       user("u1"),
       call("a1", "c1", "x ".repeat(2_000)),
@@ -171,7 +257,10 @@ describe("cursor projection", () => {
       hardTokens: 600,
       systemTokens: 100,
     });
-    expect(projection.messages).toEqual(messages.slice(3));
+    expect(projection.messages.slice(1)).toEqual(messages.slice(3));
+    expect(JSON.stringify(projection.messages[0])).toContain(
+      "[Reflection omitted u1..a1: missing-or-stale-summary]",
+    );
     expect(projection.estimatedTokens).toBeLessThanOrEqual(600);
   });
 
@@ -187,7 +276,10 @@ describe("cursor projection", () => {
       hardTokens: 600,
       systemTokens: 100,
     });
-    expect(projection.messages).toEqual(messages.slice(1));
+    expect(projection.messages.slice(1)).toEqual(messages.slice(1));
+    expect(JSON.stringify(projection.messages[0])).toContain(
+      "[Reflection omitted u1..u1: missing-or-stale-summary]",
+    );
     expect(projection.estimatedTokens).toBeGreaterThan(600);
   });
 

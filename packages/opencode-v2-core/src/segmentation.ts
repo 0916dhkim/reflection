@@ -14,7 +14,6 @@ import {
 import type { SourceInfo } from "@reflection/shared/sources";
 
 import type { NativeCanonicalRecord } from "./history.js";
-import type { NativeSegmentMemo } from "./memo.js";
 
 export interface NativePlannedSegment {
   request: NativeSegmentCreate;
@@ -32,8 +31,6 @@ export interface NativeSegmentPlanOptions {
   manifest?: NativeSessionSegmentsResponse;
   softLimitChars?: number;
   allowOpenSnapshot?: boolean;
-  /** Reuses per-segment identity for unchanged record objects. */
-  memo?: NativeSegmentMemo;
 }
 
 interface Anchor {
@@ -74,7 +71,6 @@ function anchorsFor(
   sessionId: string,
   records: readonly NativeCanonicalRecord[],
   positions: ReadonlyMap<string, number>,
-  memo: NativeSegmentMemo | undefined,
 ): Anchor[] {
   if (manifest === undefined) return [];
   const parsed = parseNativeSessionSegmentsResponse(manifest, source.id);
@@ -94,12 +90,7 @@ function anchorsFor(
     // replanned rather than being covered by an impossible range.
     if (start === undefined || end === undefined) continue;
     if (end < start) throw new Error("native manifest anchor is reversed");
-    const identity = identify(
-      source,
-      sessionId,
-      records.slice(start, end + 1),
-      memo,
-    );
+    const identity = identify(source, sessionId, records.slice(start, end + 1));
     if (identity.id !== entry.id) {
       throw new Error("native manifest anchor has an invalid deterministic ID");
     }
@@ -170,19 +161,13 @@ function identify(
   source: SourceInfo,
   sessionId: string,
   records: readonly NativeCanonicalRecord[],
-  memo: NativeSegmentMemo | undefined,
 ): Pick<NativePlannedSegment, "request" | "id" | "fingerprint"> {
-  const known = memo?.lookup(source, sessionId, records);
-  if (known) return known;
   const request = requestFor(source, sessionId, records);
-  const result = {
+  return {
     request,
     id: nativeSegmentIdForRequest(request, source),
     fingerprint: nativeSourceFingerprint(request),
   };
-  return memo
-    ? memo.remember(source, sessionId, records, result, textChars(records))
-    : result;
 }
 
 function planned(
@@ -190,14 +175,8 @@ function planned(
   sessionId: string,
   records: readonly NativeCanonicalRecord[],
   closed: boolean,
-  memo: NativeSegmentMemo | undefined,
 ): NativePlannedSegment {
-  const { request, id, fingerprint } = identify(
-    source,
-    sessionId,
-    records,
-    memo,
-  );
+  const { request, id, fingerprint } = identify(source, sessionId, records);
   return {
     request,
     id,
@@ -211,15 +190,8 @@ function planned(
   };
 }
 
-function assertSegmentSize(
-  source: SourceInfo,
-  sessionId: string,
-  records: readonly NativeCanonicalRecord[],
-  memo: NativeSegmentMemo | undefined,
-): void {
-  const size =
-    memo?.lookup(source, sessionId, records)?.textChars ?? textChars(records);
-  if (size > MAX_SEGMENT_TEXT_CHARS) {
+function assertSegmentSize(records: readonly NativeCanonicalRecord[]): void {
+  if (textChars(records) > MAX_SEGMENT_TEXT_CHARS) {
     throw new Error(
       "native segment exceeds the segment text limit and cannot be split safely",
     );
@@ -238,21 +210,13 @@ export function planNativeSegments({
   manifest,
   softLimitChars = 20_000,
   allowOpenSnapshot = false,
-  memo,
 }: NativeSegmentPlanOptions): NativePlannedSegment[] {
   requireSource(source);
   if (!Number.isInteger(softLimitChars) || softLimitChars <= 0) {
     throw new Error("native soft segment limit must be a positive integer");
   }
   const positions = validateRecords(records);
-  const anchors = anchorsFor(
-    manifest,
-    source,
-    sessionId,
-    records,
-    positions,
-    memo,
-  );
+  const anchors = anchorsFor(manifest, source, sessionId, records, positions);
   const barrier = records.findIndex((record) => !record.complete);
   const end = barrier === -1 ? records.length : barrier;
   const completeRecords = records.slice(0, end);
@@ -272,7 +236,7 @@ export function planNativeSegments({
           chunk.length > 0 &&
           weight + candidate.weightedChars > softLimitChars
         ) {
-          result.push(planned(source, sessionId, chunk, true, memo));
+          result.push(planned(source, sessionId, chunk, true));
           chunk.length = 0;
           weight = 0;
         }
@@ -280,19 +244,19 @@ export function planNativeSegments({
         weight += candidate.weightedChars;
         cursor += 1;
         if (weight === softLimitChars || weight > softLimitChars) {
-          result.push(planned(source, sessionId, chunk, true, memo));
+          result.push(planned(source, sessionId, chunk, true));
           chunk.length = 0;
           weight = 0;
         }
       }
       if (chunk.length > 0) {
-        result.push(planned(source, sessionId, chunk, true, memo));
+        result.push(planned(source, sessionId, chunk, true));
       }
     }
     if (cursor !== anchor.start)
       throw new Error("native manifest anchor is not contiguous");
     const anchored = completeRecords.slice(anchor.start, anchor.end + 1);
-    assertSegmentSize(source, sessionId, anchored, memo);
+    assertSegmentSize(anchored);
     // The anchor fixes the range even when its current fingerprint differs;
     // the new request then replaces/re-extracts the changed payload in place.
     const closed =
@@ -300,7 +264,7 @@ export function planNativeSegments({
       anchored.reduce((total, record) => total + record.weightedChars, 0) >=
         softLimitChars;
     if (closed || allowOpenSnapshot) {
-      result.push(planned(source, sessionId, anchored, closed, memo));
+      result.push(planned(source, sessionId, anchored, closed));
     }
     cursor = anchor.end + 1;
   }
@@ -310,7 +274,7 @@ export function planNativeSegments({
   while (cursor < completeRecords.length) {
     const candidate = completeRecords[cursor]!;
     if (tail.length > 0 && weight + candidate.weightedChars > softLimitChars) {
-      result.push(planned(source, sessionId, tail, true, memo));
+      result.push(planned(source, sessionId, tail, true));
       tail.length = 0;
       weight = 0;
     }
@@ -318,14 +282,14 @@ export function planNativeSegments({
     weight += candidate.weightedChars;
     cursor += 1;
     if (weight >= softLimitChars) {
-      result.push(planned(source, sessionId, tail, true, memo));
+      result.push(planned(source, sessionId, tail, true));
       tail.length = 0;
       weight = 0;
     }
   }
   if (tail.length > 0 && allowOpenSnapshot) {
-    assertSegmentSize(source, sessionId, tail, memo);
-    result.push(planned(source, sessionId, tail, false, memo));
+    assertSegmentSize(tail);
+    result.push(planned(source, sessionId, tail, false));
   }
   return result;
 }

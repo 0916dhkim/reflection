@@ -9,11 +9,11 @@ import {
   NativeProjectionError,
   estimateNativeTokens,
   nativeInputBudget,
-  projectNativeContext,
-  type NativeProjectionResult,
 } from "@reflection/opencode-v2-core/projection";
-import { canonicalizeNativeHistory } from "@reflection/opencode-v2-core/history";
-import { NativeSegmentMemo } from "@reflection/opencode-v2-core/memo";
+import {
+  canonicalizeNativeHistory,
+  type NativeCanonicalRecord,
+} from "@reflection/opencode-v2-core/history";
 import {
   hydrateNativeRange,
   planNativeSegments,
@@ -21,7 +21,7 @@ import {
 import { parseIngestSegmentResponse } from "@reflection/shared/ingestion";
 import {
   nativeSegmentIdForRequest,
-  type NativeSessionSegmentsResponse,
+  type NativeSegmentSummary,
 } from "@reflection/shared/native";
 import { readSegmentMessages } from "@reflection/shared/segmentation";
 import {
@@ -39,15 +39,8 @@ import {
   emptyCursorState,
   parseCursorState,
   selectCursorProjection,
-  type CursorState,
 } from "./cursor.js";
 import { formatProjectionDecision } from "./log.js";
-import {
-  cacheProjectionPlan,
-  manifestPrefixFingerprint,
-  projectionPlanReuseReason,
-  type CachedProjectionPlan,
-} from "./plan-cache.js";
 import { UsageTracker } from "./usage.js";
 import { Operations, bounded } from "./operations.js";
 import { withCancellableStorage, type StorageMutations } from "./native.js";
@@ -58,15 +51,7 @@ import {
   readUserInstructionParts,
   type UserPolicy,
 } from "./user-policy.js";
-import {
-  WRAPPER_RESERVE,
-  checkpoint,
-  checkpointSchemaJson,
-  estimateMessages,
-  estimationValue,
-  materialize,
-  materializedTokens,
-} from "./projection.js";
+import { estimationValue } from "./projection.js";
 
 export default withCancellableStorage({ id: "reflection-v2", setup });
 
@@ -87,13 +72,10 @@ export async function setup(ctx: Plugin.Context, storage: StorageMutations) {
   let registryRetryAllowed = false;
   let registryAttempt: Promise<void> | undefined;
   let eventTask: Promise<void> = Promise.resolve();
-  // Per-segment identity and prefix hashes for the context hook's cached
-  // history records; entries die with the records they are keyed by.
-  const segmentMemo = new NativeSegmentMemo();
-  const planCache = new Map<string, CachedProjectionPlan>();
-  const planCacheMiss = new Map<string, string>();
-  const planCacheStore = new Set<string>();
-  const key = (id: string) =>
+  // Last summaries per session, so a manifest outage keeps the current cut.
+  const lastSummaries = new Map<string, NativeSegmentSummary[]>();
+  // Checkpoint projection was removed; deletion still clears its old state.
+  const legacyCheckpointKey = (id: string) =>
     `reflection-v2/checkpoint/2/${encodeURIComponent(http!.config.sourceId)}/${encodeURIComponent(id)}`;
   const usageKey = (id: string) =>
     `reflection-v2/usage/1/${encodeURIComponent(http!.config.sourceId)}/${encodeURIComponent(id)}`;
@@ -126,36 +108,44 @@ export async function setup(ctx: Plugin.Context, storage: StorageMutations) {
         throw new Error(
           "Reflection owns compaction; native checkpoint forbidden",
         );
-      const source = await http.source(http.config.sourceId, signal);
-      const info = await http.session(
-        http.reader(source),
+      await verifyOwnership(
+        http,
+        await http.source(http.config.sourceId, signal),
         event.sessionID,
         signal,
       );
-      const directory = String(object(info.location).directory);
-      if (directory !== ctx.location.directory)
-        throw new Error(
-          "Reflection: session location is not owned by this plugin instance",
-        );
-      const query = new URLSearchParams({
-        "location[directory]": directory,
-      });
-      if (
-        automaticCompaction(
-          (
-            await http.request(
-              `/api/config?${query}`,
-              signal,
-              http.reader(source),
-            )
-          ).value,
-        )
-      )
-        throw new Error(
-          "Reflection: effective compaction.auto must be false before model dispatch",
-        );
     }),
   );
+  // The session must belong to this plugin's location, whose effective config
+  // must keep native compaction off.
+  async function verifyOwnership(
+    http: Transport,
+    source: SourceInfo,
+    session: string,
+    signal: AbortSignal,
+  ) {
+    const info = await http.session(http.reader(source), session, signal);
+    const directory = String(object(info.location).directory);
+    if (directory !== ctx.location.directory)
+      throw new Error(
+        "Reflection: session location is not owned by this plugin instance",
+      );
+    const query = new URLSearchParams({ "location[directory]": directory });
+    if (
+      automaticCompaction(
+        (
+          await http.request(
+            `/api/config?${query}`,
+            signal,
+            http.reader(source),
+          )
+        ).value,
+      )
+    )
+      throw new Error(
+        "Reflection: effective compaction.auto must be false before model dispatch",
+      );
+  }
   const tools = await ctx.tool.transform((editor) => {
     editor.add({
       name: "memory_search",
@@ -282,119 +272,6 @@ export async function setup(ctx: Plugin.Context, storage: StorageMutations) {
       return { content: JSON.stringify({ error: safeError(error) }) };
     }
   }
-  async function projectCursor(
-    event: SessionContext,
-    signal: AbortSignal,
-    http: Transport,
-    source: SourceInfo,
-    requestSystem: SessionContext["system"],
-    requestMessages: readonly SessionContext["messages"][number][],
-  ): Promise<void> {
-    const stored = await bounded(
-      ctx.storage.get(cursorKey(event.sessionID)),
-      signal,
-    );
-    const state =
-      parseCursorState(stored, source.id, event.sessionID) ??
-      emptyCursorState(source.id, event.sessionID);
-    const manifest = await http.request(
-      `/v1/sessions/${encodeURIComponent(event.sessionID)}/segments?source_id=${encodeURIComponent(source.id)}`,
-      signal,
-    );
-    const summaryState = cursorSummaryState(manifest.value, source);
-    if (summaryState.summaries.length > 0) {
-      state.summarizedThrough = summaryState.summarizedThrough;
-      state.summaryFingerprint = summaryState.fingerprint;
-    }
-    if (state.submittedThrough === null)
-      state.submittedThrough = state.summarizedThrough;
-
-    const models = await bounded(
-      ctx.model.list({ location: ctx.location }),
-      signal,
-    );
-    const model = models.data.find(
-      (candidate) =>
-        candidate.id === event.model.id &&
-        candidate.providerID === event.model.providerID,
-    );
-    if (!model) throw new Error("Reflection: current model limits unavailable");
-    const output = Math.min(
-      model.limit.output,
-      Math.floor(model.limit.context * 0.25),
-      event.options.maxTokens ?? Infinity,
-    );
-    const budget = nativeInputBudget(
-      model.limit.context,
-      model.limit.input,
-      output,
-    );
-    const systemTokens =
-      estimateNativeTokens(estimationValue(requestSystem)) +
-      estimateNativeTokens(estimationValue(event.tools)) +
-      estimateNativeTokens(WRAPPER_RESERVE);
-    const projection = selectCursorProjection({
-      sourceId: source.id,
-      messages: requestMessages,
-      summaries: summaryState.summaries,
-      projectedThrough: state.projectedThrough ?? null,
-      contextLimit: model.limit.context,
-      softTokens: budget.soft,
-      hardTokens: budget.hard,
-      systemTokens,
-    });
-    state.projectedThrough = projection.projectedThrough;
-    if (projection.estimatedTokens > budget.hard)
-      throw new Error(
-        "Reflection: materialized context exceeds hard input budget",
-      );
-    event.system = requestSystem;
-    if (allowsWireOutputCap(model)) event.options.maxTokens = output;
-    else delete event.options.maxTokens;
-    event.messages = projection.messages;
-
-    try {
-      const fresh = await http.history(
-        source,
-        event.sessionID,
-        signal,
-        state.submittedThrough ?? undefined,
-      );
-      if (fresh.length > 0) {
-        const records = canonicalizeNativeHistory(fresh);
-        const segments = planNativeSegments({
-          source,
-          sessionId: event.sessionID,
-          records,
-          softLimitChars: 20_000,
-        });
-        for (const segment of segments) {
-          if (!segment.closed) continue;
-          await http.request(
-            "/v1/segments",
-            signal,
-            undefined,
-            segment.request,
-          );
-          state.submittedThrough = segment.request.end_source_message_id;
-        }
-      }
-    } catch {
-      if (signal.aborted) signal.throwIfAborted();
-      warn(`cursor-ingestion deferred session=${event.sessionID}`);
-    }
-    await bounded(
-      ctx.storage.set(
-        cursorKey(event.sessionID),
-        JSON.parse(JSON.stringify(state)) as never,
-      ),
-      signal,
-    );
-    warn(
-      `cursor-projection session=${event.sessionID} mode=${projection.mode} summaries=${summaryState.summaries.length} omitted=${projection.omittedSummaries} estimated=${projection.estimatedTokens} soft=${budget.soft} hard=${budget.hard}`,
-    );
-  }
-
   async function project(event: SessionContext, signal: AbortSignal) {
     try {
       const { http, ingestion } = await requireReady(signal);
@@ -427,58 +304,10 @@ export async function setup(ctx: Plugin.Context, storage: StorageMutations) {
         }
       }
       const source = await http.source(http.config.sourceId, signal);
-      if (http.config.cursorProjection?.enabled) {
-        await projectCursor(
-          event,
-          signal,
-          http,
-          source,
-          requestSystem,
-          requestMessages,
-        );
-        return;
-      }
-      // Every model step needs full records, so reuse the settled prefix and
-      // read only the tail instead of re-paging the whole session.
-      const snapshot = await http.snapshot(
-        source,
-        event.sessionID,
-        signal,
-        false,
-        true,
-      );
-      const directory = String(object(snapshot.info.location).directory);
-      if (directory !== ctx.location.directory)
-        throw new Error(
-          "Reflection: session location is not owned by this plugin instance",
-        );
-      if (
-        snapshot.records.some(
-          (record) =>
-            record.raw.type === "compaction" &&
-            record.raw.status === "completed",
-        )
-      )
-        throw new Error(
-          "Reflection: preexisting native compaction requires an uncompacted session; native fallback forbidden",
-        );
-      const query = new URLSearchParams({
-        "location[directory]": directory,
-      });
-      if (
-        automaticCompaction(
-          (
-            await http.request(
-              `/api/config?${query}`,
-              signal,
-              http.reader(source),
-            )
-          ).value,
-        )
-      )
-        throw new Error(
-          "Reflection: effective compaction.auto must be false before model dispatch",
-        );
+      const session = event.sessionID;
+      const directory = ctx.location.directory;
+      await verifyOwnership(http, source, session, signal);
+
       const models = await bounded(
         ctx.model.list({ location: ctx.location }),
         signal,
@@ -520,335 +349,224 @@ export async function setup(ctx: Plugin.Context, storage: StorageMutations) {
       if (!wireCapAllowed) {
         delete (requestOptions as Record<string, unknown>).maxTokens;
       }
-      const stored = await bounded(
-        ctx.storage.get(key(event.sessionID)),
-        signal,
-      );
-      let previous = checkpoint(stored, source.id, event.sessionID);
-      if (stored !== undefined && !previous)
-        warn("Invalid checkpoint discarded; rebuilding Reflection projection");
-      const system = estimationValue(requestSystem);
-      const toolBudget = estimationValue(event.tools);
-      const estimatedMessages = estimateMessages(requestMessages);
-      if (!usage.has(event.sessionID)) {
-        try {
-          const saved = await bounded(
-            ctx.storage.get(usageKey(event.sessionID)),
+
+      const state =
+        parseCursorState(
+          await bounded(ctx.storage.get(cursorKey(session)), signal),
+          source.id,
+          session,
+        ) ?? emptyCursorState(source.id, session);
+      let summaries: NativeSegmentSummary[];
+      let manifestAvailable = true;
+      try {
+        const summaryState = cursorSummaryState(
+          await ingestion.manifest(session, signal),
+          source,
+        );
+        summaries = summaryState.summaries;
+        lastSummaries.delete(session);
+        lastSummaries.set(session, summaries);
+        while (lastSummaries.size > 64)
+          lastSummaries.delete(lastSummaries.keys().next().value!);
+        if (summaries.length > 0) {
+          state.summarizedThrough = summaryState.summarizedThrough;
+          state.summaryFingerprint = summaryState.fingerprint;
+        }
+      } catch (error) {
+        if (!(error instanceof AvailabilityError)) throw error;
+        signal.throwIfAborted();
+        manifestAvailable = false;
+        summaries = lastSummaries.get(session) ?? [];
+        warn(
+          `Manifest temporarily unavailable; projecting with ${summaries.length} last known summaries`,
+        );
+      }
+      // A committed revert removes a suffix; restart ingestion from the last
+      // summary that still exists.
+      const present = new Set(requestMessages.map((message) => message.id));
+      if (
+        state.submittedThrough !== null &&
+        !present.has(state.submittedThrough)
+      )
+        state.submittedThrough =
+          summaries.findLast((segment) =>
+            present.has(segment.end_source_message_id),
+          )?.end_source_message_id ?? null;
+      else if (state.submittedThrough === null)
+        state.submittedThrough = state.summarizedThrough;
+
+      // Unsubmitted history feeds ingestion. The latest assistant's reported
+      // usage anchors the size estimate, so read it too when it was submitted.
+      let fresh: NativeCanonicalRecord[] | undefined;
+      try {
+        fresh = canonicalizeNativeHistory(
+          await http.history(
+            source,
+            session,
             signal,
+            state.submittedThrough ?? undefined,
+          ),
+        );
+      } catch {
+        if (signal.aborted) signal.throwIfAborted();
+        warn(`cursor-ingestion deferred session=${session}`);
+      }
+      let records = fresh ?? [];
+      const sourceMessages = requestMessages.filter(
+        (message) =>
+          message.id !== undefined &&
+          (message.role === "user" || message.role === "assistant"),
+      );
+      const latest = sourceMessages.findLastIndex(
+        (message) => message.role === "assistant",
+      );
+      if (
+        latest >= 0 &&
+        !records.some(
+          (record) => record.source.id === sourceMessages[latest]!.id,
+        )
+      ) {
+        try {
+          records = canonicalizeNativeHistory(
+            await http.history(
+              source,
+              session,
+              signal,
+              sourceMessages[latest - 1]?.id,
+            ),
           );
-          usage.restore(event.sessionID, source.id, directory, saved);
+        } catch {
+          if (signal.aborted) signal.throwIfAborted();
+          records = [];
+        }
+      }
+      if (!usage.has(session)) {
+        try {
+          usage.restore(
+            session,
+            source.id,
+            directory,
+            await bounded(ctx.storage.get(usageKey(session)), signal),
+          );
         } catch {
           signal.throwIfAborted();
           // Storage is an optimization; a failed read never grants usage trust.
           warn("Usage anchor unavailable; using conservative context estimate");
         }
       }
+      const toolBudget = estimationValue(event.tools);
       const tracker = usage.prepare(
-        event.sessionID,
-        snapshot.records,
+        session,
+        records,
         event.model,
         estimationValue(usageSystem),
         toolBudget,
         estimationValue(requestOptions),
       );
-      const estimateInput = (shape: Parameters<typeof materialize>[0]) =>
-        tracker.estimate(materialize(shape, requestMessages));
-      let manifest: NativeSessionSegmentsResponse;
-      let manifestAvailable = true;
-      try {
-        manifest = await ingestion.manifest(event.sessionID, signal);
-      } catch (error) {
-        if (!(error instanceof AvailabilityError)) throw error;
-        signal.throwIfAborted();
-        manifestAvailable = false;
-        manifest = {
-          source_id: source.id,
-          session_id: event.sessionID,
-          manifest_version: 3,
-          segments: [],
-          boundaries: [],
-          targets: [],
-        };
-        warn(
-          "Manifest temporarily unavailable; projecting verified native history with explicit missing-summary markers when needed",
-        );
-      }
-      let plan: NativeProjectionResult | undefined;
-      let reusedPlan = false;
-      const cachedPlan = planCache.get(event.sessionID);
-      const currentManifestFingerprint =
-        manifestAvailable && cachedPlan?.plan.checkpoint
-          ? manifestPrefixFingerprint(
-              manifest,
-              cachedPlan.plan.checkpoint.archived,
-            )
-          : undefined;
-      const reuseReason = cachedPlan
-        ? !manifestAvailable
-          ? "manifest-unavailable"
-          : currentManifestFingerprint === undefined
-            ? "manifest-prefix-unavailable"
-            : projectionPlanReuseReason(
-                previous,
-                cachedPlan,
-                requestMessages,
-                currentManifestFingerprint,
-                model.limit.context,
-                model.limit.input,
-                output,
-              )
-        : undefined;
-      if (
-        reuseReason &&
-        reuseReason !== "ok" &&
-        planCacheMiss.get(event.sessionID) !== reuseReason
-      ) {
-        planCacheMiss.set(event.sessionID, reuseReason);
-        warn(
-          `plan-cache-miss session=${event.sessionID} reason=${reuseReason}`,
-        );
-      }
-      if (cachedPlan && reuseReason === "ok") {
-        const cachedMessages = materialize(cachedPlan.plan, requestMessages);
-        const cachedTracked = tracker.estimate(cachedMessages);
-        const cachedConservative = materializedTokens(
-          cachedMessages,
-          system,
-          toolBudget,
-        );
-        if ((cachedTracked ?? cachedConservative) <= budget.hard) {
-          plan = {
-            ...cachedPlan.plan,
-            estimatedTokens: cachedTracked ?? cachedPlan.plan.estimatedTokens,
-          };
-          reusedPlan = true;
-          planCacheMiss.delete(event.sessionID);
-        } else if (planCacheMiss.get(event.sessionID) !== "hard-budget") {
-          planCacheMiss.set(event.sessionID, "hard-budget");
-          warn(`plan-cache-miss session=${event.sessionID} reason=hard-budget`);
-        }
-      }
-      if (!plan) {
-        const segmentInput = {
-          source,
-          sessionId: event.sessionID,
-          records: snapshot.records,
-          manifest,
-          memo: segmentMemo,
-        };
-        let segments: ReturnType<typeof planNativeSegments>;
-        if (!manifestAvailable && previous) {
-          try {
-            // Local hints preserve frozen packing, not backend eligibility. Require
-            // the exact ordered complete prefix; the core separately proves hashes
-            // before reusing cached summary text, including after source changes.
-            let cursor = 0;
-            for (const range of previous.archived) {
-              for (const id of range.source_message_ids) {
-                const record = snapshot.records[cursor++];
-                if (!record?.complete || record.source.id !== id)
-                  throw new Error("invalid local planning hint");
-              }
-            }
-            const planningManifest: NativeSessionSegmentsResponse = {
-              ...manifest,
-              boundaries: previous.archived.map((range) => ({
-                id: range.id,
-                source_boundary_version: 3,
-                start_source_message_id: range.start_source_message_id,
-                end_source_message_id: range.end_source_message_id,
-                projection_version: 3,
-                source_fingerprint: range.source_fingerprint,
-                source_eligible: false,
-              })),
-            };
-            segments = planNativeSegments({
-              ...segmentInput,
-              manifest: planningManifest,
-            });
-          } catch {
-            previous = undefined;
-            warn(
-              "Invalid checkpoint planning hints discarded; rebuilding from native history",
-            );
-            segments = planNativeSegments(segmentInput);
-          }
-        } else segments = planNativeSegments(segmentInput);
-        const input = {
-          source,
-          sessionId: event.sessionID,
-          records: snapshot.records,
-          segments,
-          messages: estimatedMessages,
-          system: [system, WRAPPER_RESERVE],
-          tools: toolBudget,
-          contextLimit: model.limit.context,
-          inputLimit: model.limit.input,
-          outputLimit: output,
-          previous,
-          allowLossy: true as const,
-          memo: segmentMemo,
-          estimateInput,
-        };
-        try {
-          plan = projectNativeContext({
-            ...input,
-            manifest,
-            manifestUnavailable: !manifestAvailable,
-          });
-        } catch (error) {
-          if (segments.length === 0) throw error;
-        }
-        if (
-          manifestAvailable &&
-          (!plan || plan.reset || (!previous && plan.notice))
-        ) {
-          // One aggregate five-second synchronization window, never wait for LLM
-          // extraction. The core emits explicit omissions for missing summaries.
-          const syncSignal = AbortSignal.any([
-            signal,
-            AbortSignal.timeout(5000),
-          ]);
-          try {
-            await ingestion.submit(
-              segments.filter((segment) => segment.closed),
-              manifest,
-              syncSignal,
-              100,
-            );
-            try {
-              manifest = await ingestion.manifest(event.sessionID, syncSignal);
-              manifestAvailable = true;
-            } catch (error) {
-              if (error instanceof AvailabilityError) manifestAvailable = false;
-              throw error;
-            }
-          } catch (error) {
-            if (!(error instanceof AvailabilityError) && !syncSignal.aborted)
-              throw error;
-            warn(
-              "Closed targets not fully synchronized within projection window; exact missing summaries remain explicit omissions",
-            );
-          }
-          signal.throwIfAborted();
-          plan = projectNativeContext({
-            ...input,
-            manifest,
-            manifestUnavailable: !manifestAvailable,
-          });
-        }
-        if (!plan)
-          plan = projectNativeContext({
-            ...input,
-            manifest,
-            manifestUnavailable: !manifestAvailable,
-          });
-      }
-      if (!plan) throw new Error("Reflection: projection unavailable");
-      const messages = materialize(plan, requestMessages);
-      const tracked = tracker.estimate(messages);
-      if (plan.lossy || plan.checkpoint !== undefined) {
-        warn(
-          formatProjectionDecision({
-            session: event.sessionID,
-            lossy: plan.lossy,
-            estimatedTokens: plan.estimatedTokens,
-            trackedTokens: tracked,
-            soft: budget.soft,
-            hard: budget.hard,
-            omitted: plan.omissions.length,
-            checkpoint: plan.checkpoint !== undefined,
-            usageAnchor: usage.anchorPresent(event.sessionID),
-            reused: reusedPlan,
-            context: model.limit.context,
-            output,
-          }),
-        );
-      }
-      const conservative = materializedTokens(messages, system, toolBudget);
-      if ((tracked ?? conservative) > budget.hard)
+
+      const projection = selectCursorProjection({
+        sourceId: source.id,
+        messages: requestMessages,
+        summaries,
+        ...(summaries.length === 0 && state.block
+          ? { cachedBlock: state.block }
+          : {}),
+        projectedThrough: state.projectedThrough ?? null,
+        ...(state.projectedAnchor === undefined
+          ? {}
+          : { projectedAnchor: state.projectedAnchor }),
+        contextLimit: model.limit.context,
+        softTokens: budget.soft,
+        hardTokens: budget.hard,
+        systemTokens:
+          estimateNativeTokens(estimationValue(requestSystem)) +
+          estimateNativeTokens(toolBudget),
+        measure: tracker.estimate,
+      });
+      warn(
+        formatProjectionDecision({
+          session,
+          mode: projection.mode,
+          estimatedTokens: projection.estimatedTokens,
+          measured: projection.measured,
+          soft: budget.soft,
+          hard: budget.hard,
+          summaries: summaries.length,
+          omitted: projection.omittedSummaries,
+          missing: projection.missingRanges,
+        }),
+      );
+      if (projection.estimatedTokens > budget.hard)
         throw new Error(
           "Reflection: materialized context exceeds hard input budget",
         );
       signal.throwIfAborted();
-      if (plan.checkpoint) {
-        // Build structural JSON without unsafe SDK casts or class instances.
-        const json = checkpointSchemaJson(plan.checkpoint);
-        await bounded(storage.set(key(event.sessionID), json, signal), signal);
-      } else if (stored !== undefined)
-        await bounded(storage.remove(key(event.sessionID), signal), signal);
-      signal.throwIfAborted();
-      const planManifestFingerprint =
-        manifestAvailable && plan.checkpoint
-          ? manifestPrefixFingerprint(manifest, plan.checkpoint.archived)
-          : undefined;
-      const cached =
-        planManifestFingerprint === undefined
-          ? undefined
-          : cacheProjectionPlan(plan, requestMessages, planManifestFingerprint);
-      if (cached) {
-        if (!planCacheStore.has(event.sessionID)) {
-          planCacheStore.add(event.sessionID);
-          warn(
-            `plan-cache-store session=${event.sessionID} tail=${plan.tailStartIndex} prefix=${cached.prefixIds.length}`,
-          );
-        }
-        planCache.delete(event.sessionID);
-        planCache.set(event.sessionID, cached);
-        while (planCache.size > 8) {
-          const oldest = planCache.keys().next().value!;
-          planCache.delete(oldest);
-        }
-      } else if (
-        plan.checkpoint &&
-        !planCacheStore.has(`skip:${event.sessionID}`)
-      ) {
-        planCacheStore.add(`skip:${event.sessionID}`);
-        warn(`plan-cache-store-skipped session=${event.sessionID}`);
-        planCache.delete(event.sessionID);
-      } else planCache.delete(event.sessionID);
-      tracker.remember(messages);
+      tracker.remember(projection.messages);
       try {
-        const saved = usage.export(event.sessionID, source.id, directory);
+        const saved = usage.export(session, source.id, directory);
         if (saved === undefined)
-          await bounded(
-            storage.remove(usageKey(event.sessionID), signal),
-            signal,
-          );
+          await bounded(storage.remove(usageKey(session), signal), signal);
         else
-          await bounded(
-            storage.set(usageKey(event.sessionID), saved, signal),
-            signal,
-          );
+          await bounded(storage.set(usageKey(session), saved, signal), signal);
         signal.throwIfAborted();
       } catch {
-        usage.delete(event.sessionID);
+        usage.delete(session);
         // Best effort invalidation of any older durable hint. A failed remove
         // cannot authorize reuse: the unchanged config/prefix/anchor checks
         // still apply on the next invocation.
         const cleanupSignal = AbortSignal.timeout(5000);
         await bounded(
-          storage.remove(usageKey(event.sessionID), cleanupSignal),
+          storage.remove(usageKey(session), cleanupSignal),
           cleanupSignal,
         ).catch(() => {});
         throw new Error(
           "Reflection: usage anchor persistence failed; model dispatch blocked",
         );
       }
+
+      if (manifestAvailable && fresh && fresh.length > 0) {
+        try {
+          const segments = planNativeSegments({
+            source,
+            sessionId: session,
+            records: fresh,
+            softLimitChars: 20_000,
+          });
+          for (const segment of segments) {
+            if (!segment.closed) continue;
+            await http.request(
+              "/v1/segments",
+              signal,
+              undefined,
+              segment.request,
+            );
+            state.submittedThrough = segment.request.end_source_message_id;
+          }
+        } catch {
+          if (signal.aborted) signal.throwIfAborted();
+          warn(`cursor-ingestion deferred session=${session}`);
+        }
+      }
+      state.projectedThrough = projection.projectedThrough;
+      state.projectedAnchor = projection.projectedAnchor;
+      if (projection.block) state.block = projection.block;
+      else delete state.block;
+      await bounded(
+        storage.set(
+          cursorKey(session),
+          JSON.parse(JSON.stringify(state)) as never,
+          signal,
+        ),
+        signal,
+      );
+      signal.throwIfAborted();
       if (userPolicy) {
         instructionBases.set(requestSystem, baseSystem);
         event.system = requestSystem;
       }
-      if (wireCapAllowed) {
-        event.options.maxTokens = output;
-      } else {
-        delete event.options.maxTokens;
-      }
-      event.messages = messages;
-      if (plan.deferredReason)
-        warn(
-          "Projection deferred below hard input budget; raw source-safe context retained",
-        );
+      if (wireCapAllowed) event.options.maxTokens = output;
+      else delete event.options.maxTokens;
+      event.messages = projection.messages;
     } catch (error) {
       const message = safeError(error);
       warn(message);
@@ -991,8 +709,7 @@ export async function setup(ctx: Plugin.Context, storage: StorageMutations) {
       if (typeof id !== "string") continue;
       if (event.type === "session.deleted") {
         usage.delete(id);
-        planCache.delete(id);
-        planCacheMiss.delete(id);
+        lastSummaries.delete(id);
         ingestion?.clear(id);
         http?.forget(http.config.sourceId, id);
         void operations
@@ -1000,7 +717,7 @@ export async function setup(ctx: Plugin.Context, storage: StorageMutations) {
             const cleanupSignal = AbortSignal.timeout(5000);
             return bounded(
               Promise.all([
-                storage.remove(key(id), cleanupSignal),
+                storage.remove(legacyCheckpointKey(id), cleanupSignal),
                 storage.remove(usageKey(id), cleanupSignal),
                 storage.remove(cursorKey(id), cleanupSignal),
               ]).then(() => {}),

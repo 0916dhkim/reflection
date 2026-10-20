@@ -50,6 +50,7 @@ let legacyReads = 0;
 const auth = `Basic ${Buffer.from("opencode:cp002-fixture-only").toString("base64")}`;
 // The plugin's own source reader goes through this recording proxy.
 const sourceReads = [];
+const postedAt = [];
 const assertions = [],
   requests = [],
   wire = [],
@@ -273,6 +274,11 @@ async function reflection(req, res, body) {
     const id = nativeSegmentIdForRequest(request, source);
     const fingerprint = nativeSourceFingerprint(request);
     posts.push(request);
+    postedAt.push({
+      session: request.session_id,
+      priority: request.processing_priority,
+      requests: requests.length,
+    });
     const boundary = {
       id,
       source_boundary_version: 3,
@@ -701,22 +707,30 @@ async function main() {
     "actual plugin ingests native source segments",
     posts.length > 0,
   );
-  // Once a turn has settled (from the third turn on), each step reuses the
-  // cached prefix: its paging includes a tail read after an anchor.
-  const pressureRequests = requests
+  // Once the context hook has submitted a segment, each step reads history
+  // after its ingestion cursor. Background idle ingestion may still page the
+  // full history, so only a missing cursor read counts against a step.
+  const firstPost = postedAt.find(
+    (post) => post.session === pressure && post.priority === 0,
+  );
+  const cursorSteps = requests
     .map((item, index) => ({ item, index }))
-    .filter(({ item }) => item.phase === "pressure");
-  const tailSteps = pressureRequests
-    .slice(1)
-    .filter(({ index }) =>
-      sequenceStarts(pressure).some(
+    .filter(
+      ({ item, index }) =>
+        item.phase === "pressure" &&
+        firstPost !== undefined &&
+        index > firstPost.requests,
+    );
+  const fullSteps = cursorSteps.filter(
+    ({ index }) =>
+      !sequenceStarts(pressure).some(
         (read) => read.requests === index && read.after !== undefined,
       ),
-    ).length;
+  ).length;
   check(
-    "context steps read only the tail after a settled prefix",
-    tailSteps >= pressureRequests.length - 4,
-    { tailSteps, steps: pressureRequests.length },
+    "context steps read after the ingestion cursor",
+    cursorSteps.length > 0 && fullSteps === 0,
+    { fullSteps, steps: cursorSteps.length },
   );
 
   // Report real provider usage through the native adapter, never through plugin
@@ -819,14 +833,17 @@ async function main() {
         "[System-generated Reflection context",
       ),
   );
+  // Reported usage plus the unaccounted result passes the soft budget, but a
+  // projection that keeps the live tool exchange cannot fit yet; the full
+  // request does, so it is retained rather than archiving the new result.
   check(
-    "new unaccounted tool result triggers projection despite low reported usage",
+    "new unaccounted tool result keeps the live exchange within the hard budget",
     usageToolRequests.length === 2 &&
       !text(usageToolRequests[0].body.messages).includes(
         "[System-generated Reflection context",
       ) &&
       text(usageToolRequests[1].body.messages).includes(
-        "[System-generated Reflection context",
+        "NATIVE_USAGE_NEW_RESULT_" + "t".repeat(28000),
       ) &&
       text(usageToolHistory).includes(
         "NATIVE_USAGE_NEW_RESULT_" + "t".repeat(28000),
@@ -865,7 +882,8 @@ async function main() {
   phase = "revert";
   const reverted = await session("revert");
   for (let i = 0; i < 4; i++) await prompt(reverted, `NATIVE_REVERT_${i}_`);
-  const boundary = (await history(reverted)).find(
+  const beforeRevert = await history(reverted);
+  const boundary = beforeRevert.find(
     (item) => item.type === "user" && text(item).includes("NATIVE_REVERT_2_"),
   );
   requireCheck("revert boundary exists", boundary !== undefined);
@@ -891,19 +909,17 @@ async function main() {
         );
       }),
   );
-  // The step before the first post-revert request tries the tail, rejects it,
-  // and reads the full history. Background ingestion may also read the full
-  // history at any point, so only a full read after the tail attempt counts.
-  const revertStarts = sequenceStarts(reverted).filter(
-    (read) => read.index >= revertReads && read.requests === revertRequests,
+  // No later read resumes after a message the revert removed.
+  const removed = new Set(
+    beforeRevert.slice(beforeRevert.indexOf(boundary)).map((item) => item.id),
   );
-  const revertTail = revertStarts.findIndex((read) => read.after !== undefined);
+  const revertStarts = sequenceStarts(reverted).filter(
+    (read) => read.index >= revertReads,
+  );
   check(
-    "a revert into the cached prefix falls back to a full read",
-    revertTail >= 0 &&
-      revertStarts
-        .slice(revertTail + 1)
-        .some((read) => read.after === undefined),
+    "reads after a committed revert never resume after a removed message",
+    revertStarts.length > 0 &&
+      revertStarts.every((read) => !removed.has(read.after)),
     { revertStarts },
   );
   check(
@@ -1058,21 +1074,26 @@ async function main() {
       targets: [],
     },
   });
+  const outageOrder = (await history(pressure)).map((item) => item.id);
   check(
     "cached outage omits only genuinely uncached source ranges",
-    outageOmissions.every(
-      (span) =>
-        !cachedRanges.some(
-          (range) =>
-            span ===
-            `${range.boundary.start_source_message_id}..${range.boundary.end_source_message_id}`,
-        ) &&
-        outagePlan.some(
-          (range) =>
-            span ===
-            `${range.request.start_source_message_id}..${range.request.end_source_message_id}`,
-        ),
-    ),
+    outageOmissions.every((span) => {
+      const [first, last] = span
+        .split("..")
+        .map((id) => outageOrder.indexOf(id));
+      return (
+        first >= 0 &&
+        last >= first &&
+        !cachedRanges.some((range) => {
+          const start = outageOrder.indexOf(
+            range.boundary.start_source_message_id,
+          );
+          const end = outageOrder.indexOf(range.boundary.end_source_message_id);
+          return start <= last && end >= first;
+        })
+      );
+    }),
+    { omissions: outageOmissions, plan: outagePlan.length },
   );
   diagnostics.cachedOutage = {
     cachedSummaries: cachedRanges.map((range) => range.summary),

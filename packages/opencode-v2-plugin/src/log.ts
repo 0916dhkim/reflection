@@ -76,34 +76,29 @@ export function formatAnchorMissing(input: AnchorMissing): string {
 
 export interface ProjectionDecision {
   session: string;
-  lossy: boolean;
+  mode: "raw" | "kept" | "fired";
   estimatedTokens: number;
-  trackedTokens?: number;
+  /** Anchored to the provider-reported usage of the latest response. */
+  measured: boolean;
   soft: number;
   hard: number;
+  summaries: number;
   omitted: number;
-  checkpoint: boolean;
-  usageAnchor: boolean;
-  reused?: boolean;
-  context: number;
-  output: number;
+  /** Archived ranges marked as missing a summary. */
+  missing: number;
 }
 
 export function formatProjectionDecision(input: ProjectionDecision): string {
   return [
     "projection",
     `session=${token(input.session)}`,
-    `plan=${input.lossy ? "lossy" : "projected"}`,
+    `mode=${input.mode}`,
     `estimated_tokens=${input.estimatedTokens}`,
-    `estimate_source=${input.trackedTokens === undefined ? "conservative" : "provider-anchor"}`,
-    `tracked_tokens=${input.trackedTokens ?? "none"}`,
+    `estimate_source=${input.measured ? "provider" : "heuristic"}`,
     `soft=${input.soft}`,
     `hard=${input.hard}`,
+    `summaries=${input.summaries}`,
     `omitted=${input.omitted}`,
-    `checkpoint=${input.checkpoint ? "yes" : "no"}`,
-    `usage_anchor=${input.usageAnchor ? "present" : "missing"}`,
-    `reused=${input.reused ? "yes" : "no"}`,
-    `context=${input.context}`,
-    `output=${input.output}`,
+    `missing=${input.missing}`,
   ].join(" ");
 }
