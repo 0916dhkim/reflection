@@ -83,6 +83,30 @@ export function cursorSummaryState(
   };
 }
 
+// A tail may not start between a tool call and its result: providers reject a
+// tool result whose call is missing. safe[i] is true when every result at or
+// after message i has its call at or after i (or no call in the request).
+function toolSafeStarts(messages: readonly Message[]): boolean[] {
+  const calls = new Map<string, number>();
+  const unsafe = Array<number>(messages.length + 2).fill(0);
+  messages.forEach((message, index) => {
+    if (!Array.isArray(message.content)) return;
+    for (const part of message.content) {
+      if (part.type === "tool-call") calls.set(part.id, index);
+      if (part.type !== "tool-result") continue;
+      const call = calls.get(part.id);
+      if (call === undefined || call === index) continue;
+      unsafe[call + 1]!++;
+      unsafe[index + 1]!--;
+    }
+  });
+  let depth = 0;
+  return Array.from({ length: messages.length + 1 }, (_, index) => {
+    depth += unsafe[index]!;
+    return depth === 0;
+  });
+}
+
 export function selectCursorProjection(input: {
   sourceId: string;
   messages: readonly Message[];
@@ -105,6 +129,10 @@ export function selectCursorProjection(input: {
     if (index < 0) return;
     tailStart = index + 1;
   }
+  const safe = toolSafeStarts(input.messages);
+  // A summary can end on a tool-calling assistant message; keep that call in
+  // the tail rather than sending its results alone.
+  while (tailStart > 0 && !safe[tailStart]) tailStart--;
   const costs = input.messages.map(
     (message) =>
       8 +
@@ -113,10 +141,16 @@ export function selectCursorProjection(input: {
   let tailCost = costs.slice(tailStart).reduce((sum, cost) => sum + cost, 0);
   while (
     tailStart < input.messages.length - 1 &&
-    input.systemTokens + tailCost > input.hardTokens
+    (input.systemTokens + tailCost > input.hardTokens || !safe[tailStart])
   ) {
     tailCost -= costs[tailStart]!;
     tailStart++;
+  }
+  // If only an unsafe start fits, include the call and let the caller reject
+  // the over-budget request instead of sending an invalid one.
+  while (tailStart > 0 && !safe[tailStart]) {
+    tailStart--;
+    tailCost += costs[tailStart]!;
   }
   let remaining = input.hardTokens - input.systemTokens - tailCost;
   const selected: NativeSegmentSummary[] = [];

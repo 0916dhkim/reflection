@@ -71,6 +71,75 @@ describe("cursor projection", () => {
     expect(result!.omittedSummaries).toBe(0);
   });
 
+  const call = (id: string, callId: string, command = id) =>
+    Message.make({
+      id,
+      role: "assistant",
+      content: [
+        { type: "tool-call", id: callId, name: "bash", input: { command } },
+      ],
+    });
+  const result = (callId: string, output = "ok") =>
+    Message.tool({ id: callId, name: "bash", result: output });
+
+  it("keeps the tool call when the summary ends on a tool-calling message", () => {
+    const summaries = cursorSummaryState(manifest, source).summaries;
+    const messages = [
+      Message.make({ id: "u1", role: "user", content: "one" }),
+      Message.make({ id: "a1", role: "assistant", content: "answer" }),
+      Message.make({ id: "u2", role: "user", content: "two" }),
+      call("a2", "c2"),
+      result("c2"),
+    ];
+    const projection = selectCursorProjection({
+      sourceId: "native",
+      messages,
+      summarizedThrough: "a2",
+      summaries,
+      hardTokens: 10_000,
+      systemTokens: 100,
+    });
+    expect(projection!.messages.slice(1)).toEqual(messages.slice(3));
+  });
+
+  it("starts a budget-trimmed tail after a complete tool exchange", () => {
+    const messages = [
+      Message.make({ id: "u1", role: "user", content: "one" }),
+      call("a1", "c1", "x ".repeat(2_000)),
+      result("c1"),
+      call("a2", "c2"),
+      result("c2"),
+    ];
+    const projection = selectCursorProjection({
+      sourceId: "native",
+      messages,
+      summarizedThrough: null,
+      summaries: [],
+      hardTokens: 600,
+      systemTokens: 100,
+    });
+    expect(projection!.messages).toEqual(messages.slice(3));
+    expect(projection!.estimatedTokens).toBeLessThanOrEqual(600);
+  });
+
+  it("never starts the tail with an orphaned tool result", () => {
+    const messages = [
+      Message.make({ id: "u1", role: "user", content: "one" }),
+      call("a1", "c1"),
+      result("c1", "x ".repeat(2_000)),
+    ];
+    const projection = selectCursorProjection({
+      sourceId: "native",
+      messages,
+      summarizedThrough: null,
+      summaries: [],
+      hardTokens: 600,
+      systemTokens: 100,
+    });
+    expect(projection!.messages).toEqual(messages.slice(1));
+    expect(projection!.estimatedTokens).toBeGreaterThan(600);
+  });
+
   it("drops older summaries with one marker when they do not fit", () => {
     const summaries = cursorSummaryState(manifest, source).summaries;
     const result = selectCursorProjection({
