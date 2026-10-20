@@ -82,6 +82,7 @@ export async function setup(ctx: Plugin.Context, storage: StorageMutations) {
   const segmentMemo = new NativeSegmentMemo();
   const planCache = new Map<string, CachedProjectionPlan>();
   const planCacheMiss = new Map<string, string>();
+  const planCacheStore = new Set<string>();
   const key = (id: string) =>
     `reflection-v2/checkpoint/2/${encodeURIComponent(http!.config.sourceId)}/${encodeURIComponent(id)}`;
   const usageKey = (id: string) =>
@@ -650,12 +651,25 @@ export async function setup(ctx: Plugin.Context, storage: StorageMutations) {
           ? undefined
           : cacheProjectionPlan(plan, requestMessages, planManifestFingerprint);
       if (cached) {
+        if (!planCacheStore.has(event.sessionID)) {
+          planCacheStore.add(event.sessionID);
+          warn(
+            `plan-cache-store session=${event.sessionID} tail=${plan.tailStartIndex} prefix=${cached.prefixIds.length}`,
+          );
+        }
         planCache.delete(event.sessionID);
         planCache.set(event.sessionID, cached);
         while (planCache.size > 8) {
           const oldest = planCache.keys().next().value!;
           planCache.delete(oldest);
         }
+      } else if (
+        plan.checkpoint &&
+        !planCacheStore.has(`skip:${event.sessionID}`)
+      ) {
+        planCacheStore.add(`skip:${event.sessionID}`);
+        warn(`plan-cache-store-skipped session=${event.sessionID}`);
+        planCache.delete(event.sessionID);
       } else planCache.delete(event.sessionID);
       tracker.remember(messages);
       try {

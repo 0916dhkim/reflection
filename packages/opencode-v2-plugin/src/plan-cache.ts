@@ -6,6 +6,17 @@ import type {
 } from "@reflection/opencode-v2-core/projection";
 import type { NativeSessionSegmentsResponse } from "@reflection/shared/native";
 
+function prefixKey(message: Message, index: number): string {
+  if (message.id !== undefined) return message.id;
+  try {
+    return `#${index}:${message.role}:${createHash("sha256")
+      .update(JSON.stringify(message.content))
+      .digest("hex")}`;
+  } catch {
+    return `#${index}:${message.role}`;
+  }
+}
+
 export function manifestPrefixFingerprint(
   manifest: NativeSessionSegmentsResponse,
   archived: readonly { id: string }[],
@@ -47,11 +58,10 @@ export function cacheProjectionPlan(
   if (!checkpoint || plan.tailStartIndex > requestMessages.length) return;
   const prefixIds = requestMessages
     .slice(0, plan.tailStartIndex)
-    .map((message) => message.id);
-  if (prefixIds.some((id) => id === undefined)) return;
+    .map(prefixKey);
   return {
     plan,
-    prefixIds: prefixIds as string[],
+    prefixIds,
     prefixFingerprint: checkpoint.source_prefix_fingerprint,
     tailStartSourceId: checkpoint.tail_start_source_id,
     manifestPrefixFingerprint,
@@ -101,7 +111,11 @@ export function projectionPlanReuseReason(
   if (cached.outputLimit !== outputLimit) return "cached-output-limit";
   if (cached.prefixIds.length > requestMessages.length) return "prefix-short";
   for (let index = 0; index < cached.prefixIds.length; index++) {
-    if (requestMessages[index]?.id !== cached.prefixIds[index])
+    const message = requestMessages[index];
+    if (
+      message === undefined ||
+      prefixKey(message, index) !== cached.prefixIds[index]
+    )
       return "prefix-id";
   }
   return "ok";
