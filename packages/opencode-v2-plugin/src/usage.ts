@@ -28,6 +28,8 @@ const stateSchema = z
     anchor: anchorSchema.optional(),
     /** Latest assistant when `messages` was sent; a newer one answered it. */
     sent: hash.optional(),
+    /** Provider-derived size of `messages` when it was sent. */
+    tokens: z.number().int().nonnegative().max(1e9).optional(),
   })
   .strict();
 const NO_ASSISTANT = createHash("sha256")
@@ -496,33 +498,36 @@ export class UsageTracker {
       return total + added;
     };
     // Upper bound once exact continuity is lost, for example after the
-    // projection notice changed: the reported size of the request that
-    // produced the latest assistant plus every message that request did not
-    // contain. Removed content is never subtracted, and a changed system or
-    // tool set adds `fixedTokens` in full.
+    // projection notice changed or a request failed. Start from the reported
+    // size of the request that produced the latest assistant or, when no
+    // newer response reported usage, from the provider-derived size recorded
+    // for the last request sent. Add every message that request did not
+    // contain; removed content is never subtracted. A changed system or tool
+    // set adds `fixedTokens` in full after a response, and no bound is given
+    // across a config change without one.
     const bound = (
       messages: readonly Message[],
       fixedTokens: number,
     ): number | undefined => {
-      if (
-        !previous?.sent ||
-        previous.sent === assistantId ||
-        !latest ||
-        !assistantId ||
-        total === undefined ||
-        rawModel?.providerID !== model.providerID ||
-        rawModel.id !== model.id ||
-        (rawModel.variant !== undefined && rawModel.variant !== model.variant)
-      )
-        return;
+      if (!previous) return;
+      const answered =
+        previous.sent !== undefined &&
+        previous.sent !== assistantId &&
+        latest !== undefined &&
+        assistantId !== undefined &&
+        total !== undefined &&
+        rawModel?.providerID === model.providerID &&
+        rawModel.id === model.id &&
+        (rawModel.variant === undefined || rawModel.variant === model.variant);
+      const sameConfig = config !== undefined && config === previous.config;
+      if (!answered && (previous.tokens === undefined || !sameConfig)) return;
       const hashes = messageHashes(messages);
       if (!hashes) return;
       const sent = new Map<string, number>();
       for (const hash of previous.messages)
         sent.set(hash, (sent.get(hash) ?? 0) + 1);
       const estimated = estimateMessages(messages);
-      let added =
-        config !== undefined && config === previous.config ? 0 : fixedTokens;
+      let added = 0;
       hashes.forEach((hash, index) => {
         const left = sent.get(hash) ?? 0;
         if (left > 0) {
@@ -530,10 +535,12 @@ export class UsageTracker {
           return;
         }
         const message = messages[index]!;
+        // The answering assistant's own output is already in its usage.
         if (
-          message.id === latest.raw.id &&
+          answered &&
+          message.id === latest!.raw.id &&
           message.role === "assistant" &&
-          matchesAssistant(latest, message, model.providerID)
+          matchesAssistant(latest!, message, model.providerID)
         )
           return;
         added +=
@@ -543,9 +550,12 @@ export class UsageTracker {
             content: estimated[index]!.content,
           });
       });
-      return total + added;
+      return answered
+        ? total! + added + (sameConfig ? 0 : fixedTokens)
+        : previous.tokens! + added;
     };
-    const remember = (messages: readonly Message[]) => {
+    /** `tokens` is the provider-derived size of `messages`, if any. */
+    const remember = (messages: readonly Message[], tokens?: number) => {
       const hashes = config && messageHashes(messages);
       if (!config || !hashes) {
         this.logMissingAnchor(
@@ -643,6 +653,9 @@ export class UsageTracker {
         messages: hashes,
         anchor,
         sent: assistantId ?? NO_ASSISTANT,
+        ...(tokens !== undefined && Number.isSafeInteger(tokens) && tokens >= 0
+          ? { tokens }
+          : {}),
       });
       if (this.sessions.size > this.capacity) {
         const evicted = this.sessions.keys().next().value!;

@@ -161,12 +161,49 @@ describe("provider usage continuity", () => {
     ).toBeUndefined();
   });
 
-  it("does not bound a request that no response has answered yet", () => {
+  it("does not bound an unanswered request without a recorded size", () => {
     const tracker = new UsageTracker();
     const next = Message.make({ id: "next", role: "user", content: "go" });
     prepare(tracker, history().slice(0, 1)).remember([user]);
     prepare(tracker).remember([user, answer, next]);
     expect(prepare(tracker).bound([user, answer, next], 50)).toBeUndefined();
+  });
+
+  it("bounds a retry after a failed response from the size last sent", () => {
+    const cost = (message: Message) =>
+      8 +
+      estimateNativeTokens({ role: message.role, content: message.content });
+    const tracker = new UsageTracker();
+    const next = Message.make({ id: "next", role: "user", content: "go" });
+    const retry = Message.make({ id: "retry", role: "user", content: "again" });
+    prepare(tracker, history().slice(0, 1)).remember([user]);
+    const step = prepare(tracker);
+    const sent = step.estimate([user, answer, next])!;
+    step.remember([user, answer, next], sent);
+    const failed = canonicalizeNativeHistory([
+      { id: "u", type: "user", text: "ask", time: { created: 1 } },
+      raw(),
+      { id: "next", type: "user", text: "go", time: { created: 4 } },
+      {
+        id: "e",
+        type: "assistant",
+        time: { created: 5, completed: 6 },
+        agent: "build",
+        model,
+        content: [],
+        error: { type: "provider", message: "WebSocket closed" },
+      },
+    ]);
+    expect(
+      prepare(tracker, failed).bound([user, answer, next, retry], 50),
+    ).toBe(sent + cost(retry));
+    // Without a response, a changed config gives no bound.
+    expect(
+      prepare(tracker, failed, { system: ["changed"] }).bound(
+        [user, answer, next, retry],
+        50,
+      ),
+    ).toBeUndefined();
   });
 
   it("logs a missing anchor when the latest assistant has zero usage", () => {

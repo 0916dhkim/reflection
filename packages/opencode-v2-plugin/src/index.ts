@@ -503,7 +503,12 @@ export async function setup(ctx: Plugin.Context, storage: StorageMutations) {
           "Reflection: materialized context exceeds hard input budget",
         );
       signal.throwIfAborted();
-      tracker.remember(projection.messages);
+      tracker.remember(
+        projection.messages,
+        projection.source === "heuristic"
+          ? undefined
+          : projection.estimatedTokens,
+      );
       try {
         const saved = usage.export(session, source.id, directory);
         if (saved === undefined)

@@ -646,6 +646,45 @@ it("keeps the projection on measured usage despite encrypted assistant metadata,
     "a",
     "b",
   ]);
+
+  // A failed response reports no usage; the size recorded for the request
+  // that failed still bounds the retry.
+  history = [
+    ...history,
+    {
+      id: "e",
+      type: "assistant",
+      agent: "build",
+      model: { id: "small", providerID: "test" },
+      time: { created: 9, completed: 10 },
+      content: [],
+      error: { type: "provider", message: "WebSocket closed" },
+    },
+    { id: "again", type: "user", text: "continue", time: { created: 11 } },
+  ];
+  const retried = event();
+  retried.messages = [
+    ...revised.messages.slice(1),
+    Message.make({ id: "again", role: "user", content: "continue" }),
+  ];
+  retried.messages.unshift(
+    Message.make({ id: "u", role: "user", content: "ask" }),
+    Message.make({ id: "old", role: "assistant", content: "x".repeat(50_000) }),
+  );
+  const retryLog = vi.spyOn(console, "warn").mockImplementation(() => {});
+  try {
+    await fake.hooks.get("context")!(retried);
+    expect(
+      retryLog.mock.calls.some(([line]) =>
+        /mode=kept estimated_tokens=9\d{3} estimate_source=provider-bound/.test(
+          String(line),
+        ),
+      ),
+    ).toBe(true);
+  } finally {
+    retryLog.mockRestore();
+  }
+  expect(retried.messages[0]?.id).toBe(revised.messages[0]?.id);
 });
 it("hydrates persisted measured usage when a new user follows encrypted assistant metadata", async () => {
   state.config = JSON.stringify(config);
