@@ -84,6 +84,7 @@ export interface ProjectionDecision {
   omitted: number;
   checkpoint: boolean;
   usageAnchor: boolean;
+  reused?: boolean;
   context: number;
   output: number;
 }
@@ -101,6 +102,7 @@ export function formatProjectionDecision(input: ProjectionDecision): string {
     `omitted=${input.omitted}`,
     `checkpoint=${input.checkpoint ? "yes" : "no"}`,
     `usage_anchor=${input.usageAnchor ? "present" : "missing"}`,
+    `reused=${input.reused ? "yes" : "no"}`,
     `context=${input.context}`,
     `output=${input.output}`,
   ].join(" ");

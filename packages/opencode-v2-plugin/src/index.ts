@@ -32,6 +32,12 @@ import {
 } from "./transport.js";
 import { Ingestion, warn } from "./ingestion.js";
 import { formatProjectionDecision } from "./log.js";
+import {
+  cacheProjectionPlan,
+  canReuseProjectionPlan,
+  manifestFingerprint,
+  type CachedProjectionPlan,
+} from "./plan-cache.js";
 import { UsageTracker } from "./usage.js";
 import { Operations, bounded } from "./operations.js";
 import { withCancellableStorage, type StorageMutations } from "./native.js";
@@ -74,6 +80,7 @@ export async function setup(ctx: Plugin.Context, storage: StorageMutations) {
   // Per-segment identity and prefix hashes for the context hook's cached
   // history records; entries die with the records they are keyed by.
   const segmentMemo = new NativeSegmentMemo();
+  const planCache = new Map<string, CachedProjectionPlan>();
   const key = (id: string) =>
     `reflection-v2/checkpoint/2/${encodeURIComponent(http!.config.sourceId)}/${encodeURIComponent(id)}`;
   const usageKey = (id: string) =>
@@ -382,71 +389,6 @@ export async function setup(ctx: Plugin.Context, storage: StorageMutations) {
       let previous = checkpoint(stored, source.id, event.sessionID);
       if (stored !== undefined && !previous)
         warn("Invalid checkpoint discarded; rebuilding Reflection projection");
-      let manifest: NativeSessionSegmentsResponse;
-      let manifestAvailable = true;
-      try {
-        manifest = await ingestion.manifest(event.sessionID, signal);
-      } catch (error) {
-        if (!(error instanceof AvailabilityError)) throw error;
-        signal.throwIfAborted();
-        manifestAvailable = false;
-        manifest = {
-          source_id: source.id,
-          session_id: event.sessionID,
-          manifest_version: 3,
-          segments: [],
-          boundaries: [],
-          targets: [],
-        };
-        warn(
-          "Manifest temporarily unavailable; projecting verified native history with explicit missing-summary markers when needed",
-        );
-      }
-      const segmentInput = {
-        source,
-        sessionId: event.sessionID,
-        records: snapshot.records,
-        manifest,
-        memo: segmentMemo,
-      };
-      let segments: ReturnType<typeof planNativeSegments>;
-      if (!manifestAvailable && previous) {
-        try {
-          // Local hints preserve frozen packing, not backend eligibility. Require
-          // the exact ordered complete prefix; the core separately proves hashes
-          // before reusing cached summary text, including after source changes.
-          let cursor = 0;
-          for (const range of previous.archived) {
-            for (const id of range.source_message_ids) {
-              const record = snapshot.records[cursor++];
-              if (!record?.complete || record.source.id !== id)
-                throw new Error("invalid local planning hint");
-            }
-          }
-          const planningManifest: NativeSessionSegmentsResponse = {
-            ...manifest,
-            boundaries: previous.archived.map((range) => ({
-              id: range.id,
-              source_boundary_version: 3,
-              start_source_message_id: range.start_source_message_id,
-              end_source_message_id: range.end_source_message_id,
-              projection_version: 3,
-              source_fingerprint: range.source_fingerprint,
-              source_eligible: false,
-            })),
-          };
-          segments = planNativeSegments({
-            ...segmentInput,
-            manifest: planningManifest,
-          });
-        } catch {
-          previous = undefined;
-          warn(
-            "Invalid checkpoint planning hints discarded; rebuilding from native history",
-          );
-          segments = planNativeSegments(segmentInput);
-        }
-      } else segments = planNativeSegments(segmentInput);
       const system = estimationValue(requestSystem);
       const toolBudget = estimationValue(event.tools);
       const estimatedMessages = estimateMessages(requestMessages);
@@ -473,73 +415,178 @@ export async function setup(ctx: Plugin.Context, storage: StorageMutations) {
       );
       const estimateInput = (shape: Parameters<typeof materialize>[0]) =>
         tracker.estimate(materialize(shape, requestMessages));
-      const input = {
-        source,
-        sessionId: event.sessionID,
-        records: snapshot.records,
-        segments,
-        messages: estimatedMessages,
-        system: [system, WRAPPER_RESERVE],
-        tools: toolBudget,
-        contextLimit: model.limit.context,
-        inputLimit: model.limit.input,
-        outputLimit: output,
-        previous,
-        allowLossy: true as const,
-        memo: segmentMemo,
-        estimateInput,
-      };
-      let plan: NativeProjectionResult | undefined;
+      let manifest: NativeSessionSegmentsResponse;
+      let manifestAvailable = true;
       try {
-        plan = projectNativeContext({
-          ...input,
-          manifest,
-          manifestUnavailable: !manifestAvailable,
-        });
+        manifest = await ingestion.manifest(event.sessionID, signal);
       } catch (error) {
-        if (segments.length === 0) throw error;
-      }
-      if (
-        manifestAvailable &&
-        (!plan || plan.reset || (!previous && plan.notice))
-      ) {
-        // One aggregate five-second synchronization window, never wait for LLM
-        // extraction. The core emits explicit omissions for missing summaries.
-        const syncSignal = AbortSignal.any([signal, AbortSignal.timeout(5000)]);
-        try {
-          await ingestion.submit(
-            segments.filter((segment) => segment.closed),
-            manifest,
-            syncSignal,
-            100,
-          );
-          try {
-            manifest = await ingestion.manifest(event.sessionID, syncSignal);
-            manifestAvailable = true;
-          } catch (error) {
-            if (error instanceof AvailabilityError) manifestAvailable = false;
-            throw error;
-          }
-        } catch (error) {
-          if (!(error instanceof AvailabilityError) && !syncSignal.aborted)
-            throw error;
-          warn(
-            "Closed targets not fully synchronized within projection window; exact missing summaries remain explicit omissions",
-          );
-        }
+        if (!(error instanceof AvailabilityError)) throw error;
         signal.throwIfAborted();
-        plan = projectNativeContext({
-          ...input,
-          manifest,
-          manifestUnavailable: !manifestAvailable,
-        });
+        manifestAvailable = false;
+        manifest = {
+          source_id: source.id,
+          session_id: event.sessionID,
+          manifest_version: 3,
+          segments: [],
+          boundaries: [],
+          targets: [],
+        };
+        warn(
+          "Manifest temporarily unavailable; projecting verified native history with explicit missing-summary markers when needed",
+        );
       }
-      if (!plan)
-        plan = projectNativeContext({
-          ...input,
+      const currentManifestFingerprint = manifestAvailable
+        ? manifestFingerprint(manifest)
+        : undefined;
+      let plan: NativeProjectionResult | undefined;
+      let reusedPlan = false;
+      const cachedPlan = planCache.get(event.sessionID);
+      if (
+        cachedPlan &&
+        manifestAvailable &&
+        currentManifestFingerprint !== undefined &&
+        canReuseProjectionPlan(
+          previous,
+          cachedPlan,
+          requestMessages,
+          currentManifestFingerprint,
+          model.limit.context,
+          model.limit.input,
+          output,
+        )
+      ) {
+        const cachedMessages = materialize(cachedPlan.plan, requestMessages);
+        const cachedTracked = tracker.estimate(cachedMessages);
+        const cachedConservative = materializedTokens(
+          cachedMessages,
+          system,
+          toolBudget,
+        );
+        if ((cachedTracked ?? cachedConservative) <= budget.hard) {
+          plan = {
+            ...cachedPlan.plan,
+            estimatedTokens: cachedTracked ?? cachedPlan.plan.estimatedTokens,
+          };
+          reusedPlan = true;
+        }
+      }
+      if (!plan) {
+        const segmentInput = {
+          source,
+          sessionId: event.sessionID,
+          records: snapshot.records,
           manifest,
-          manifestUnavailable: !manifestAvailable,
-        });
+          memo: segmentMemo,
+        };
+        let segments: ReturnType<typeof planNativeSegments>;
+        if (!manifestAvailable && previous) {
+          try {
+            // Local hints preserve frozen packing, not backend eligibility. Require
+            // the exact ordered complete prefix; the core separately proves hashes
+            // before reusing cached summary text, including after source changes.
+            let cursor = 0;
+            for (const range of previous.archived) {
+              for (const id of range.source_message_ids) {
+                const record = snapshot.records[cursor++];
+                if (!record?.complete || record.source.id !== id)
+                  throw new Error("invalid local planning hint");
+              }
+            }
+            const planningManifest: NativeSessionSegmentsResponse = {
+              ...manifest,
+              boundaries: previous.archived.map((range) => ({
+                id: range.id,
+                source_boundary_version: 3,
+                start_source_message_id: range.start_source_message_id,
+                end_source_message_id: range.end_source_message_id,
+                projection_version: 3,
+                source_fingerprint: range.source_fingerprint,
+                source_eligible: false,
+              })),
+            };
+            segments = planNativeSegments({
+              ...segmentInput,
+              manifest: planningManifest,
+            });
+          } catch {
+            previous = undefined;
+            warn(
+              "Invalid checkpoint planning hints discarded; rebuilding from native history",
+            );
+            segments = planNativeSegments(segmentInput);
+          }
+        } else segments = planNativeSegments(segmentInput);
+        const input = {
+          source,
+          sessionId: event.sessionID,
+          records: snapshot.records,
+          segments,
+          messages: estimatedMessages,
+          system: [system, WRAPPER_RESERVE],
+          tools: toolBudget,
+          contextLimit: model.limit.context,
+          inputLimit: model.limit.input,
+          outputLimit: output,
+          previous,
+          allowLossy: true as const,
+          memo: segmentMemo,
+          estimateInput,
+        };
+        try {
+          plan = projectNativeContext({
+            ...input,
+            manifest,
+            manifestUnavailable: !manifestAvailable,
+          });
+        } catch (error) {
+          if (segments.length === 0) throw error;
+        }
+        if (
+          manifestAvailable &&
+          (!plan || plan.reset || (!previous && plan.notice))
+        ) {
+          // One aggregate five-second synchronization window, never wait for LLM
+          // extraction. The core emits explicit omissions for missing summaries.
+          const syncSignal = AbortSignal.any([
+            signal,
+            AbortSignal.timeout(5000),
+          ]);
+          try {
+            await ingestion.submit(
+              segments.filter((segment) => segment.closed),
+              manifest,
+              syncSignal,
+              100,
+            );
+            try {
+              manifest = await ingestion.manifest(event.sessionID, syncSignal);
+              manifestAvailable = true;
+            } catch (error) {
+              if (error instanceof AvailabilityError) manifestAvailable = false;
+              throw error;
+            }
+          } catch (error) {
+            if (!(error instanceof AvailabilityError) && !syncSignal.aborted)
+              throw error;
+            warn(
+              "Closed targets not fully synchronized within projection window; exact missing summaries remain explicit omissions",
+            );
+          }
+          signal.throwIfAborted();
+          plan = projectNativeContext({
+            ...input,
+            manifest,
+            manifestUnavailable: !manifestAvailable,
+          });
+        }
+        if (!plan)
+          plan = projectNativeContext({
+            ...input,
+            manifest,
+            manifestUnavailable: !manifestAvailable,
+          });
+      }
+      if (!plan) throw new Error("Reflection: projection unavailable");
       const messages = materialize(plan, requestMessages);
       const tracked = tracker.estimate(messages);
       if (plan.lossy || plan.checkpoint !== undefined) {
@@ -554,6 +601,7 @@ export async function setup(ctx: Plugin.Context, storage: StorageMutations) {
             omitted: plan.omissions.length,
             checkpoint: plan.checkpoint !== undefined,
             usageAnchor: usage.anchorPresent(event.sessionID),
+            reused: reusedPlan,
             context: model.limit.context,
             output,
           }),
@@ -572,6 +620,22 @@ export async function setup(ctx: Plugin.Context, storage: StorageMutations) {
       } else if (stored !== undefined)
         await bounded(storage.remove(key(event.sessionID), signal), signal);
       signal.throwIfAborted();
+      const cached =
+        currentManifestFingerprint === undefined
+          ? undefined
+          : cacheProjectionPlan(
+              plan,
+              requestMessages,
+              currentManifestFingerprint,
+            );
+      if (cached) {
+        planCache.delete(event.sessionID);
+        planCache.set(event.sessionID, cached);
+        while (planCache.size > 8) {
+          const oldest = planCache.keys().next().value!;
+          planCache.delete(oldest);
+        }
+      } else planCache.delete(event.sessionID);
       tracker.remember(messages);
       try {
         const saved = usage.export(event.sessionID, source.id, directory);
@@ -756,6 +820,7 @@ export async function setup(ctx: Plugin.Context, storage: StorageMutations) {
       if (typeof id !== "string") continue;
       if (event.type === "session.deleted") {
         usage.delete(id);
+        planCache.delete(id);
         ingestion?.clear(id);
         http?.forget(http.config.sourceId, id);
         void operations
