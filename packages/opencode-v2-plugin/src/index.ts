@@ -331,7 +331,7 @@ export async function setup(ctx: Plugin.Context, storage: StorageMutations) {
     );
     const systemTokens =
       estimateNativeTokens(estimationValue(requestSystem)) +
-      estimateNativeTokens(event.tools) +
+      estimateNativeTokens(estimationValue(event.tools)) +
       estimateNativeTokens(WRAPPER_RESERVE);
     const projection = selectCursorProjection({
       sourceId: source.id,

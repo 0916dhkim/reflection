@@ -191,6 +191,33 @@ describe("cursor projection", () => {
     expect(projection.estimatedTokens).toBeGreaterThan(600);
   });
 
+  it("estimates images in tool results with a fixed reserve", () => {
+    const messages = [
+      user("u1"),
+      call("a1", "c1"),
+      Message.tool({
+        id: "c1",
+        name: "read",
+        resultType: "content",
+        result: [
+          {
+            type: "file",
+            uri: `data:image/png;base64,${"A".repeat(4_000)}`,
+            mime: "image/png",
+          },
+        ],
+      }),
+      user("u2"),
+    ];
+    const projection = project(messages, {
+      contextLimit: 100_000,
+      softTokens: 70_000,
+      hardTokens: 75_000,
+    });
+    expect(projection.mode).toBe("raw");
+    expect(projection.estimatedTokens).toBeGreaterThan(16_384);
+  });
+
   it("drops older summaries with one marker when they do not fit", () => {
     const projection = project(
       [user("u1"), reply("a1"), user("u2", big), reply("a2"), user("u3")],

@@ -6,7 +6,7 @@ import {
   type NativeSegmentSummary,
 } from "@reflection/shared/native";
 import { estimateNativeTokens } from "@reflection/opencode-v2-core/projection";
-import { NOTICE_PREFIX } from "./projection.js";
+import { NOTICE_PREFIX, estimateMessages } from "./projection.js";
 
 // Once projection fires, keep at most this share of the context window as raw
 // tail and spend at most this share on summaries, leaving room to grow back to
@@ -138,7 +138,8 @@ export function selectCursorProjection(input: {
     if (message.id !== undefined) positions.set(message.id, index);
   });
   const safe = toolSafeStarts(input.messages);
-  const costs = input.messages.map(
+  // Images become fixed reserves; other media fails closed (projection.ts).
+  const costs = estimateMessages(input.messages).map(
     (message) =>
       8 +
       estimateNativeTokens({ role: message.role, content: message.content }),
