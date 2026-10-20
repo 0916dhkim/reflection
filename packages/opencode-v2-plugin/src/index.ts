@@ -35,7 +35,7 @@ import { formatProjectionDecision } from "./log.js";
 import {
   cacheProjectionPlan,
   canReuseProjectionPlan,
-  manifestFingerprint,
+  manifestPrefixFingerprint,
   type CachedProjectionPlan,
 } from "./plan-cache.js";
 import { UsageTracker } from "./usage.js";
@@ -435,12 +435,16 @@ export async function setup(ctx: Plugin.Context, storage: StorageMutations) {
           "Manifest temporarily unavailable; projecting verified native history with explicit missing-summary markers when needed",
         );
       }
-      const currentManifestFingerprint = manifestAvailable
-        ? manifestFingerprint(manifest)
-        : undefined;
       let plan: NativeProjectionResult | undefined;
       let reusedPlan = false;
       const cachedPlan = planCache.get(event.sessionID);
+      const currentManifestFingerprint =
+        manifestAvailable && cachedPlan?.plan.checkpoint
+          ? manifestPrefixFingerprint(
+              manifest,
+              cachedPlan.plan.checkpoint.archived,
+            )
+          : undefined;
       if (
         cachedPlan &&
         manifestAvailable &&
@@ -620,14 +624,14 @@ export async function setup(ctx: Plugin.Context, storage: StorageMutations) {
       } else if (stored !== undefined)
         await bounded(storage.remove(key(event.sessionID), signal), signal);
       signal.throwIfAborted();
+      const planManifestFingerprint =
+        manifestAvailable && plan.checkpoint
+          ? manifestPrefixFingerprint(manifest, plan.checkpoint.archived)
+          : undefined;
       const cached =
-        currentManifestFingerprint === undefined
+        planManifestFingerprint === undefined
           ? undefined
-          : cacheProjectionPlan(
-              plan,
-              requestMessages,
-              currentManifestFingerprint,
-            );
+          : cacheProjectionPlan(plan, requestMessages, planManifestFingerprint);
       if (cached) {
         planCache.delete(event.sessionID);
         planCache.set(event.sessionID, cached);
