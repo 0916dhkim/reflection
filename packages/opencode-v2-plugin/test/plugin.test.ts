@@ -1706,3 +1706,56 @@ it.each([1, 2])(
     ).toContain("error");
   },
 );
+
+it("projects cursor mode from summaries plus tail without a checkpoint", async () => {
+  state.config = JSON.stringify({
+    ...config,
+    cursorProjection: { enabled: true },
+  });
+  const fake = sdk();
+  const source = {
+    id: "native",
+    kind: "opencode-v2",
+    identity_scheme: "source-v1",
+  };
+  const manifest = {
+    source_id: "native",
+    session_id: "s",
+    manifest_version: 3,
+    segments: [
+      {
+        id: "11111111-1111-4111-8111-111111111111",
+        projection_version: 3,
+        source_boundary_version: 3,
+        start_source_message_id: "u1",
+        end_source_message_id: "a1",
+        summary: "Earlier work.",
+      },
+    ],
+    boundaries: [],
+    targets: [],
+  };
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (input: URL) => {
+      const url = new URL(String(input));
+      if (url.pathname === "/v1/sources/native") return Response.json(source);
+      if (url.pathname === "/v1/sessions/s/segments")
+        return Response.json(manifest);
+      if (url.pathname === "/api/session/s/message")
+        return Response.json({ data: [], cursor: {} });
+      throw new Error(`unexpected ${url.pathname}`);
+    }),
+  );
+  cleanups.push(await setup(fake.ctx, fake.ctx.storage));
+  const request = event();
+  request.messages = [
+    Message.make({ id: "u1", role: "user", content: "one" }),
+    Message.make({ id: "a1", role: "assistant", content: "answer" }),
+    Message.make({ id: "u2", role: "user", content: "latest" }),
+  ];
+  await fake.hooks.get("context")!(request);
+  expect(request.messages[0]?.id).toContain("reflection-cursor-");
+  expect(request.messages.at(-1)?.id).toBe("u2");
+  expect(fake.storage.has("reflection-v2/checkpoint/2/native/s")).toBe(false);
+});

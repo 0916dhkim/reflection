@@ -3,13 +3,16 @@ import { open, readFile } from "node:fs/promises";
 import { isAbsolute } from "node:path";
 import type { Plugin } from "@opencode/plugin";
 import type { SessionContext } from "@opencode/plugin/promise/session";
+import type { SourceInfo } from "@reflection/shared/sources";
 import { z } from "zod";
 import {
   NativeProjectionError,
+  estimateNativeTokens,
   nativeInputBudget,
   projectNativeContext,
   type NativeProjectionResult,
 } from "@reflection/opencode-v2-core/projection";
+import { canonicalizeNativeHistory } from "@reflection/opencode-v2-core/history";
 import { NativeSegmentMemo } from "@reflection/opencode-v2-core/memo";
 import {
   hydrateNativeRange,
@@ -31,6 +34,13 @@ import {
   object,
 } from "./transport.js";
 import { Ingestion, warn } from "./ingestion.js";
+import {
+  cursorSummaryState,
+  emptyCursorState,
+  parseCursorState,
+  selectCursorProjection,
+  type CursorState,
+} from "./cursor.js";
 import { formatProjectionDecision } from "./log.js";
 import {
   cacheProjectionPlan,
@@ -87,6 +97,8 @@ export async function setup(ctx: Plugin.Context, storage: StorageMutations) {
     `reflection-v2/checkpoint/2/${encodeURIComponent(http!.config.sourceId)}/${encodeURIComponent(id)}`;
   const usageKey = (id: string) =>
     `reflection-v2/usage/1/${encodeURIComponent(http!.config.sourceId)}/${encodeURIComponent(id)}`;
+  const cursorKey = (id: string) =>
+    `reflection-v2/cursor/1/${encodeURIComponent(http!.config.sourceId)}/${encodeURIComponent(id)}`;
   const requireReady = async (signal: AbortSignal) => {
     signal.throwIfAborted();
     if (!ready && registryRetryAllowed && !operations.stopped)
@@ -270,6 +282,118 @@ export async function setup(ctx: Plugin.Context, storage: StorageMutations) {
       return { content: JSON.stringify({ error: safeError(error) }) };
     }
   }
+  async function projectCursor(
+    event: SessionContext,
+    signal: AbortSignal,
+    http: Transport,
+    source: SourceInfo,
+    requestSystem: SessionContext["system"],
+    requestMessages: readonly SessionContext["messages"][number][],
+  ): Promise<void> {
+    const stored = await bounded(
+      ctx.storage.get(cursorKey(event.sessionID)),
+      signal,
+    );
+    const state =
+      parseCursorState(stored, source.id, event.sessionID) ??
+      emptyCursorState(source.id, event.sessionID);
+    const manifest = await http.request(
+      `/v1/sessions/${encodeURIComponent(event.sessionID)}/segments?source_id=${encodeURIComponent(source.id)}`,
+      signal,
+    );
+    const summaryState = cursorSummaryState(manifest.value, source);
+    if (summaryState.summaries.length > 0) {
+      state.summarizedThrough = summaryState.summarizedThrough;
+      state.summaryFingerprint = summaryState.fingerprint;
+    }
+    if (state.submittedThrough === null)
+      state.submittedThrough = state.summarizedThrough;
+
+    const models = await bounded(
+      ctx.model.list({ location: ctx.location }),
+      signal,
+    );
+    const model = models.data.find(
+      (candidate) =>
+        candidate.id === event.model.id &&
+        candidate.providerID === event.model.providerID,
+    );
+    if (!model) throw new Error("Reflection: current model limits unavailable");
+    const output = Math.min(
+      model.limit.output,
+      Math.floor(model.limit.context * 0.25),
+      event.options.maxTokens ?? Infinity,
+    );
+    const budget = nativeInputBudget(
+      model.limit.context,
+      model.limit.input,
+      output,
+    );
+    const systemTokens =
+      estimateNativeTokens(estimationValue(requestSystem)) +
+      estimateNativeTokens(event.tools) +
+      estimateNativeTokens(WRAPPER_RESERVE);
+    const projection = selectCursorProjection({
+      sourceId: source.id,
+      messages: requestMessages,
+      summarizedThrough: state.summarizedThrough,
+      summaries: summaryState.summaries,
+      hardTokens: budget.hard,
+      systemTokens,
+    });
+    if (!projection)
+      throw new Error("Reflection: cursor projection unavailable");
+    if (projection.estimatedTokens > budget.hard)
+      throw new Error(
+        "Reflection: materialized context exceeds hard input budget",
+      );
+    event.system = requestSystem;
+    if (allowsWireOutputCap(model)) event.options.maxTokens = output;
+    else delete event.options.maxTokens;
+    event.messages = projection.messages;
+
+    try {
+      const fresh = await http.history(
+        source,
+        event.sessionID,
+        signal,
+        state.submittedThrough ?? undefined,
+      );
+      if (fresh.length > 0) {
+        const records = canonicalizeNativeHistory(fresh);
+        const segments = planNativeSegments({
+          source,
+          sessionId: event.sessionID,
+          records,
+          softLimitChars: 20_000,
+        });
+        for (const segment of segments) {
+          if (!segment.closed) continue;
+          await http.request(
+            "/v1/segments",
+            signal,
+            undefined,
+            segment.request,
+          );
+          state.submittedThrough = segment.request.end_source_message_id;
+        }
+      }
+    } catch {
+      if (signal.aborted) signal.throwIfAborted();
+      warn(`cursor-ingestion deferred session=${event.sessionID}`);
+    }
+    await bounded(
+      ctx.storage.set(
+        cursorKey(event.sessionID),
+        JSON.parse(JSON.stringify(state)) as never,
+      ),
+      signal,
+    );
+    warn(
+      `cursor-projection session=${event.sessionID} summaries=${summaryState.summaries.length} omitted=${projection.omittedSummaries} estimated=${projection.estimatedTokens} hard=${budget.hard}`,
+    );
+  }
+
   async function project(event: SessionContext, signal: AbortSignal) {
     try {
       const { http, ingestion } = await requireReady(signal);
@@ -302,6 +426,17 @@ export async function setup(ctx: Plugin.Context, storage: StorageMutations) {
         }
       }
       const source = await http.source(http.config.sourceId, signal);
+      if (http.config.cursorProjection?.enabled) {
+        await projectCursor(
+          event,
+          signal,
+          http,
+          source,
+          requestSystem,
+          requestMessages,
+        );
+        return;
+      }
       // Every model step needs full records, so reuse the settled prefix and
       // read only the tail instead of re-paging the whole session.
       const snapshot = await http.snapshot(
@@ -866,13 +1001,12 @@ export async function setup(ctx: Plugin.Context, storage: StorageMutations) {
               Promise.all([
                 storage.remove(key(id), cleanupSignal),
                 storage.remove(usageKey(id), cleanupSignal),
+                storage.remove(cursorKey(id), cleanupSignal),
               ]).then(() => {}),
               cleanupSignal,
             );
           })
-          .catch(() =>
-            warn("Deleted session checkpoint or usage removal failed"),
-          );
+          .catch(() => warn("Deleted session state removal failed"));
       } else if (
         event.type === "session.execution.succeeded" ||
         event.type === "session.execution.failed" ||

@@ -43,6 +43,10 @@ export const configSchema = z
     sourceId: z.string().trim().min(1).max(500),
     sources: z.record(z.string(), readerSchema),
     contextProjection: z.object({ enabled: z.literal(true) }).strict(),
+    cursorProjection: z
+      .object({ enabled: z.literal(true) })
+      .strict()
+      .optional(),
   })
   .strict()
   .refine(
