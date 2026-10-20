@@ -6,10 +6,22 @@ import type {
 } from "@reflection/opencode-v2-core/projection";
 import type { NativeSessionSegmentsResponse } from "@reflection/shared/native";
 
-export function manifestFingerprint(
+export function manifestPrefixFingerprint(
   manifest: NativeSessionSegmentsResponse,
+  archived: readonly { id: string }[],
 ): string {
-  return createHash("sha256").update(JSON.stringify(manifest)).digest("hex");
+  const ids = new Set(archived.map((range) => range.id));
+  const pick = <T extends { id: string }>(entries: readonly T[]) =>
+    entries.filter((entry) => ids.has(entry.id));
+  return createHash("sha256")
+    .update(
+      JSON.stringify({
+        segments: pick(manifest.segments),
+        boundaries: pick(manifest.boundaries),
+        targets: pick(manifest.targets),
+      }),
+    )
+    .digest("hex");
 }
 
 export interface CachedProjectionPlan {
@@ -17,7 +29,7 @@ export interface CachedProjectionPlan {
   readonly prefixIds: readonly string[];
   readonly prefixFingerprint: string;
   readonly tailStartSourceId: string | null;
-  readonly manifestFingerprint: string;
+  readonly manifestPrefixFingerprint: string;
   readonly manifestSummaryFingerprint: string;
   readonly cachedSummariesFingerprint: string;
   readonly contextLimit: number;
@@ -29,7 +41,7 @@ export interface CachedProjectionPlan {
 export function cacheProjectionPlan(
   plan: NativeProjectionResult,
   requestMessages: readonly Message[],
-  manifestFingerprint: string,
+  manifestPrefixFingerprint: string,
 ): CachedProjectionPlan | undefined {
   const checkpoint = plan.checkpoint;
   if (!checkpoint || plan.tailStartIndex > requestMessages.length) return;
@@ -42,7 +54,7 @@ export function cacheProjectionPlan(
     prefixIds: prefixIds as string[],
     prefixFingerprint: checkpoint.source_prefix_fingerprint,
     tailStartSourceId: checkpoint.tail_start_source_id,
-    manifestFingerprint,
+    manifestPrefixFingerprint,
     manifestSummaryFingerprint: checkpoint.manifest_summary_fingerprint,
     cachedSummariesFingerprint: checkpoint.cached_summaries_fingerprint,
     contextLimit: checkpoint.context_limit,
@@ -59,7 +71,7 @@ export function canReuseProjectionPlan(
   previous: NativeProjectionCheckpoint | undefined,
   cached: CachedProjectionPlan,
   requestMessages: readonly Message[],
-  manifestFingerprint: string,
+  manifestPrefixFingerprint: string,
   contextLimit: number,
   inputLimit: number | undefined,
   outputLimit: number,
@@ -69,7 +81,7 @@ export function canReuseProjectionPlan(
     previous.notice_id !== cached.noticeId ||
     previous.source_prefix_fingerprint !== cached.prefixFingerprint ||
     previous.tail_start_source_id !== cached.tailStartSourceId ||
-    cached.manifestFingerprint !== manifestFingerprint ||
+    cached.manifestPrefixFingerprint !== manifestPrefixFingerprint ||
     previous.manifest_summary_fingerprint !==
       cached.manifestSummaryFingerprint ||
     previous.cached_summaries_fingerprint !==

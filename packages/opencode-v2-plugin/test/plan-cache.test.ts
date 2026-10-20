@@ -1,4 +1,5 @@
 import { Message } from "@opencode/ai";
+import type { NativeSessionSegmentsResponse } from "@reflection/shared/native";
 import type {
   NativeProjectionCheckpoint,
   NativeProjectionResult,
@@ -7,14 +8,22 @@ import { describe, expect, it } from "vitest";
 import {
   cacheProjectionPlan,
   canReuseProjectionPlan,
-  manifestFingerprint,
+  manifestPrefixFingerprint,
 } from "../src/plan-cache.js";
 
 const checkpoint = {
   version: 2,
   source_id: "native",
   session_id: "s",
-  archived: [],
+  archived: [
+    {
+      id: "segment",
+      start_source_message_id: "u1",
+      end_source_message_id: "a1",
+      source_fingerprint: "fingerprint",
+      source_message_ids: ["u1", "a1"],
+    },
+  ],
   source_prefix_fingerprint: "prefix",
   tail_start_source_id: "u2",
   restored_user_id: null,
@@ -43,14 +52,23 @@ const messages = [
   Message.make({ id: "a1", role: "assistant", content: "answer" }),
   Message.make({ id: "u2", role: "user", content: "latest" }),
 ];
+const segment = {
+  id: "segment",
+  projection_version: 3 as const,
+  source_boundary_version: 3 as const,
+  start_source_message_id: "u1",
+  end_source_message_id: "a1",
+  summary: "old",
+};
 const manifest = {
   source_id: "native",
   session_id: "s",
   manifest_version: 3 as const,
-  segments: [],
+  segments: [segment],
   boundaries: [],
   targets: [],
-};
+} satisfies NativeSessionSegmentsResponse;
+const archived = checkpoint.archived;
 
 describe("projection plan cache", () => {
   it("reuses a plan when the settled prefix, manifest, and limits match", () => {
@@ -131,23 +149,27 @@ describe("projection plan cache", () => {
         "manifest",
       ),
     ).toBeUndefined();
-    expect(manifestFingerprint(manifest)).toBe(
-      manifestFingerprint({ ...manifest }),
-    );
+    const base = manifestPrefixFingerprint(manifest, archived);
     expect(
-      manifestFingerprint({
-        ...manifest,
-        segments: [
-          {
-            id: "segment",
-            projection_version: 3,
-            source_boundary_version: 3,
-            start_source_message_id: "u1",
-            end_source_message_id: "a1",
-            summary: "new",
-          },
-        ],
-      }),
-    ).not.toBe(manifestFingerprint(manifest));
+      manifestPrefixFingerprint(
+        {
+          ...manifest,
+          segments: [
+            ...manifest.segments,
+            { ...segment, id: "tail", summary: "tail" },
+          ],
+        },
+        archived,
+      ),
+    ).toBe(base);
+    expect(
+      manifestPrefixFingerprint(
+        {
+          ...manifest,
+          segments: [{ ...segment, summary: "new" }],
+        },
+        archived,
+      ),
+    ).not.toBe(base);
   });
 });
