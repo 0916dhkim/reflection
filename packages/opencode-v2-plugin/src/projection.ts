@@ -5,9 +5,46 @@ import { estimateNativeTokens } from "@reflection/opencode-v2-core/projection";
 export const NOTICE_PREFIX =
   "[System-generated Reflection context, not a new user instruction. Archived material may omit details; use memory_search and memory_read_segment with source_id and segment_id.]\n";
 
+// Providers bill PDFs per page (extracted text plus a page image), roughly
+// 1.5K-3K tokens per page. These reserves are only the first guess: once the
+// provider reports usage, the request that carried the PDF is sized from it.
+const PDF_PAGE_RESERVE = "x ".repeat(4096);
+const PDF_BYTES_PER_PAGE = 50_000;
+
+function pdfBytes(data: unknown): Uint8Array | undefined {
+  if (data instanceof Uint8Array) return data;
+  if (typeof data !== "string") return;
+  const match = /^data:[^,]*;base64,/.exec(data);
+  if (match) return Buffer.from(data.slice(match[0].length), "base64");
+  if (/^[A-Za-z0-9+/=\s]+$/.test(data)) return Buffer.from(data, "base64");
+}
+
+/** Pages from page objects and page-tree counts. Object streams can hide both,
+ * so fall back to a size-based guess, and use one page for unreadable data. */
+export function pdfPageCount(data: unknown): number {
+  const bytes = pdfBytes(data);
+  if (!bytes || bytes.length === 0) return 1;
+  const text = Buffer.from(
+    bytes.buffer,
+    bytes.byteOffset,
+    bytes.length,
+  ).toString("latin1");
+  const objects = text.match(/\/Type\s*\/Page(?![A-Za-z0-9])/g)?.length ?? 0;
+  let counted = 0;
+  for (const match of text.matchAll(/\/Count\s+(\d+)/g))
+    counted = Math.max(counted, Number(match[1]));
+  return Math.max(
+    1,
+    objects,
+    counted,
+    objects || counted ? 0 : Math.ceil(bytes.length / PDF_BYTES_PER_PAGE),
+  );
+}
+
 // Estimation-only copy. Original content, including binary media, is never
-// rewritten. Images reserve 16K tokens each (core adds another 4K). Unknown
-// file/audio/video payloads fail closed rather than silently dropping media.
+// rewritten. Images reserve 16K tokens each (core adds another 4K) and PDFs
+// reserve 4K per page. Other file/audio/video payloads fail closed rather than
+// silently dropping media.
 export function estimationValue(
   value: unknown,
   visiting = new Set<object>(),
@@ -87,9 +124,10 @@ export function estimationValue(
       );
     if (item.type === "media" || item.type === "file") {
       const mime = item.mediaType ?? item.mime;
+      const pdf = mime === "application/pdf";
       if (
         typeof mime !== "string" ||
-        !/^image\/(png|jpeg|webp|gif)$/.test(mime)
+        !(pdf || /^image\/(png|jpeg|webp|gif)$/.test(mime))
       )
         throw new Error(
           "Reflection: unbounded non-image media cannot be projected safely",
@@ -101,7 +139,7 @@ export function estimationValue(
           (data instanceof Uint8Array && !types.isProxy(data))
         )
       )
-        throw new Error("Reflection: invalid image payload");
+        throw new Error(`Reflection: invalid ${pdf ? "PDF" : "image"} payload`);
       const { data: _data, uri: _uri, ...metadata } = item;
       return {
         ...Object.fromEntries(
@@ -110,8 +148,15 @@ export function estimationValue(
             estimationValue(child, visiting),
           ]),
         ),
-        type: "image",
-        reserve: "x ".repeat(16384),
+        ...(pdf
+          ? {
+              type: "document",
+              reserve: Array.from(
+                { length: pdfPageCount(data) },
+                () => PDF_PAGE_RESERVE,
+              ),
+            }
+          : { type: "image", reserve: "x ".repeat(16384) }),
         mediaType: mime,
       };
     }

@@ -11,6 +11,7 @@ import {
   estimationValue,
   estimateMessages,
   materializedTokens,
+  pdfPageCount,
 } from "../src/projection.js";
 import { estimateNativeTokens } from "@reflection/opencode-v2-core/projection";
 it("counts system, tools, and every message in the request estimate", () => {
@@ -42,6 +43,33 @@ it("budgets binary images without mutating them and rejects opaque/non-image con
   expect(() => estimationValue({ type: "compaction", text: "old" })).toThrow(
     "checkpoint",
   );
+});
+it("reserves tokens per PDF page without mutating the attachment", () => {
+  const pages = (count: number) =>
+    "%PDF-1.4\n" +
+    "1 0 obj <</Type /Pages /Kids [] /Count " +
+    count +
+    ">> endobj\n" +
+    "2 0 obj <</Type /Page /Parent 1 0 R>> endobj\n".repeat(count);
+  const uri = (count: number) =>
+    "data:application/pdf;base64," +
+    Buffer.from(pages(count)).toString("base64");
+  expect(pdfPageCount(uri(3))).toBe(3);
+  expect(pdfPageCount(new TextEncoder().encode(pages(2)))).toBe(2);
+  // Page objects inside compressed object streams: fall back to size.
+  expect(pdfPageCount(new Uint8Array(120_000))).toBe(3);
+  expect(pdfPageCount("https://example.com/remote.pdf")).toBe(1);
+  const one = { type: "file", mime: "application/pdf", uri: uri(1) };
+  const ten = { type: "file", mime: "application/pdf", uri: uri(10) };
+  expect(estimationValue(one)).toHaveProperty("type", "document");
+  expect(estimationValue(one)).not.toHaveProperty("uri");
+  expect(one.uri).toBe(uri(1));
+  const cost = (part: unknown) => estimateNativeTokens(estimationValue(part));
+  expect(cost(one)).toBeGreaterThan(4096);
+  expect(cost(ten) - cost(one)).toBeGreaterThanOrEqual(9 * 4096);
+  expect(() =>
+    estimationValue({ type: "file", mime: "application/pdf", uri: 1 }),
+  ).toThrow("invalid PDF payload");
 });
 it("estimates actual SDK-produced tool/text/media content and preserves the original messages", () => {
   const call = ToolCallPart.make({
