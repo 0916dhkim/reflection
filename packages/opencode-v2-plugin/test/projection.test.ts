@@ -4,6 +4,7 @@ import {
   ToolResultPart,
   TextPart,
   MediaPart,
+  Media,
   ReasoningPart,
 } from "@opencode/ai";
 import { expect, it } from "vitest";
@@ -86,8 +87,7 @@ it("estimates actual SDK-produced tool/text/media content and preserves the orig
   const text = TextPart.make({ type: "text", text: "latest" });
   const media = MediaPart.make({
     type: "media",
-    mediaType: "image/png",
-    data: new Uint8Array([1, 2, 3]),
+    media: Media.bytes(new Uint8Array([1, 2, 3]), "image/png"),
   });
   const messages = [
     Message.assistant([call]),
@@ -118,8 +118,7 @@ it("normalizes supported SDK data shapes across foreign class prototypes without
   });
   const media = MediaPart.make({
     type: "media",
-    mediaType: "image/png",
-    data: new Uint8Array([1]),
+    media: Media.bytes(new Uint8Array([1]), "image/png"),
   });
   // Host and bundle may have different schema prototypes. Reuse SDK-produced
   // fields and exercise the non-plain representation separately from .make.

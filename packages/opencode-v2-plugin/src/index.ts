@@ -583,9 +583,9 @@ export async function setup(ctx: Plugin.Context, storage: StorageMutations) {
 
   const initialization = operations.run(undefined, async (signal) => {
     try {
-      if (ctx.app?.version !== "2.0.8")
+      if (ctx.app?.version !== "2.2.5")
         throw new Error(
-          "Reflection: unsupported OpenCode host version; exactly 2.0.8 is required; native fallback forbidden",
+          "Reflection: unsupported OpenCode host version; exactly 2.2.5 is required; native fallback forbidden",
         );
       if (Object.hasOwn(ctx.options, "userPolicyPath")) {
         try {
@@ -739,7 +739,7 @@ export async function setup(ctx: Plugin.Context, storage: StorageMutations) {
         event.type === "session.idle" ||
         (event.type === "session.status" && object(data.status).type === "idle")
       ) {
-        // Native 2.0.8 emits execution terminal events; idle/status are aliases.
+        // Native 2.2.5 emits execution terminal events; idle/status are aliases.
         // Terminal aliases must not cancel ingestion started by the first event.
         operations.abort(id, true);
         void ingestion?.schedule(id);

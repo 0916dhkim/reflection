@@ -232,7 +232,9 @@ function validateV2Message(
           ? error(message.error)
           : oneOf(message.status, ["running", "completed"]) &&
             typeof message.summary === "string" &&
-            typeof message.recent === "string");
+            // OpenCode 2.2.5 dropped the verbatim `recent` tail.
+            (message.recent === undefined ||
+              typeof message.recent === "string"));
       break;
     default:
       throw new Error("history source returned an unknown v2 message type");

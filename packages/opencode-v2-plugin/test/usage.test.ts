@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { Message, ToolCallPart, ToolResultPart } from "@opencode/ai";
+import { Media, Message, ToolCallPart, ToolResultPart } from "@opencode/ai";
 import { canonicalizeNativeHistory } from "@reflection/opencode-v2-core/history";
 import { estimateNativeTokens } from "@reflection/opencode-v2-core/projection";
 import { describe, expect, it, vi } from "vitest";
@@ -538,8 +538,7 @@ describe("provider usage continuity", () => {
         content: [
           {
             type: "media",
-            mediaType: "image/png",
-            data: new Uint8Array(bytes),
+            media: Media.bytes(new Uint8Array(bytes), "image/png"),
           },
         ],
       });

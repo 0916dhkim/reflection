@@ -35,7 +35,7 @@ afterEach(async () => {
 function sdk(
   configPath: unknown = "/isolated/reflection-v2.json",
   directory = "/work",
-  version = "2.0.8",
+  version = "2.2.5",
   limits: { context: number; input?: number; output: number } = {
     context: 20_000,
     input: 16_000,
@@ -202,7 +202,7 @@ it.each([
   "caps outgoing maxTokens and budgets the same $name",
   async ({ limits, requested, expected }) => {
     state.config = JSON.stringify(config);
-    const fake = sdk("/isolated/reflection-v2.json", "/work", "2.0.8", limits);
+    const fake = sdk("/isolated/reflection-v2.json", "/work", "2.2.5", limits);
     vi.stubGlobal(
       "fetch",
       vi.fn(async (input: URL) => {
@@ -338,7 +338,7 @@ it.each([
     const fake = sdk(
       "/isolated/reflection-v2.json",
       "/work",
-      "2.0.8",
+      "2.2.5",
       limits,
       modelExtra,
     );
@@ -846,7 +846,7 @@ it("hydrates persisted measured usage when a new user follows encrypted assistan
     materializedTokens(next.messages, next.system, next.tools),
   ).toBeGreaterThan(20_000);
 });
-it.each(["2.0.7", "2.0.9", "v2.0.8", "2.0.8-dev", "unknown", ""])(
+it.each(["2.0.8", "2.2.4", "2.2.6", "v2.2.5", "2.2.5-dev", "unknown", ""])(
   "unsupported host %s retains guards and refuses all model/source IO",
   async (version) => {
     state.config = JSON.stringify(config);
@@ -863,7 +863,7 @@ it.each(["2.0.7", "2.0.9", "v2.0.8", "2.0.8-dev", "unknown", ""])(
     );
     for (let i = 0; i < 2; i++) {
       await expect(fake.hooks.get("context")!(event())).rejects.toThrow(
-        "unsupported OpenCode host version; exactly 2.0.8 is required",
+        "unsupported OpenCode host version; exactly 2.2.5 is required",
       );
       await expect(fake.hooks.get("model.request")!(event())).rejects.toThrow(
         "unsupported OpenCode host version",

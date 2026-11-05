@@ -108,7 +108,7 @@ function operationFor(path: string, source?: Reader): string {
   return "backend.request";
 }
 
-// OpenCode 2.0.8, the only accepted host, encodes message cursors as base64url
+// OpenCode 2.2.5, the only accepted host, encodes message cursors as base64url
 // JSON {id, order, direction} and anchors them on the message's sequence
 // (server/src/handlers/message.ts, core/src/session/store.ts).
 export function nativeCursorAfter(id: string): string {
@@ -120,7 +120,7 @@ export function nativeCursorAfter(id: string): string {
 /**
  * Settled native history prefix from the last stable context snapshot.
  *
- * In 2.0.8 rows are appended with increasing sequences and updates keep the
+ * In 2.2.5 rows are appended with increasing sequences and updates keep the
  * sequence. The only deletion is a committed revert, which removes a suffix.
  * Updates target incomplete records, and a step retry can revive the latest
  * assistant. So the prefix before the latest assistant and before the first

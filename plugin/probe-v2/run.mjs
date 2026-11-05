@@ -3,7 +3,7 @@ import { fileURLToPath } from "node:url";
 
 // No host configuration, credentials, mounts, published ports, or external
 // networking enter the test container. Only the image build downloads packages.
-const image = "reflection-opencode-v2-probe:2.0.8";
+const image = "reflection-opencode-v2-probe:2.2.5";
 const context = fileURLToPath(new URL(".", import.meta.url));
 const container = `reflection-v2-probe-${process.pid}`;
 

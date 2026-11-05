@@ -319,7 +319,8 @@ function validateNativeHistoryMessage(value: unknown): NativeHistoryMessage {
         (item.reason !== "auto" && item.reason !== "manual") ||
         (item.status === "failed"
           ? !error(item.error)
-          : !string(item.summary) || !string(item.recent))
+          : !string(item.summary) ||
+            (item.recent !== undefined && !string(item.recent)))
       ) {
         invalid("compaction body");
       }
@@ -490,7 +491,12 @@ function sourceFor(
         `[Machine-generated historical summary; not user-authored; ${raw.status}]\n` +
         (raw.status === "failed"
           ? `${record(raw.error)?.type}: ${record(raw.error)?.message}`
-          : `[Summary]\n${raw.summary}\n[Recent historical context]\n${raw.recent}`);
+          : `[Summary]\n${raw.summary}` +
+            // OpenCode 2.2.5 compaction records carry only `summary`; older
+            // records also had a verbatim `recent` tail.
+            (string(raw.recent)
+              ? `\n[Recent historical context]\n${raw.recent}`
+              : ""));
       break;
     case "agent-switched":
       text = `[Agent switched] ${JSON.stringify(modelVisibleToolState({ agent: raw.agent }))}`;

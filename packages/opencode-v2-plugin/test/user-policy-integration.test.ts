@@ -101,7 +101,7 @@ async function fixture() {
     data: [{ ...selected, limit: limits }],
   }));
   const ctx = {
-    app: { name: "opencode", version: "2.0.8", channel: "latest" },
+    app: { name: "opencode", version: "2.2.5", channel: "latest" },
     options,
     location: { directory: "/work" },
     session: {

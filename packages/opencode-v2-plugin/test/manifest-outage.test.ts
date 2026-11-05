@@ -193,7 +193,7 @@ async function fixture(
   });
   vi.stubGlobal("fetch", fetch);
   const ctx = {
-    app: { name: "opencode", version: "2.0.8", channel: "latest" },
+    app: { name: "opencode", version: "2.2.5", channel: "latest" },
     options: { configPath: "/isolated/config.json" },
     location: { directory: "/work" },
     session: {

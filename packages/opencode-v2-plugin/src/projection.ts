@@ -41,6 +41,25 @@ export function pdfPageCount(data: unknown): number {
   );
 }
 
+/** Own data fields of a plain object or class instance, without invoking
+ * accessors. Returns undefined for anything that is not a non-array object. */
+function fields(value: unknown): Record<string, unknown> | undefined {
+  if (
+    value === null ||
+    typeof value !== "object" ||
+    Array.isArray(value) ||
+    types.isProxy(value)
+  )
+    return;
+  const descriptors = Object.getOwnPropertyDescriptors(value);
+  const out: Record<string, unknown> = {};
+  for (const key of Object.keys(descriptors)) {
+    const descriptor = descriptors[key]!;
+    if ("value" in descriptor) out[key] = descriptor.value as unknown;
+  }
+  return out;
+}
+
 // Estimation-only copy. Original content, including binary media, is never
 // rewritten. Images reserve 16K tokens each (core adds another 4K) and PDFs
 // reserve 4K per page. Other file/audio/video payloads fail closed rather than
@@ -123,7 +142,14 @@ export function estimationValue(
         "Reflection: preexisting native checkpoint is forbidden; rebuild from uncompacted history",
       );
     if (item.type === "media" || item.type === "file") {
-      const mime = item.mediaType ?? item.mime;
+      // opencode >= 2.2 media parts carry a `Media.Asset` class instance whose
+      // own fields are plain data (`source`, `mediaType`, ...). Read those
+      // fields directly; never walk the asset (it has methods and may carry
+      // transient download headers) and never call `inline()`/`bytes()`.
+      const asset = fields(item.media);
+      const source = fields(asset?.source);
+      const mime =
+        asset?.mediaType ?? source?.mediaType ?? item.mediaType ?? item.mime;
       const pdf = mime === "application/pdf";
       if (
         typeof mime !== "string" ||
@@ -132,7 +158,9 @@ export function estimationValue(
         throw new Error(
           "Reflection: unbounded non-image media cannot be projected safely",
         );
-      const data = item.data ?? item.uri;
+      const data = source
+        ? (source.data ?? source.url ?? source.id)
+        : (item.data ?? item.uri);
       if (
         !(
           typeof data === "string" ||
@@ -140,7 +168,7 @@ export function estimationValue(
         )
       )
         throw new Error(`Reflection: invalid ${pdf ? "PDF" : "image"} payload`);
-      const { data: _data, uri: _uri, ...metadata } = item;
+      const { data: _data, uri: _uri, media: _media, ...metadata } = item;
       return {
         ...Object.fromEntries(
           Object.entries(metadata).map(([key, child]) => [

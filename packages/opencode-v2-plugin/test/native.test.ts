@@ -157,19 +157,20 @@ it("cancels queued removal so it cannot erase the next instance's saved value", 
 // uses storage. Unused API methods remain absent and fail if called.
 function host(storage: Plugin.Context["storage"]) {
   return {
-    app: { name: "opencode", version: "2.0.8", channel: "latest" },
+    app: { name: "opencode", version: "2.2.5", channel: "latest" },
     location: { directory: "/work" },
     options: { marker: "native context" },
     storage,
     agent: {},
     aisdk: {},
     command: {},
+    credential: {},
     event: {},
-    experimental: { terminal: {} },
+    experimental: { terminal: {}, generate: {}, artifact: {} },
     generate: {},
     model: {},
     provider: {},
-    integration: { connect: {}, oauth: {}, command: {} },
+    integration: { connect: {}, oauth: {}, command: {}, connection: {} },
     mcp: {},
     permission: {},
     plugin: {},
@@ -180,7 +181,7 @@ function host(storage: Plugin.Context["storage"]) {
     vcs: { branch: {} },
     websearch: {},
     worktree: {},
-    session: {},
+    session: { instructions: { entry: {} } },
     shell: {},
   } as unknown as Plugin.Context;
 }

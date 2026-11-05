@@ -376,7 +376,7 @@ describe("source-owned transport", () => {
   });
 });
 
-// Emulates the 2.0.8 message store: rows ordered by an append sequence,
+// Emulates the 2.2.5 message store: rows ordered by an append sequence,
 // updates keep the sequence, a revert deletes a suffix, and a cursor anchors
 // after an existing message or returns [] when the anchor is gone.
 function nativeServer() {
@@ -484,7 +484,7 @@ function nativeServer() {
 }
 
 describe("incremental native snapshots", () => {
-  it("encodes the 2.0.8 message cursor", () => {
+  it("encodes the 2.2.5 message cursor", () => {
     expect(
       JSON.parse(
         Buffer.from(nativeCursorAfter("msg_1"), "base64url").toString(),

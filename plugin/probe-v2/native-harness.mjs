@@ -1828,7 +1828,7 @@ console.log(
       types: post.messages.map((item) => item.type),
     })),
     scope: {
-      runtime: "published native 2.0.8, actual bundled plugin",
+      runtime: "published native 2.2.5, actual bundled plugin",
       backend: "in-memory shared-contract fixture, not PostgreSQL",
       crossSourceLegacy: "asserted",
       automaticCompactionEnabled: "asserted",

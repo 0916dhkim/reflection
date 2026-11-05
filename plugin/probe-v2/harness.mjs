@@ -466,8 +466,8 @@ async function main() {
     stderr: version.stderr,
   });
   check(
-    "native CLI is pinned to 2.0.8",
-    `${version.stdout}${version.stderr}`.includes("2.0.8"),
+    "native CLI is pinned to 2.2.5",
+    `${version.stdout}${version.stderr}`.includes("2.2.5"),
     version.stdout.trim(),
   );
 
