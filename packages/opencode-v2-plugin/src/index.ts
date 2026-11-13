@@ -324,7 +324,7 @@ export async function setup(ctx: Plugin.Context, storage: StorageMutations) {
       const requestedOutput = event.options.maxTokens;
       if (
         !Number.isSafeInteger(catalogOutput) ||
-        catalogOutput <= 0 ||
+        catalogOutput < 0 ||
         !Number.isSafeInteger(quarterContext) ||
         quarterContext <= 0 ||
         (requestedOutput !== undefined &&
@@ -332,7 +332,9 @@ export async function setup(ctx: Plugin.Context, storage: StorageMutations) {
       )
         throw new Error("Reflection: invalid output token limit");
       const output = Math.min(
-        catalogOutput,
+        // OpenCode uses zero for an unknown catalog ceiling. Keep that
+        // metadata intact and use our normal headroom as the planning fallback.
+        catalogOutput === 0 ? Infinity : catalogOutput,
         quarterContext,
         requestedOutput ?? Infinity,
       );

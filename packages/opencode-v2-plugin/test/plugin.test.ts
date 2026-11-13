@@ -198,8 +198,40 @@ it.each([
     requested: 7000,
     expected: 5000,
   },
+  {
+    name: "unknown catalog output",
+    limits: { context: 1_000_000, output: 0 },
+    requested: undefined,
+    expected: 250_000,
+  },
+  {
+    name: "unknown catalog output with a smaller explicit request",
+    limits: { context: 20_000, input: 10_000, output: 0 },
+    requested: 800,
+    expected: 800,
+  },
+  {
+    name: "unknown catalog output with an oversized explicit request",
+    limits: { context: 20_000, output: 0 },
+    requested: 7000,
+    expected: 5000,
+  },
+  ...[-1, 1.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1].map((output) => ({
+    name: `invalid catalog output ${output}`,
+    limits: { context: 20_000, output },
+    requested: undefined,
+    expected: "invalid" as const,
+  })),
+  ...[0, -1, 1.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1].map(
+    (requested) => ({
+      name: `unknown catalog output with invalid explicit cap ${requested}`,
+      limits: { context: 20_000, output: 0 },
+      requested,
+      expected: "invalid" as const,
+    }),
+  ),
 ])(
-  "caps outgoing maxTokens and budgets the same $name",
+  "selects an output allowance or rejects $name",
   async ({ limits, requested, expected }) => {
     state.config = JSON.stringify(config);
     const fake = sdk("/isolated/reflection-v2.json", "/work", "2.2.5", limits);
@@ -252,8 +284,19 @@ it.each([
       Message.make({ id: "u", role: "user", content: "hello" }),
     ];
     if (requested !== undefined) request.options.maxTokens = requested;
+    if (expected === "invalid") {
+      await expect(fake.hooks.get("context")!(request)).rejects.toThrow(
+        "Reflection: invalid output token limit",
+      );
+      expect(request.options.maxTokens).toBe(requested);
+      return;
+    }
     await fake.hooks.get("context")!(request);
     expect(request.options.maxTokens).toBe(expected);
+    expect(
+      (await fake.ctx.model.list({ location: fake.ctx.location })).data[0]!
+        .limit,
+    ).toEqual(limits);
     expect(request.messages).toHaveLength(1);
     expect(
       materializedTokens(request.messages, request.system, request.tools),
@@ -330,11 +373,28 @@ it.each([
     modelExtra: { headers: { "chatgpt-account-id": "acc-123" } },
     requested: undefined,
   },
+  {
+    name: "unknown catalog output with wire capping disabled",
+    modelExtra: { settings: { wireOutputCap: false } },
+    output: 0,
+    requested: undefined,
+  },
+  {
+    name: "unknown catalog output with wire capping disabled and an explicit cap",
+    modelExtra: { settings: { wireOutputCap: false } },
+    output: 0,
+    requested: 800,
+  },
 ])(
   "omits wire maxTokens when $name but preserves context budgeting",
-  async ({ modelExtra, requested }) => {
+  async (testCase) => {
+    const { modelExtra, requested } = testCase;
     state.config = JSON.stringify(config);
-    const limits = { context: 20_000, input: 16_000, output: 4000 };
+    const limits = {
+      context: 20_000,
+      input: 16_000,
+      output: testCase.output ?? 4000,
+    };
     const fake = sdk(
       "/isolated/reflection-v2.json",
       "/work",
