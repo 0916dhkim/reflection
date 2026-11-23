@@ -24,6 +24,7 @@ export interface CursorState {
   projectedThrough?: string | null;
   projectedAnchor?: string | null;
   block?: ArchiveBlock;
+  omittedTurns?: string[];
 }
 
 export function parseCursorState(
@@ -51,7 +52,13 @@ export function parseCursorState(
       (state.block === null ||
         typeof state.block !== "object" ||
         typeof (state.block as ArchiveBlock).through !== "string" ||
-        typeof (state.block as ArchiveBlock).text !== "string"))
+        typeof (state.block as ArchiveBlock).text !== "string")) ||
+    (state.omittedTurns !== undefined &&
+      (!Array.isArray(state.omittedTurns) ||
+        state.omittedTurns.length > 8192 ||
+        state.omittedTurns.some(
+          (id) => typeof id !== "string" || id.length === 0 || id.length > 500,
+        )))
   )
     return;
   return state as unknown as CursorState;

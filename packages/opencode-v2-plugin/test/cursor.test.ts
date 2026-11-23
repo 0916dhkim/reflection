@@ -37,6 +37,15 @@ describe("cursor projection", () => {
   it("round-trips cursor state", () => {
     const state = emptyCursorState("native", "s");
     expect(parseCursorState(state, "native", "s")).toEqual(state);
+    expect(
+      parseCursorState({ ...state, omittedTurns: ["a1", "u2"] }, "native", "s"),
+    ).toEqual({ ...state, omittedTurns: ["a1", "u2"] });
+    expect(
+      parseCursorState({ ...state, omittedTurns: [""] }, "native", "s"),
+    ).toBe(undefined);
+    expect(
+      parseCursorState({ ...state, omittedTurns: [123] }, "native", "s"),
+    ).toBe(undefined);
     expect(parseCursorState({ ...state, version: 2 }, "native", "s")).toBe(
       undefined,
     );

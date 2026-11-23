@@ -5,7 +5,7 @@ import { afterEach, expect, it, vi } from "vitest";
 import { allowsWireOutputCap, setup } from "../src/index.js";
 import { canonicalizeNativeHistory } from "@reflection/opencode-v2-core/history";
 import { planNativeSegments } from "@reflection/opencode-v2-core/segmentation";
-import { Message } from "@opencode/ai";
+import { Media, MediaPart, Message } from "@opencode/ai";
 import { materializedTokens } from "../src/projection.js";
 import { Effect, Exit, Scope } from "effect";
 import { cancellableStorage } from "../src/native.js";
@@ -1941,4 +1941,359 @@ it("projects only above the threshold without a checkpoint", async () => {
   expect(large.messages.slice(1).map((message) => message.id)).toEqual(["u2"]);
   expect(fake.storage.get(cursorKey)).toMatchObject({ projectedThrough: "a1" });
   expect(fake.storage.has("reflection-v2/checkpoint/2/native/s")).toBe(false);
+});
+
+it("replaces a rejected tool turn with a neutral stub and keeps it sticky across turns and reloads", async () => {
+  state.config = JSON.stringify(config);
+  const fake = sdk();
+  const source = {
+    id: "native",
+    kind: "opencode-v2",
+    identity_scheme: "source-v1",
+  };
+  let history: Record<string, unknown>[] = [
+    { id: "u1", type: "user", text: "inspect frame", time: { created: 1 } },
+    {
+      id: "a1",
+      type: "assistant",
+      agent: "build",
+      model: { id: "small", providerID: "test" },
+      time: { created: 2, completed: 3 },
+      content: [
+        {
+          type: "tool",
+          id: "call_1",
+          name: "read",
+          time: { created: 2 },
+          state: {
+            status: "completed",
+            input: { path: "/big.png" },
+            content: [
+              {
+                type: "file",
+                uri: "data:image/png;base64,iVBORw0KGgo=",
+                mime: "image/png",
+              },
+            ],
+          },
+        },
+      ],
+    },
+    {
+      id: "f1",
+      type: "assistant",
+      agent: "build",
+      model: { id: "small", providerID: "test" },
+      time: { created: 4, completed: 5 },
+      content: [],
+      finish: "error",
+      error: {
+        type: "provider.invalid-request",
+        status: 413,
+        message: "Request body exceeds the provider maximum size",
+      },
+    },
+    { id: "u2", type: "user", text: "continue", time: { created: 6 } },
+  ];
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (input: URL) => {
+      const url = new URL(String(input));
+      if (url.pathname === "/v1/sources/native") return Response.json(source);
+      if (url.pathname === "/v1/sessions/s/segments")
+        return Response.json({
+          source_id: "native",
+          session_id: "s",
+          manifest_version: 3,
+          segments: [],
+          boundaries: [],
+          targets: [],
+        });
+      if (url.pathname === "/api/session/s")
+        return Response.json({
+          data: {
+            id: "s",
+            time: { updated: 1 },
+            location: { directory: "/work" },
+          },
+        });
+      if (url.pathname === "/api/config")
+        return Response.json([
+          { type: "document", info: { compaction: { auto: false } } },
+        ]);
+      if (url.pathname === "/api/session/s/message") {
+        const cursor = url.searchParams.get("cursor");
+        if (cursor) {
+          const decoded = JSON.parse(
+            Buffer.from(cursor, "base64url").toString("utf8"),
+          ) as { id: string };
+          const idx = history.findIndex((item) => item.id === decoded.id);
+          return Response.json({
+            data: idx >= 0 ? history.slice(idx + 1) : [],
+            cursor: {},
+          });
+        }
+        return Response.json({ data: history, cursor: {} });
+      }
+      throw new Error(`unexpected ${url.pathname}`);
+    }),
+  );
+
+  cleanups.push(await setup(fake.ctx, fake.ctx.storage));
+  const cursorKey = "reflection-v2/cursor/1/native/s";
+
+  const first = event();
+  first.messages = [
+    Message.make({ id: "u1", role: "user", content: "inspect frame" }),
+    Message.make({
+      id: "a1",
+      role: "assistant",
+      content: [
+        {
+          type: "tool-call",
+          id: "call_1",
+          name: "read",
+          input: { path: "/big.png" },
+        },
+      ],
+    }),
+    Message.tool({
+      id: "call_1",
+      name: "read",
+      result: {
+        type: "content",
+        value: [
+          {
+            type: "file",
+            uri: "data:image/png;base64,iVBORw0KGgo=",
+            mime: "image/png",
+          },
+        ],
+      },
+    }),
+    Message.make({ id: "u2", role: "user", content: "continue" }),
+  ];
+  await fake.hooks.get("context")!(first);
+  expect(first.messages.map((m) => ({ id: m.id, role: m.role }))).toEqual([
+    { id: "u1", role: "user" },
+    { id: "a1", role: "assistant" },
+    { id: "u2", role: "user" },
+  ]);
+  expect(first.messages[1]!.content).toEqual([
+    { type: "text", text: "[Turn omitted after provider rejection]" },
+  ]);
+  expect(fake.storage.get(cursorKey)).toMatchObject({ omittedTurns: ["a1"] });
+
+  // Simulate plugin reload after the failure has scrolled out of the fetched tail.
+  const reloaded = sdk();
+  for (const [k, v] of fake.storage) reloaded.storage.set(k, v);
+  history = [
+    ...history,
+    {
+      id: "a2",
+      type: "assistant",
+      agent: "build",
+      model: { id: "small", providerID: "test" },
+      time: { created: 7, completed: 8 },
+      content: [{ type: "text", text: "recovered" }],
+    },
+    { id: "u3", type: "user", text: "next", time: { created: 9 } },
+  ];
+  cleanups.push(await setup(reloaded.ctx, reloaded.ctx.storage));
+  const next = event();
+  next.messages = [
+    Message.make({ id: "u1", role: "user", content: "inspect frame" }),
+    Message.make({
+      id: "a1",
+      role: "assistant",
+      content: [
+        {
+          type: "tool-call",
+          id: "call_1",
+          name: "read",
+          input: { path: "/big.png" },
+        },
+      ],
+    }),
+    Message.tool({ id: "call_1", name: "read", result: "still-in-db" }),
+    Message.make({ id: "u2", role: "user", content: "continue" }),
+    Message.make({ id: "a2", role: "assistant", content: "recovered" }),
+    Message.make({ id: "u3", role: "user", content: "next" }),
+  ];
+  await reloaded.hooks.get("context")!(next);
+  expect(next.messages.map((m) => ({ id: m.id, role: m.role }))).toEqual([
+    { id: "u1", role: "user" },
+    { id: "a1", role: "assistant" },
+    { id: "u2", role: "user" },
+    { id: "a2", role: "assistant" },
+    { id: "u3", role: "user" },
+  ]);
+  expect(next.messages[1]!.content).toEqual([
+    { type: "text", text: "[Turn omitted after provider rejection]" },
+  ]);
+});
+
+it("recovers from a rejected user turn with unsupported media or oversize text", async () => {
+  state.config = JSON.stringify(config);
+  const fake = sdk();
+  const source = {
+    id: "native",
+    kind: "opencode-v2",
+    identity_scheme: "source-v1",
+  };
+  const history: Record<string, unknown>[] = [
+    {
+      id: "u_bad",
+      type: "user",
+      text: "x".repeat(250_000),
+      time: { created: 1 },
+    },
+    {
+      id: "f1",
+      type: "assistant",
+      agent: "build",
+      model: { id: "small", providerID: "test" },
+      time: { created: 2, completed: 3 },
+      content: [],
+      finish: "error",
+      error: {
+        type: "provider.invalid-request",
+        message: "OpenAI Chat does not support media type application/pdf",
+      },
+    },
+    { id: "u2", type: "user", text: "nevermind", time: { created: 4 } },
+  ];
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (input: URL) => {
+      const url = new URL(String(input));
+      if (url.pathname === "/v1/sources/native") return Response.json(source);
+      if (url.pathname === "/v1/sessions/s/segments")
+        return Response.json({
+          source_id: "native",
+          session_id: "s",
+          manifest_version: 3,
+          segments: [],
+          boundaries: [],
+          targets: [],
+        });
+      if (url.pathname === "/api/session/s")
+        return Response.json({
+          data: {
+            id: "s",
+            time: { updated: 1 },
+            location: { directory: "/work" },
+          },
+        });
+      if (url.pathname === "/api/config")
+        return Response.json([
+          { type: "document", info: { compaction: { auto: false } } },
+        ]);
+      if (url.pathname === "/api/session/s/message")
+        return Response.json({ data: history, cursor: {} });
+      throw new Error(`unexpected ${url.pathname}`);
+    }),
+  );
+
+  cleanups.push(await setup(fake.ctx, fake.ctx.storage));
+  const req = event();
+  req.messages = [
+    Message.make({
+      id: "u_bad",
+      role: "user",
+      content: [
+        { type: "text", text: "x".repeat(250_000) },
+        MediaPart.make({
+          type: "media",
+          media: Media.bytes(new Uint8Array([1, 2, 3]), "audio/mp3"),
+        }),
+      ],
+    }),
+    Message.make({ id: "u2", role: "user", content: "nevermind" }),
+  ];
+  await fake.hooks.get("context")!(req);
+  expect(req.messages.map((m) => m.id)).toEqual(["u_bad", "u2"]);
+  expect(req.messages[0]!.content).toEqual([
+    { type: "text", text: "[Turn omitted after provider rejection]" },
+  ]);
+  expect(req.messages[1]!.content).toEqual([
+    { type: "text", text: "nevermind" },
+  ]);
+});
+
+it("does not omit turns after a routing 404 or transport failure", async () => {
+  state.config = JSON.stringify(config);
+  const fake = sdk();
+  const source = {
+    id: "native",
+    kind: "opencode-v2",
+    identity_scheme: "source-v1",
+  };
+  const history: Record<string, unknown>[] = [
+    { id: "u1", type: "user", text: "hello", time: { created: 1 } },
+    {
+      id: "f1",
+      type: "assistant",
+      agent: "build",
+      model: { id: "small", providerID: "test" },
+      time: { created: 2, completed: 3 },
+      content: [],
+      finish: "error",
+      error: {
+        type: "provider.invalid-request",
+        status: 404,
+        message: "No endpoints found for model",
+      },
+    },
+    { id: "u2", type: "user", text: "retry", time: { created: 4 } },
+  ];
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (input: URL) => {
+      const url = new URL(String(input));
+      if (url.pathname === "/v1/sources/native") return Response.json(source);
+      if (url.pathname === "/v1/sessions/s/segments")
+        return Response.json({
+          source_id: "native",
+          session_id: "s",
+          manifest_version: 3,
+          segments: [],
+          boundaries: [],
+          targets: [],
+        });
+      if (url.pathname === "/api/session/s")
+        return Response.json({
+          data: {
+            id: "s",
+            time: { updated: 1 },
+            location: { directory: "/work" },
+          },
+        });
+      if (url.pathname === "/api/config")
+        return Response.json([
+          { type: "document", info: { compaction: { auto: false } } },
+        ]);
+      if (url.pathname === "/api/session/s/message")
+        return Response.json({ data: history, cursor: {} });
+      throw new Error(`unexpected ${url.pathname}`);
+    }),
+  );
+
+  cleanups.push(await setup(fake.ctx, fake.ctx.storage));
+  const req = event();
+  req.messages = [
+    Message.make({ id: "u1", role: "user", content: "hello" }),
+    Message.make({ id: "u2", role: "user", content: "retry" }),
+  ];
+  const raw = [...req.messages];
+  await fake.hooks.get("context")!(req);
+  expect(req.messages).toEqual(raw);
+  expect(
+    (
+      fake.storage.get("reflection-v2/cursor/1/native/s") as Record<
+        string,
+        unknown
+      >
+    ).omittedTurns,
+  ).toBeUndefined();
 });

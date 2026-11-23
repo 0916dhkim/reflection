@@ -52,6 +52,7 @@ import {
   type UserPolicy,
 } from "./user-policy.js";
 import { estimationValue } from "./projection.js";
+import { applyOmittedTurns, detectRejectedTurnIds } from "./quarantine.js";
 
 export default withCancellableStorage({ id: "reflection-v2", setup });
 
@@ -399,20 +400,22 @@ export async function setup(ctx: Plugin.Context, storage: StorageMutations) {
 
       // Unsubmitted history feeds ingestion. The latest assistant's reported
       // usage anchors the size estimate, so read it too when it was submitted.
+      let rawFresh: unknown[] | undefined;
       let fresh: NativeCanonicalRecord[] | undefined;
       try {
-        fresh = canonicalizeNativeHistory(
-          await http.history(
-            source,
-            session,
-            signal,
-            state.submittedThrough ?? undefined,
-          ),
+        rawFresh = await http.history(
+          source,
+          session,
+          signal,
+          state.submittedThrough ?? undefined,
         );
+        fresh = canonicalizeNativeHistory(rawFresh);
       } catch {
         if (signal.aborted) signal.throwIfAborted();
         warn(`cursor-ingestion deferred session=${session}`);
       }
+      let rawRecords = rawFresh ?? [];
+      let rawRecordsAfterId: string | null = state.submittedThrough ?? null;
       let records = fresh ?? [];
       const sourceMessages = requestMessages.filter(
         (message) =>
@@ -429,18 +432,37 @@ export async function setup(ctx: Plugin.Context, storage: StorageMutations) {
         )
       ) {
         try {
-          records = canonicalizeNativeHistory(
-            await http.history(
-              source,
-              session,
-              signal,
-              sourceMessages[latest - 1]?.id,
-            ),
+          const fallbackAfter = sourceMessages[latest - 1]?.id;
+          const rawFallback = await http.history(
+            source,
+            session,
+            signal,
+            fallbackAfter,
           );
+          rawRecords = rawFallback;
+          rawRecordsAfterId = fallbackAfter ?? null;
+          records = canonicalizeNativeHistory(rawFallback);
         } catch {
           if (signal.aborted) signal.throwIfAborted();
           records = [];
         }
+      }
+      const omittedTurns = detectRejectedTurnIds({
+        history: rawRecords,
+        messages: requestMessages,
+        historyAfterId: rawRecordsAfterId,
+        ...(state.omittedTurns === undefined
+          ? {}
+          : { existing: state.omittedTurns }),
+      });
+      if (omittedTurns.length > 0) {
+        requestMessages = applyOmittedTurns(
+          requestMessages,
+          new Set(omittedTurns),
+        );
+        warn(
+          `omitted-turns session=${session} count=${omittedTurns.length} ids=${omittedTurns.join(",")}`,
+        );
       }
       if (!usage.has(session)) {
         try {
@@ -560,6 +582,8 @@ export async function setup(ctx: Plugin.Context, storage: StorageMutations) {
       state.projectedAnchor = projection.projectedAnchor;
       if (projection.block) state.block = projection.block;
       else delete state.block;
+      if (omittedTurns.length > 0) state.omittedTurns = omittedTurns;
+      else delete state.omittedTurns;
       await bounded(
         storage.set(
           cursorKey(session),
